@@ -534,6 +534,14 @@ bool TitleBar::isSystemMoveAreaAt(const QPoint& globalPos) const
 
 bool TitleBar::startWindowMove(QMouseEvent* ev, bool useSystemMove)
 {
+#ifdef Q_OS_ANDROID
+    // The activity is always maximized — window-move makes no sense, and
+    // the drag-handle labels (speaker/headphone icons, app name) would
+    // otherwise steal touches aimed at the adjacent sliders and buttons.
+    Q_UNUSED(ev);
+    Q_UNUSED(useSystemMove);
+    return false;
+#else
     if (!ev || ev->button() != Qt::LeftButton)
         return false;
 
@@ -576,6 +584,7 @@ bool TitleBar::startWindowMove(QMouseEvent* ev, bool useSystemMove)
 
     ev->accept();
     return true;
+#endif // !Q_OS_ANDROID
 }
 
 bool TitleBar::continueWindowMove(QMouseEvent* ev)

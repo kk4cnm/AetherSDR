@@ -388,7 +388,13 @@ int main(int argc, char* argv[])
     int exitCode = 0;
     {
         AetherSDR::MainWindow window;
+#ifdef Q_OS_ANDROID
+        // Fill the activity surface — without this Qt creates a movable
+        // desktop-sized window that overflows small screens.
+        window.showMaximized();
+#else
         window.show();
+#endif
         exitCode = app.exec();
     }
 

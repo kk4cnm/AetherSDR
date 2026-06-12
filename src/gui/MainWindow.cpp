@@ -953,8 +953,16 @@ MainWindow::MainWindow(QWidget* parent)
 
     setWindowTitle(QString("AetherSDR v%1").arg(QCoreApplication::applicationVersion()));
     setWindowIcon(QIcon(":/icon.png"));
+#ifdef Q_OS_ANDROID
+    // Phones can be as small as ~820x360 logical px at 3x density — the
+    // desktop minimum would overflow the screen and the user ends up
+    // panning a clipped window. The activity is always maximized (see
+    // main.cpp), so the minimum only needs to be a sane floor.
+    setMinimumSize(320, 240);
+#else
     setMinimumSize(1024, 400);
     resize(1400, 800);
+#endif
 
     // Apply frameless flag before first show() so the window is created
     // without chrome from the start — avoids the flash + re-create that
@@ -974,7 +982,10 @@ MainWindow::MainWindow(QWidget* parent)
             s.save();
         }
         if (s.value("FramelessWindow", "True").toString() == "True") {
-#ifndef Q_OS_WIN
+#if !defined(Q_OS_WIN) && !defined(Q_OS_ANDROID)
+            // Android: never frameless — the platform gives an
+            // undecorated fullscreen surface already, and the hint makes
+            // Qt create a movable sub-screen window instead.
             setWindowFlags(windowFlags() | Qt::FramelessWindowHint);
 #endif
         }
@@ -999,7 +1010,9 @@ MainWindow::MainWindow(QWidget* parent)
         // is well clear of the 18+ px title-bar height).  Stays
         // installed across frameless toggles — when the system frame is
         // back on, the platform owns resize and our filter no-ops.
+#ifndef Q_OS_ANDROID
         FramelessResizer::install(this);
+#endif
 
         // One-shot migration: collapse the legacy "CwDecodeOverlay" flat
         // key into the nested AppSettings["CwDecoder"] blob (#2417).  The

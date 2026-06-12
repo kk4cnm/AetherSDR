@@ -19,8 +19,12 @@
     <supports-screens android:anyDensity="true" android:largeScreens="true"
                       android:normalScreens="true" android:smallScreens="false" />
 
+    <!-- NoActionBar: without an explicit theme Android draws a framework
+         ActionBar with the activity label, eating ~32dp of a phone screen
+         and covering the top of the panadapter. -->
     <application
         android:name="org.qtproject.qt.android.bindings.QtApplication"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
         android:hardwareAccelerated="true"
         android:label="AetherSDR for Android"
         android:allowNativeHeapPointerTagging="false"

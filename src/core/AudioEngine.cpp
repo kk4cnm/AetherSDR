@@ -1037,6 +1037,13 @@ bool AudioEngine::startRxStream()
         noteRxAttempt(candidate);
         auto* sink = new QAudioSink(dev, candidate, this);
         sink->setVolume(m_muted.load() ? 0.0f : m_rxVolume.load());
+#ifdef Q_OS_ANDROID
+        // Qt's Android backend defaults to a small AudioTrack buffer sized
+        // for low latency; Wi-Fi delivery jitter on the VITA-49 stream then
+        // surfaces as audible pops. ~200 ms of headroom absorbs it — must
+        // be set before start().
+        sink->setBufferSize(candidate.bytesForDuration(200000));
+#endif
         QIODevice* io = sink->start();   // push-mode
         if (io) {
             m_audioSink = sink;

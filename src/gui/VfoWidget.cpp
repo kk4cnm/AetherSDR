@@ -435,6 +435,60 @@ VfoWidget::~VfoWidget()
     delete m_collapsedFreqLabel.data();
 }
 
+void VfoWidget::commitDirectEntry()
+{
+    const QString text = m_freqEdit->text().trimmed();
+    if (!text.isEmpty()) {
+        bool ok = false;
+        double freqMhz = 0.0;
+
+        // Try parsing as MHz (e.g. "14.225", "14.225.000", "14225", "14225.0")
+        QString clean = FrequencyEntryParser::normalizedMhzText(text);
+        freqMhz = clean.toDouble(&ok);
+        const bool explicitMhzEntry = FrequencyEntryParser::isExplicitMhzEntry(text, clean);
+
+        // If value looks like Hz or kHz (> 54 MHz is out of HF range)
+        // Context-aware parsing: on XVTR bands, accept higher freqs
+        const bool onXvtr = m_slice &&
+            (m_slice->rxAntenna().startsWith("XVT") || m_slice->frequency() > 54.0);
+        const bool highExplicitMhzEntry = ok && explicitMhzEntry && freqMhz > 54.0;
+        const double maxMhz = (onXvtr || highExplicitMhzEntry) ? 50000.0 : 54.0;
+
+        if (onXvtr) {
+            // 3-digit-band convenience: on 2m/70cm a bare integer like
+            //   1446 → 144.6, 14696 → 146.96, 144600 → 144.600
+            // Only fire when slice is in 100-999 MHz range; for 23cm
+            // and microwave bands a bare integer is the MHz itself
+            // (e.g. 1296 on 23cm means 1296 MHz, not 129.6 MHz).
+            const double sliceMhz = m_slice->frequency();
+            const bool threeDigitBand = sliceMhz >= 100.0 && sliceMhz < 1000.0;
+            if (ok && threeDigitBand && freqMhz > 450.0 && !clean.contains('.')) {
+                int digits = clean.length();
+                if (digits >= 4) {
+                    clean.insert(3, '.');
+                    freqMhz = clean.toDouble(&ok);
+                }
+            }
+        } else if (!highExplicitMhzEntry) {
+            // HF: 14225 = kHz, 14225000 = Hz
+            if (ok && freqMhz > 54000.0)
+                freqMhz /= 1e6;
+            else if (ok && freqMhz > 54.0)
+                freqMhz /= 1e3;
+        }
+
+        if (ok && freqMhz >= 0.001 && freqMhz <= maxMhz && m_slice) {
+            emit directEntryCommitted(freqMhz, m_directEntrySource);
+            // Clear so the paired editingFinished (fired when focus
+            // leaves as we switch back to the label) can't re-commit.
+            m_freqEdit->clear();
+        }
+    }
+    m_directEntrySource = "vfo-direct-entry";
+    if (m_freqStack)
+        m_freqStack->setCurrentIndex(0);  // back to label
+}
+
 void VfoWidget::buildUI()
 {
     auto* root = new QVBoxLayout(this);
@@ -659,57 +713,11 @@ void VfoWidget::buildUI()
     m_freqStack->addWidget(m_freqEdit);
     m_freqStack->setCurrentIndex(0);  // show label by default
 
-    connect(m_freqEdit, &QLineEdit::returnPressed, this, [this] {
-        const QString text = m_freqEdit->text().trimmed();
-        if (!text.isEmpty()) {
-            bool ok = false;
-            double freqMhz = 0.0;
-
-            // Try parsing as MHz (e.g. "14.225", "14.225.000", "14225", "14225.0")
-            QString clean = FrequencyEntryParser::normalizedMhzText(text);
-            freqMhz = clean.toDouble(&ok);
-            const bool explicitMhzEntry = FrequencyEntryParser::isExplicitMhzEntry(text, clean);
-
-            // If value looks like Hz or kHz (> 54 MHz is out of HF range)
-            // Context-aware parsing: on XVTR bands, accept higher freqs
-            const bool onXvtr = m_slice &&
-                (m_slice->rxAntenna().startsWith("XVT") || m_slice->frequency() > 54.0);
-            const bool highExplicitMhzEntry = ok && explicitMhzEntry && freqMhz > 54.0;
-            const double maxMhz = (onXvtr || highExplicitMhzEntry) ? 50000.0 : 54.0;
-
-            if (onXvtr) {
-                // 3-digit-band convenience: on 2m/70cm a bare integer like
-                //   1446 → 144.6, 14696 → 146.96, 144600 → 144.600
-                // Only fire when slice is in 100-999 MHz range; for 23cm
-                // and microwave bands a bare integer is the MHz itself
-                // (e.g. 1296 on 23cm means 1296 MHz, not 129.6 MHz).
-                const double sliceMhz = m_slice->frequency();
-                const bool threeDigitBand = sliceMhz >= 100.0 && sliceMhz < 1000.0;
-                if (ok && threeDigitBand && freqMhz > 450.0 && !clean.contains('.')) {
-                    int digits = clean.length();
-                    if (digits >= 4) {
-                        clean.insert(3, '.');
-                        freqMhz = clean.toDouble(&ok);
-                    }
-                }
-            } else if (!highExplicitMhzEntry) {
-                // HF: 14225 = kHz, 14225000 = Hz
-                if (ok && freqMhz > 54000.0)
-                    freqMhz /= 1e6;
-                else if (ok && freqMhz > 54.0)
-                    freqMhz /= 1e3;
-            }
-
-            if (ok && freqMhz >= 0.001 && freqMhz <= maxMhz && m_slice)
-                emit directEntryCommitted(freqMhz, m_directEntrySource);
-        }
-        m_directEntrySource = "vfo-direct-entry";
-        m_freqStack->setCurrentIndex(0);  // back to label
-    });
-    connect(m_freqEdit, &QLineEdit::editingFinished, this, [this] {
-        m_directEntrySource = "vfo-direct-entry";
-        m_freqStack->setCurrentIndex(0);
-    });
+    connect(m_freqEdit, &QLineEdit::returnPressed, this, &VfoWidget::commitDirectEntry);
+    // Android soft keyboards fire editingFinished (focus loss) from the
+    // action key instead of returnPressed; commit on either path. The
+    // field is cleared on a successful commit so this doesn't double-fire.
+    connect(m_freqEdit, &QLineEdit::editingFinished, this, &VfoWidget::commitDirectEntry);
 
     // ── Frequency row: [RADE badge] [stretch] [frequency] ───────────────
     {
@@ -3185,8 +3193,10 @@ bool VfoWidget::cancelDirectEntry()
         return false;
 
     m_directEntrySource = "vfo-direct-entry";
-    if (m_slice)
-        m_freqEdit->setText(QString::number(m_slice->frequency(), 'f', 6));
+    // Clear before clearFocus(): the focus loss fires editingFinished ->
+    // commitDirectEntry(), and an empty field makes that a no-op so an
+    // explicit cancel never commits a frequency.
+    m_freqEdit->clear();
     m_freqStack->setCurrentIndex(0);
     m_freqEdit->clearFocus();
     return true;

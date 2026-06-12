@@ -78,6 +78,11 @@ public:
     void setPlayOn(bool on);
     void setPlayEnabled(bool enabled);
     void beginDirectEntry(QString source = QStringLiteral("vfo-direct-entry"));
+    // Parse m_freqEdit's text and, if valid, emit directEntryCommitted.
+    // Clears the field on success so a following editingFinished (which
+    // Android's soft-keyboard action key fires instead of returnPressed)
+    // doesn't re-commit. Returns to the label either way.
+    void commitDirectEntry();
     QLabel* freqLabel() const { return m_freqLabel; }
 
     bool isCollapsed() const { return m_collapsed; }

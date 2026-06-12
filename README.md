@@ -1,3 +1,23 @@
+# AetherSDR for Android
+
+**A fork of [AetherSDR](https://github.com/aethersdr/AetherSDR) bringing
+FlexRadio operation to Android tablets and phones.**
+
+Maintained by Daniel Nelms, **KK4CNM**. All credit for AetherSDR itself
+goes to the upstream project — this fork adds the Android port described
+in [docs/PORTING-ANDROID.md](docs/PORTING-ANDROID.md). Phase 1 targets
+tablets with the existing Qt Widgets UI (LAN connect, panadapter +
+GPU waterfall, RX audio, mic TX with on-screen PTT); a touch-first QML
+UI for phones is Phase 2.
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+[![Qt6](https://img.shields.io/badge/Qt-6-green.svg)](https://www.qt.io/)
+
+---
+
+The upstream README follows.
+
 # AetherSDR
 
 **A Linux-native client for FlexRadio Systems transceivers**

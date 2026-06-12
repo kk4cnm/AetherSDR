@@ -1,4 +1,8 @@
 #include "VfoWidget.h"
+#ifdef Q_OS_ANDROID
+#include <QGuiApplication>
+#include <QInputMethod>
+#endif
 #include "PhaseKnob.h"
 #include "ComboStyle.h"
 #include "FrequencyEntryParser.h"
@@ -648,6 +652,9 @@ void VfoWidget::buildUI()
     const int stackW = QFontMetrics(labelFont).horizontalAdvance("0000.000.000") + 8;
     m_freqStack->setFixedWidth(stackW);
     m_freqEdit->setPlaceholderText("MHz (e.g. 14.225)");
+    // Numeric-formatted hint: phones raise a number pad instead of the
+    // full keyboard; no effect with a physical keyboard.
+    m_freqEdit->setInputMethodHints(Qt::ImhFormattedNumbersOnly);
     m_freqEdit->installEventFilter(this);
     m_freqStack->addWidget(m_freqEdit);
     m_freqStack->setCurrentIndex(0);  // show label by default
@@ -3165,6 +3172,10 @@ void VfoWidget::beginDirectEntry(QString source)
         if (!edit) return;
         edit->setFocus(Qt::ShortcutFocusReason);
         edit->selectAll();
+#ifdef Q_OS_ANDROID
+        // Programmatic focus does not always raise the soft keyboard.
+        QGuiApplication::inputMethod()->show();
+#endif
     });
 }
 
@@ -4195,6 +4206,18 @@ bool VfoWidget::eventFilter(QObject* obj, QEvent* event)
         beginDirectEntry();
         return true;
     }
+#ifdef Q_OS_ANDROID
+    // Touch: a single tap on the frequency readout opens direct entry.
+    // Double-tap is undiscoverable on a phone and there is no physical
+    // keyboard for the desktop type-to-tune path.
+    if (obj == m_freqLabel && event->type() == QEvent::MouseButtonRelease) {
+        auto* me = static_cast<QMouseEvent*>(event);
+        if (me->button() == Qt::LeftButton) {
+            beginDirectEntry(QStringLiteral("vfo-tap-entry"));
+            return true;
+        }
+    }
+#endif
     // Right-click on frequency label → context menu
     if (obj == m_freqLabel && event->type() == QEvent::MouseButtonPress) {
         auto* me = static_cast<QMouseEvent*>(event);

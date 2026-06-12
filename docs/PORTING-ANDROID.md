@@ -82,10 +82,15 @@ adb install -r build-android/android-build/build/outputs/apk/debug/android-build
 ## Known gaps / next steps
 
 0. **QRhiWidget GPU spectrum on Android** — composites a black surface
-   (Qt 6.8.2, OpenGL ES, Mali-G610) even though pipelines initialize and
-   data decodes. Re-test on Qt 6.9/6.10; suspect QRhiWidget
-   texture-composition or alpha handling on the GLES backend. The CPU
-   QPainter path is the Android default meanwhile.
+   even though pipelines initialize and data decodes. Confirmed
+   **device-independent**: identical black panadapter on Mali-G610
+   (phone, Android 15) and Mali-G615 (Galaxy Tab A11+ SM-X230,
+   Android 16), both Qt 6.8.2 / OpenGL ES — so this is a Qt-on-Android
+   QRhiWidget bug, not a Mali- or device-specific quirk. Re-test on
+   Qt 6.9/6.10 and file upstream; suspect QRhiWidget texture
+   composition or alpha handling on the GLES backend. The CPU QPainter
+   path is the Android default meanwhile and performs fine for a single
+   pan at tablet resolution.
 
 1. **Opus for Android** — cross-compile libopus (the vendored
    `third_party/opus-rade` snapshot or upstream) so compressed remote

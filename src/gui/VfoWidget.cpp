@@ -28,6 +28,17 @@
 #include <QComboBox>
 #include <QStackedWidget>
 #include <QVBoxLayout>
+
+// Slice-edge buttons (close / lock / record / play) and the slice badge:
+// 20 px suits a mouse pointer; on Android a fingertip needs ~9 mm, so the
+// buttons scale up. Corner radius and glyph size follow the button size.
+#ifdef Q_OS_ANDROID
+static constexpr int kSliceBtnPx   = 34;
+static constexpr int kSliceBtnFont = 17;
+#else
+static constexpr int kSliceBtnPx   = 20;
+static constexpr int kSliceBtnFont = 11;
+#endif
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QMenu>
@@ -526,13 +537,14 @@ void VfoWidget::buildUI()
     // Shared base style for the four 20x20 slice-side buttons (close, lock,
     // record, play). All use the same background circle so they line up
     // visually when stacked vertically on the slice edge.
-    static const QString sliceBtnStyle =
+    static const QString sliceBtnStyle = QString(
         "QPushButton { background: rgba(255,255,255,30); border: none; "
-        "border-radius: 10px; font-size: 11px; padding: 0; }"
-        "QPushButton:hover { background: rgba(255,255,255,60); }";
+        "border-radius: %1px; font-size: %2px; padding: 0; }"
+        "QPushButton:hover { background: rgba(255,255,255,60); }")
+        .arg(kSliceBtnPx / 2).arg(kSliceBtnFont);
 
     m_closeSliceBtn = new QPushButton("\xE2\x9C\x95", btnParent);  // ✕
-    m_closeSliceBtn->setFixedSize(20, 20);
+    m_closeSliceBtn->setFixedSize(kSliceBtnPx, kSliceBtnPx);
     m_closeSliceBtn->setStyleSheet(sliceBtnStyle +
         "QPushButton { color: #c8d8e8; }"
         "QPushButton:hover { background: rgba(204,32,32,180); color: #ffffff; }");
@@ -542,7 +554,7 @@ void VfoWidget::buildUI()
     });
 
     m_lockVfoBtn = new QPushButton("\xF0\x9F\x94\x93", btnParent);  // 🔓
-    m_lockVfoBtn->setFixedSize(20, 20);
+    m_lockVfoBtn->setFixedSize(kSliceBtnPx, kSliceBtnPx);
     m_lockVfoBtn->setCheckable(true);
     m_lockVfoBtn->setStyleSheet(sliceBtnStyle +
         "QPushButton:checked { background: rgba(255,100,100,80); }");
@@ -555,7 +567,7 @@ void VfoWidget::buildUI()
     // Record button
 
     m_recordBtn = new QPushButton(QString::fromUtf8("\xe2\x8f\xba"), btnParent);  // ⏺
-    m_recordBtn->setFixedSize(20, 20);
+    m_recordBtn->setFixedSize(kSliceBtnPx, kSliceBtnPx);
     m_recordBtn->setCheckable(true);
     m_recordBtn->setToolTip("Record slice audio");
     m_recordBtn->setStyleSheet(sliceBtnStyle +
@@ -583,7 +595,7 @@ void VfoWidget::buildUI()
 
     // Play button
     m_playBtn = new QPushButton(QString::fromUtf8("\xe2\x96\xb6"), btnParent);  // ▶
-    m_playBtn->setFixedSize(20, 20);
+    m_playBtn->setFixedSize(kSliceBtnPx, kSliceBtnPx);
     m_playBtn->setCheckable(true);
     m_playBtn->setEnabled(false);
     m_playBtn->setToolTip("Play recorded audio");
@@ -2172,7 +2184,7 @@ void VfoWidget::setCollapsed(bool collapsed)
         // Restore external buttons to pre-collapse state and reposition them
         // based on the new expanded width (they were positioned for COLLAPSED_W)
         {
-            const int btnSize = 20;
+            const int btnSize = kSliceBtnPx;
             const int gap = 2;
             int btnX;
             if (m_lastOnLeft)
@@ -2379,7 +2391,7 @@ void VfoWidget::updatePosition(int vfoX, int specTop, FlagDir dir)
 
     // Position close/lock/record/play buttons stacked vertically on the side opposite the marker
     if (m_closeSliceBtn && m_lockVfoBtn) {
-        const int btnSize = 20;
+        const int btnSize = kSliceBtnPx;
         const int gap = 2;
         int btnX;
         if (onLeft)

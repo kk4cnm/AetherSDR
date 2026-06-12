@@ -19,10 +19,11 @@ reaches parity.
 
 | Feature | Status |
 |---|---|
-| LAN discovery + connect | ported — needs `MulticastLock` (see below) |
-| Panadapter / waterfall (QRhi GPU) | ported (OpenGL ES backend) |
-| RX audio (remote audio via QAudioSink) | ported, uncompressed streams |
-| TX: device mic + on-screen PTT | ported (`RECORD_AUDIO` permission) |
+| LAN connect by IP | working (verified on hardware) |
+| LAN discovery | needs `MulticastLock` + WifiLock (see below); may still be filtered by some Wi-Fi chipsets |
+| Panadapter / waterfall | working via **CPU renderer** (QPainter). QRhiWidget GPU path composites black on Android (Qt 6.8.2 / Mali-G610) — forced off, see `AETHER_GPU_SPECTRUM_ANDROID_FORCE` |
+| RX audio (remote audio via QAudioSink) | working, uncompressed streams (needs WifiLock — see below) |
+| TX: device mic + on-screen PTT | ported (`RECORD_AUDIO` manifest + runtime permission requested at startup) |
 | SmartLink (WAN) | deferred — needs Opus for Android + Qt6Keychain replacement |
 | Client DSP strip / NR2 / RNNoise | compiles; FFTW absent → fallback FFT |
 | DFNR / specbleach / BNR / RADE / MQTT | off (`ENABLE_*=OFF`) |
@@ -31,10 +32,18 @@ reaches parity.
 
 ## Android-specific code
 
-- `src/core/AndroidMulticastLock.{h,cpp}` — acquires
-  `WifiManager.MulticastLock` at startup. Android Wi-Fi drivers filter
-  UDP broadcast by default; without this the radio's discovery packets
-  on `:4992` never arrive and the radio chooser stays empty.
+- `src/core/AndroidMulticastLock.{h,cpp}` — acquires two WifiManager
+  locks at startup:
+  - `MulticastLock`: Android Wi-Fi drivers filter UDP broadcast by
+    default; without it the radio's discovery packets on `:4992` never
+    arrive and the radio chooser stays empty.
+  - `WifiLock` (`WIFI_MODE_FULL_LOW_LATENCY`): **critical.** Wi-Fi
+    power save naps the chip between beacons; the AP buffers-then-drops
+    the radio's ~350 pkt/s of unsolicited VITA-49 UDP (audio, FFT,
+    waterfall, meters) while TCP survives on retransmissions. Symptom
+    without it: controls work, S-meter/waterfall dead, audio is
+    rhythmic popping. Verified on MediaTek MT6895 (Unihertz TANK 3,
+    Android 15): ~1 pkt/s without the lock, full stream rate with it.
 - `android/AndroidManifest.xml` — permissions (INTERNET, RECORD_AUDIO,
   CHANGE_WIFI_MULTICAST_STATE, WAKE_LOCK, …), landscape launch activity.
 - `CMakeLists.txt` — `if(ANDROID)` gates: pkg-config blinded (host
@@ -71,6 +80,12 @@ adb install -r build-android/android-build/build/outputs/apk/debug/android-build
 ```
 
 ## Known gaps / next steps
+
+0. **QRhiWidget GPU spectrum on Android** — composites a black surface
+   (Qt 6.8.2, OpenGL ES, Mali-G610) even though pipelines initialize and
+   data decodes. Re-test on Qt 6.9/6.10; suspect QRhiWidget
+   texture-composition or alpha handling on the GLES backend. The CPU
+   QPainter path is the Android default meanwhile.
 
 1. **Opus for Android** — cross-compile libopus (the vendored
    `third_party/opus-rade` snapshot or upstream) so compressed remote

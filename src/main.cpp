@@ -5,6 +5,7 @@
 #include "core/MacMicPermission.h"
 #ifdef Q_OS_ANDROID
 #include "core/AndroidMulticastLock.h"
+#include <QPermissions>
 #endif
 
 #include <QApplication>
@@ -167,10 +168,18 @@ int main(int argc, char* argv[])
     app.setDesktopFileName("AetherSDR");  // matches .desktop file for taskbar icon
 
 #ifdef Q_OS_ANDROID
-    // Android Wi-Fi stacks drop UDP broadcast unless a MulticastLock is
-    // held; without it the radio's VITA-49 discovery packets on :4992
-    // never reach our socket. Held for the app's lifetime.
+    // Wi-Fi locks: MulticastLock for discovery broadcasts, low-latency
+    // WifiLock so power save doesn't starve the VITA-49 UDP streams.
+    // Held for the app's lifetime.
     AetherSDR::AndroidMulticastLock::acquire();
+
+    // TX uses the device microphone; Android needs a runtime grant on top
+    // of the manifest entry. Request at startup so the dialog appears
+    // before the operator first hits PTT, not mid-QSO.
+    app.requestPermission(QMicrophonePermission{}, [](const QPermission& p) {
+        if (p.status() != Qt::PermissionStatus::Granted)
+            qWarning("Microphone permission not granted — TX audio unavailable");
+    });
 #endif
 
     // ── Bundled DSEG fonts (SIL OFL 1.1) ──────────────────────────────────

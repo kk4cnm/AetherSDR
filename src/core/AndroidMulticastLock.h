@@ -2,10 +2,15 @@
 
 namespace AetherSDR {
 
-// Holds a WifiManager.MulticastLock so the Wi-Fi stack delivers the UDP
-// broadcast discovery packets FlexRadio transmits on port 4992. Android
-// filters broadcast/multicast frames in the Wi-Fi driver by default to
-// save power; without this lock discovery silently finds nothing.
+// Holds the two WifiManager locks the app needs for radio traffic:
+//
+// - MulticastLock: the Wi-Fi driver filters broadcast/multicast frames by
+//   default to save power; without it the UDP discovery broadcasts
+//   FlexRadio sends on :4992 silently never arrive.
+// - WifiLock (low-latency): Wi-Fi power save naps the chip between
+//   beacons, so the AP buffers-then-drops the radio's high-rate VITA-49
+//   unicast streams (audio, FFT, waterfall) while TCP limps along on
+//   retransmissions. The lock disables power save while the app runs.
 //
 // Compiled on Android only (see the ANDROID block in CMakeLists.txt).
 class AndroidMulticastLock {

@@ -131,6 +131,15 @@ if(ANDROID)
     # execute in a cross-build. arm64-v8a mandates NEON — preseed success.
     set(C_HAS_NEON_1_EXITCODE 0 CACHE STRING "cross-build: NEON guaranteed on arm64-v8a" FORCE)
     set(CXX_HAS_NEON_1_EXITCODE 0 CACHE STRING "cross-build: NEON guaranteed on arm64-v8a" FORCE)
+    # QRhiWidget composites a black surface on Android (observed on Qt 6.8.2
+    # GLES / Mali-G610: pipelines build and tiles decode, but nothing the
+    # widget draws reaches the screen — including the static background).
+    # Default to the QPainter spectrum path until a fixed Qt is verified;
+    # pass -DAETHER_GPU_SPECTRUM_ANDROID_FORCE=ON to re-test the GPU path.
+    if(AETHER_GPU_SPECTRUM AND NOT AETHER_GPU_SPECTRUM_ANDROID_FORCE)
+        set(AETHER_GPU_SPECTRUM OFF)
+        message(STATUS "GPU spectrum disabled on Android (QRhiWidget black-surface issue)")
+    endif()
 endif()
 
 # PortAudio (optional fallback for audio)

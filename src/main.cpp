@@ -3,6 +3,9 @@
 #include "core/AppSettings.h"
 #include "core/LogManager.h"
 #include "core/MacMicPermission.h"
+#ifdef Q_OS_ANDROID
+#include "core/AndroidMulticastLock.h"
+#endif
 
 #include <QApplication>
 #include <QSurfaceFormat>
@@ -24,7 +27,7 @@
 #include <cstring>
 #endif
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(Q_OS_ANDROID)
 #include <dlfcn.h>
 
 // Minimal forward declarations matching the Xlib error-handler ABI.
@@ -56,7 +59,7 @@ static int aetherTolerantX11ErrorHandler(AetherX11Display*, AetherX11ErrorEvent*
              ev ? ev->request_code : -1);
     return 0;
 }
-#endif  // __linux__
+#endif  // __linux__ && !Q_OS_ANDROID
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -97,7 +100,7 @@ int main(int argc, char* argv[])
         }
     }
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(Q_OS_ANDROID)
     // Install a tolerant X11 error handler before QApplication and before any
     // library (FFmpeg, VA-API, VDPAU) can open an X11 connection.  Xlib's
     // default handler calls exit() on protocol errors like BadAccess, which
@@ -162,6 +165,13 @@ int main(int argc, char* argv[])
     app.setApplicationVersion(AETHERSDR_VERSION);
     app.setOrganizationName("AetherSDR");
     app.setDesktopFileName("AetherSDR");  // matches .desktop file for taskbar icon
+
+#ifdef Q_OS_ANDROID
+    // Android Wi-Fi stacks drop UDP broadcast unless a MulticastLock is
+    // held; without it the radio's VITA-49 discovery packets on :4992
+    // never reach our socket. Held for the app's lifetime.
+    AetherSDR::AndroidMulticastLock::acquire();
+#endif
 
     // ── Bundled DSEG fonts (SIL OFL 1.1) ──────────────────────────────────
     // Register the 13 TTFs into QFontDatabase so themes can resolve

@@ -80,6 +80,9 @@ inline DaxTxPlatform currentDaxTxPlatform()
     return DaxTxPlatform::Windows;
 #elif defined(Q_OS_MAC)
     return DaxTxPlatform::MacOS;
+#elif defined(Q_OS_ANDROID)
+    // No PulseAudio/PipeWire userspace — DAX virtual audio is unavailable.
+    return DaxTxPlatform::Other;
 #elif defined(Q_OS_LINUX)
     return DaxTxPlatform::Linux;
 #else

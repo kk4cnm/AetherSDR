@@ -104,7 +104,7 @@ if(Qt6WebSockets_FOUND)
 else()
     message(STATUS "Qt6::WebSockets not found — FreeDV Reporter spot source disabled")
 endif()
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     find_package(Qt6 QUIET COMPONENTS DBus)
     if(Qt6DBus_FOUND)
         message(STATUS "Qt6::DBus found — sleep inhibition via D-Bus enabled")
@@ -117,6 +117,20 @@ if(Qt6Keychain_FOUND)
     message(STATUS "Qt6Keychain found — SmartLink credential persistence enabled")
 else()
     message(STATUS "Qt6Keychain not found — SmartLink credential persistence disabled")
+endif()
+
+# Cross-compiling for Android: the host's pkg-config would happily hand us
+# Homebrew/system libraries the NDK cannot link (opus, onnxruntime, fftw3,
+# ...). CMAKE_FIND_ROOT_PATH protects find_library/find_path, but pkg-config
+# bypasses it — so blind it entirely. Every pkg-config dependency is
+# desktop-only until someone cross-compiles it for Android explicitly.
+if(ANDROID)
+    set(PKG_CONFIG_EXECUTABLE "ANDROID-PKGCONFIG-DISABLED" CACHE FILEPATH
+        "pkg-config disabled for Android cross-builds (host-library leakage)" FORCE)
+    # liquid-dsp's SIMD autodetection try_run()s NEON probes, which cannot
+    # execute in a cross-build. arm64-v8a mandates NEON — preseed success.
+    set(C_HAS_NEON_1_EXITCODE 0 CACHE STRING "cross-build: NEON guaranteed on arm64-v8a" FORCE)
+    set(CXX_HAS_NEON_1_EXITCODE 0 CACHE STRING "cross-build: NEON guaranteed on arm64-v8a" FORCE)
 endif()
 
 # PortAudio (optional fallback for audio)
@@ -280,6 +294,15 @@ if(AETHER_GPU_SPECTRUM)
         find_package(Qt6 REQUIRED COMPONENTS ShaderTools)
         # Qt6GuiPrivate provides QRhi headers needed for GPU rendering.
         find_package(Qt6GuiPrivate QUIET)
+        if(NOT Qt6GuiPrivate_FOUND)
+            # Qt online-installer/aqt kits (and Android kits) don't ship a
+            # standalone Qt6GuiPrivate package — the component form of the
+            # same module does resolve there.
+            find_package(Qt6 QUIET COMPONENTS GuiPrivate)
+            if(TARGET Qt6::GuiPrivate)
+                set(Qt6GuiPrivate_FOUND TRUE)
+            endif()
+        endif()
 
         # Detect Debian paths early (support any multiarch tuple, e.g. aarch64-linux-gnu)
         if(NOT Qt6GuiPrivate_FOUND)
@@ -592,6 +615,9 @@ set(CORE_SOURCES
 
 if(APPLE)
     list(APPEND CORE_SOURCES src/core/VirtualAudioBridge.cpp src/core/MacMicPermission.mm)
+elseif(ANDROID)
+    # Android: no DAX virtual-audio bridge (no PulseAudio/PipeWire userspace).
+    # RX/TX audio goes through QAudioSink/QAudioSource (AAudio backend).
 elseif(UNIX)
     # Linux DAX uses PulseAudio pipe modules via pactl (works with PipeWire too).
     # When libpipewire-0.3 dev headers are present we additionally compile a
@@ -958,7 +984,13 @@ endif()
 
 qt_add_resources(RESOURCES resources/resources.qrc)
 
-add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${BNR_SOURCES} ${SPECBLEACH_SOURCES} ${RESOURCES} ${DFNR_RESOURCES})
+if(ANDROID)
+    # qt_add_executable is required on Android: it builds the app as a
+    # shared library and drives androiddeployqt/Gradle APK packaging.
+    qt_add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${BNR_SOURCES} ${SPECBLEACH_SOURCES} ${RESOURCES} ${DFNR_RESOURCES})
+else()
+    add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${BNR_SOURCES} ${SPECBLEACH_SOURCES} ${RESOURCES} ${DFNR_RESOURCES})
+endif()
 
 if (USE_SYSTEM_ZLIB)
     target_link_libraries(AetherSDR PRIVATE PkgConfig::zlib)
@@ -1040,6 +1072,24 @@ endif()
 # Windows: GUI app (no console window) + icon resource
 if(WIN32)
     set_target_properties(AetherSDR PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
+# Android: APK packaging. Manifest + Gradle template live in android/.
+# Min SDK 28 (Android 9): first release with stable AAudio via Qt Multimedia
+# and adb-less wireless debugging on tablets we care about.
+if(ANDROID)
+    set_target_properties(AetherSDR PROPERTIES
+        QT_ANDROID_PACKAGE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/android"
+        QT_ANDROID_PACKAGE_NAME "org.aethersdr.mobile"
+        QT_ANDROID_MIN_SDK_VERSION 28
+        QT_ANDROID_TARGET_SDK_VERSION 35
+        QT_ANDROID_VERSION_NAME "${PROJECT_VERSION}"
+    )
+    # WifiManager.MulticastLock helper — without it Android Wi-Fi stacks
+    # drop the UDP broadcast discovery packets FlexRadio sends on :4992.
+    target_sources(AetherSDR PRIVATE
+        src/core/AndroidMulticastLock.cpp
+        src/core/AndroidMulticastLock.h)
 endif()
 
 # macOS app bundle
@@ -1187,7 +1237,10 @@ else()
     add_subdirectory(third_party/libmspack)
 endif()
 
-# Bundled RtMidi (MIT license) — MIDI controller support on all platforms
+# Bundled RtMidi (MIT license) — MIDI controller support on all desktop
+# platforms. Android has no RtMidi backend (no ALSA userspace), so the
+# whole MIDI feature is compiled out there; HAVE_MIDI guards all call sites.
+if(NOT ANDROID)
 message(STATUS "MIDI controller support enabled (RtMidi)")
 target_compile_definitions(AetherSDR PRIVATE HAVE_MIDI)
 target_sources(AetherSDR PRIVATE
@@ -1219,6 +1272,7 @@ else()
     endif()
     target_link_libraries(AetherSDR PRIVATE PkgConfig::alsa)
 endif()
+endif() # NOT ANDROID (MIDI controller support)
 
 # hidapi — USB HID encoder support (Stream Deck, Icom RC-28, Griffin PowerMate, Contour Shuttle)
 # Windows: run scripts/setup/setup-hidapi.ps1 first to download and build hidapi
@@ -1254,7 +1308,7 @@ target_sources(AetherSDR PRIVATE
     src/core/UlanziDialBackend.h
     src/gui/UlanziDialMapperDialog.cpp
     src/gui/UlanziDialMapperDialog.h)
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     target_sources(AetherSDR PRIVATE
         src/core/EvdevEncoderManager.cpp
         src/core/EvdevEncoderManager.h)
@@ -1606,6 +1660,13 @@ else()
     )
 endif()
 
+
+if(ANDROID)
+    # Android: desktop unit-test harnesses, dev tools, and install rules
+    # below don't apply — APK packaging is handled by androiddeployqt via
+    # qt_add_executable. Stop processing here.
+    return()
+endif()
 
 # ── Unit test harnesses ──────────────────────────────────────────────────────
 # Standalone DSP smoke tests. Built alongside the main target so they share

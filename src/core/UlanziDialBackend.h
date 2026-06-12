@@ -8,7 +8,7 @@
 
 #include <QtGlobal>
 
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
     #include "core/EvdevEncoderManager.h"
     namespace AetherSDR { using UlanziDialBackend = EvdevEncoderManager; }
 #elif defined(Q_OS_WIN) && defined(HAVE_HIDAPI)

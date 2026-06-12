@@ -101,7 +101,7 @@ class MidiMappingDialog;
 class RC28MappingDialog;
 #endif
 class UlanziDialMapperDialog;
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
 class EvdevEncoderManager;
 #elif defined(Q_OS_WIN) && defined(HAVE_HIDAPI)
 class UlanziDialWindowsManager;
@@ -639,7 +639,7 @@ private:
     QMetaObject::Connection m_tmate2RitConn;
     QMetaObject::Connection m_tmate2XitConn;
 #endif
-#ifdef Q_OS_LINUX
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
     EvdevEncoderManager*       m_dialBackend{nullptr};
 #elif defined(Q_OS_WIN) && defined(HAVE_HIDAPI)
     UlanziDialWindowsManager*  m_dialBackend{nullptr};

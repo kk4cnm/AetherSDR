@@ -27,8 +27,19 @@
 #include "PanadapterStack.h"
 #include "RadioSetupDialog.h"
 #include "RxApplet.h"
+#include "AmpApplet.h"
+#include "HealthApplet.h"
+#include "MeterApplet.h"
+#include "ProfileSwitcherApplet.h"
+#include "SMeterWidget.h"
+#include "TunerApplet.h"
+#include "TxApplet.h"
+#include "core/PeripheralSettings.h"
+#include "core/KiwiSdrManager.h"
+#include "core/KiwiSdrProtocol.h"
 #include "SpectrumOverlayMenu.h"
 #include "SpectrumWidget.h"
+#include "core/AdaptiveFilterEngine.h"
 #include "VfoWidget.h"
 #include "core/BandStackSettings.h"
 #include "core/AppSettings.h"
@@ -38,13 +49,19 @@
 #ifdef HAVE_RADE
 #include "core/RADEEngine.h"
 #endif
+#include "models/ProfileLoadCommand.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
 
+#include <QDateTime>
+#include <QElapsedTimer>
 #include <QFileDialog>
+#include <QPointer>
+#include <QSet>
 #include <QTimer>
 
 #include <algorithm>
+#include <memory>
 #include <cmath>
 
 namespace AetherSDR {
@@ -57,11 +74,77 @@ constexpr double kRevealComfortEdgeMarginFrac = 0.18;
 constexpr double kSpectrumClickEdgeMarginFrac = 0.05;
 
 constexpr double kMemoryRevealTargetToleranceMhz = 0.000001;
+constexpr int kPanDimensionDecoderFallbackMs = 650;
+constexpr int kKiwiGestureViewUpdateMs = 100;
+constexpr qint64 kProfileLoadDimensionSettleMs = kPanDimensionDecoderFallbackMs + 100;
+
+int currentAutoSqlMarginDb()
+{
+    return std::clamp(
+        AppSettings::instance().value("AutoSqlMarginDb", "10").toInt(), 5, 20);
+}
+
+int kiwiSdrSquelchMarginDbForSliceLevel(const SliceModel* slice, int level)
+{
+    if (slice && slice->externalReceiveAutoSquelchOn()) {
+        return currentAutoSqlMarginDb();
+    }
+    return KiwiSdrProtocol::squelchSliderLevelToMarginDb(level);
+}
 
 bool memoryRevealTargetMatches(double actualMhz, double targetMhz)
 {
     return targetMhz <= 0.0
         || std::abs(actualMhz - targetMhz) <= kMemoryRevealTargetToleranceMhz;
+}
+
+bool dbmRangeLooksPlausible(float minDbm, float maxDbm)
+{
+    constexpr float kMinAllowedDbm = -180.0f;
+    constexpr float kMaxAllowedDbm = 80.0f;
+    constexpr float kMinRangeDb = 10.0f;
+    constexpr float kMaxRangeDb = 180.0f;
+
+    if (!std::isfinite(minDbm) || !std::isfinite(maxDbm)) {
+        return false;
+    }
+
+    const float rangeDb = maxDbm - minDbm;
+    return minDbm >= kMinAllowedDbm
+        && maxDbm <= kMaxAllowedDbm
+        && rangeDb >= kMinRangeDb
+        && rangeDb <= kMaxRangeDb;
+}
+
+SliceModel* kiwiAssignedSliceForPan(const RadioModel& radioModel,
+                                    const KiwiSdrManager* manager,
+                                    const QString& panId)
+{
+    if (!manager || panId.isEmpty()) {
+        return nullptr;
+    }
+
+    QVector<SliceModel*> candidates;
+    for (SliceModel* slice : radioModel.slices()) {
+        if (!slice || slice->panId() != panId
+            || !radioModel.sliceMayBelongToUs(slice->sliceId())
+            || manager->assignedProfileForSlice(slice->sliceId()).isEmpty()) {
+            continue;
+        }
+        if (slice->isDiversityParent()) {
+            return slice;
+        }
+        candidates.append(slice);
+    }
+    if (candidates.isEmpty()) {
+        return nullptr;
+    }
+    for (SliceModel* slice : candidates) {
+        if (!slice->diversity()) {
+            return slice;
+        }
+    }
+    return candidates.first();
 }
 
 // Pan-follow tuning internals — moved with their only callers from
@@ -78,6 +161,139 @@ double quantizeIncrementalFollowDelta(double overshootMhz, double stepMhz)
 }
 
 } // namespace
+
+void MainWindow::syncActiveSliceSquelchLineToSpectrums()
+{
+    SliceModel* s = activeSlice();
+    if (!s) {
+        auto clearSpectrum = [](SpectrumWidget* sw) {
+            if (!sw) {
+                return;
+            }
+            sw->clearKiwiSdrSquelchLine();
+            sw->setSquelchLine(false, 0);
+        };
+        if (!m_panStack) {
+            clearSpectrum(spectrum());
+            return;
+        }
+        for (PanadapterApplet* applet : m_panStack->allApplets()) {
+            if (!applet) {
+                continue;
+            }
+            clearSpectrum(m_panStack->spectrum(applet->panId()));
+        }
+        return;
+    }
+
+    const bool kiwiActive = m_kiwiSdrManager
+        && !m_kiwiSdrManager->assignedProfileForSlice(s->sliceId()).isEmpty();
+    const bool on = kiwiActive ? s->receiveSquelchOn() : s->squelchOn();
+    const int level = kiwiActive ? s->receiveSquelchLevel()
+                                 : s->squelchLevel();
+    const QString kiwiPanId = kiwiActive ? s->panId() : QString();
+    auto applyToSpectrum = [&](const QString& panId, SpectrumWidget* sw) {
+        if (!sw) {
+            return;
+        }
+        if (SliceModel* kiwiSlice =
+                kiwiAssignedSliceForPan(m_radioModel, m_kiwiSdrManager, panId)) {
+            sw->setKiwiSdrSquelchLine(
+                kiwiSlice->receiveSquelchOn(),
+                kiwiSdrSquelchMarginDbForSliceLevel(
+                    kiwiSlice, kiwiSlice->receiveSquelchLevel()),
+                kiwiSlice->externalReceiveAutoSquelchOn());
+            sw->setSquelchLine(false, 0);
+            return;
+        }
+        if (kiwiActive) {
+            if (panId == kiwiPanId) {
+                sw->setKiwiSdrSquelchLine(
+                    on, kiwiSdrSquelchMarginDbForSliceLevel(s, level),
+                    s->externalReceiveAutoSquelchOn());
+            } else {
+                sw->clearKiwiSdrSquelchLine();
+                sw->setSquelchLine(false, 0);
+            }
+            return;
+        }
+        if (!kiwiSdrProfileForPan(panId).isEmpty()
+            || sw->kiwiSdrWaterfallActive()) {
+            sw->clearKiwiSdrSquelchLine();
+            sw->setSquelchLine(false, 0);
+            return;
+        }
+        sw->clearKiwiSdrSquelchLine();
+        sw->setSquelchLine(on, level);
+    };
+
+    if (!m_panStack) {
+        applyToSpectrum(s->panId(), spectrumForSlice(s));
+        return;
+    }
+
+    for (PanadapterApplet* applet : m_panStack->allApplets()) {
+        if (!applet) {
+            continue;
+        }
+        applyToSpectrum(applet->panId(), m_panStack->spectrum(applet->panId()));
+    }
+}
+
+bool MainWindow::autoSquelchShouldRunOnSpectrum(
+    const QString& panId, const SpectrumWidget* spectrum) const
+{
+    if (const SliceModel* kiwiSlice =
+            kiwiAssignedSliceForPan(m_radioModel, m_kiwiSdrManager, panId)) {
+        return kiwiSlice->externalReceiveAutoSquelchOn();
+    }
+
+    if (!m_appletPanel || !m_appletPanel->rxApplet()
+        || m_appletPanel->rxApplet()->sqlMode() != RxApplet::SqlMode::Auto) {
+        return false;
+    }
+
+    const SliceModel* s = activeSlice();
+    if (!s) {
+        return false;
+    }
+
+    const bool activeKiwi = m_kiwiSdrManager
+        && !m_kiwiSdrManager->assignedProfileForSlice(s->sliceId()).isEmpty();
+
+    if (activeKiwi) {
+        return panId == s->panId();
+    }
+
+    return kiwiSdrProfileForPan(panId).isEmpty()
+        && (!spectrum || !spectrum->kiwiSdrWaterfallActive());
+}
+
+void MainWindow::syncActiveSliceAutoSquelchToSpectrums()
+{
+    auto applyToSpectrum = [this](const QString& panId, SpectrumWidget* sw) {
+        if (!sw) {
+            return;
+        }
+        sw->setAutoSquelchEnable(autoSquelchShouldRunOnSpectrum(panId, sw));
+    };
+
+    if (!m_panStack) {
+        if (SliceModel* s = activeSlice()) {
+            applyToSpectrum(s->panId(), spectrumForSlice(s));
+        } else {
+            applyToSpectrum(QString(), spectrum());
+        }
+        return;
+    }
+
+    for (PanadapterApplet* applet : m_panStack->allApplets()) {
+        if (!applet) {
+            continue;
+        }
+        applyToSpectrum(applet->panId(), m_panStack->spectrum(applet->panId()));
+    }
+}
 
 void MainWindow::wireAetherDspWidget(AetherDspWidget* w)
 {
@@ -188,31 +404,32 @@ void MainWindow::onSliceAdded(SliceModel* s)
                 QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setMnrEnabled(true); });
             // BNR not auto-restored — requires manual enable each session
 
-            // Restore DEXP (downward expander) — radio does not persist across sessions
-            bool dexpSaved = settings.value("DexpEnabled", "False").toString() == "True";
-            int dexpLevel = settings.value("DexpLevel", "0").toInt();
-            if (dexpSaved) {
-                m_radioModel.transmitModel().setDexp(true);
-                if (dexpLevel > 0) {
-                    m_radioModel.transmitModel().setDexpLevel(dexpLevel);
-                }
-            }
-
             refreshCwDecodeState();
             refreshRttyDecodeState();
         });
     }
 
     // Restore per-slice DAX channel from last session (#1221).
-    // Deferred so the radio's initial slice status has arrived first.
+    // Deferred so the radio's initial slice status has arrived first. Skip this
+    // during profile recall: setDaxChannel() updates local slice state before
+    // sending the radio command, and profile-created slices must keep the
+    // radio/profile DAX assignment.
     {
         const int sliceIdx = m_radioModel.slices().indexOf(s);
         if (sliceIdx >= 0) {
             const QString key = QString("DaxChannel_Slice%1").arg(QChar('A' + sliceIdx));
             int savedDax = AppSettings::instance().value(key, "0").toInt();
             if (savedDax > 0) {
-                QTimer::singleShot(300, this, [s, savedDax]() {
-                    if (s) { s->setDaxChannel(savedDax); }
+                // QPointer guards against a dangling slice: a raw SliceModel*
+                // stays non-null after the slice is destroyed, so the `s &&`
+                // check below is only meaningful if the capture auto-nulls.
+                // Removing the slice within this 300 ms window (rapid
+                // add/remove) would otherwise dereference freed memory. (#3646)
+                QPointer<SliceModel> sp(s);
+                QTimer::singleShot(300, this, [this, sp, savedDax]() {
+                    if (sp && !profileLoadRadioStateWritesHeld()) {
+                        sp->setDaxChannel(savedDax);
+                    }
                 });
             }
         }
@@ -221,8 +438,11 @@ void MainWindow::onSliceAdded(SliceModel* s)
     // Re-claim TX assignment after profile load or slice recreation (#145).
     // The radio sets tx=1 on the slice but tx_client_handle may be 0x00000000
     // if the slice was destroyed and recreated (e.g. by profile global load).
-    if (s->isTxSlice())
-        m_radioModel.sendCommand(QString("slice set %1 tx=1").arg(s->sliceId()));
+    // During profile recall, RadioModel's profile-load hold suppresses this
+    // slice write so it cannot fight the radio's restored profile state.
+    if (s->isTxSlice()) {
+        s->setTxSlice(true);
+    }
 
     // Keep the radio-side TX DAX flag aligned when the TX slice or mode changes.
     // SmartSDR DAX2 on Windows owns both the dax_tx stream and the radio's
@@ -255,10 +475,13 @@ void MainWindow::onSliceAdded(SliceModel* s)
         // the user re-arms it from the DAX2 window.  Let the user manage that
         // state via DAX2 — matches SmartSDR Console behavior. (#2315)
 #if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
-        m_radioModel.transmitModel().setDax(isDigital);
         m_audio->setDaxTxMode(isDigital);
-        if (isDigital)
-            m_radioModel.ensureDaxTxStream(DaxTxRequestReason::HostedDaxBridge);
+        if (!profileLoadRadioStateWritesHeld()) {
+            m_radioModel.transmitModel().setDax(isDigital);
+            if (isDigital) {
+                m_radioModel.ensureDaxTxStream(DaxTxRequestReason::HostedDaxBridge);
+            }
+        }
 #else
         Q_UNUSED(isDigital);
 #endif
@@ -332,16 +555,45 @@ void MainWindow::onSliceAdded(SliceModel* s)
         // HID encoder frequency tuning routes through applyFlexControlWheelAction,
         // so m_flexCoalesceTimer above already covers it.
         const bool memoryRevealPending = (m_pendingMemoryRevealSliceId == s->sliceId());
-        if (activeTuning && s->sliceId() == m_activeSliceId && !memoryRevealPending)
+        SliceModel* active = m_radioModel.slice(m_activeSliceId);
+        const bool activeDiversityPartner = isSameDiversityReceivePair(active, s);
+        SliceModel* dragTarget = m_radioModel.slice(m_sliceDragTargetSliceId);
+        const bool dragDiversityPartner = isSameDiversityReceivePair(dragTarget, s);
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        const bool dragEchoHoldActive =
+            m_sliceDragInProgress
+            || (m_sliceDragEchoHoldUntilMs > 0 && nowMs < m_sliceDragEchoHoldUntilMs);
+        const bool dragTargetSlice =
+            m_sliceDragTargetSliceId >= 0
+            && (s->sliceId() == m_sliceDragTargetSliceId || dragDiversityPartner);
+        if (dragEchoHoldActive && dragTargetSlice
+            && m_sliceDragTargetMhz > 0.0 && !memoryRevealPending) {
+            const int sliceId = s->sliceId();
+            QTimer::singleShot(0, this, [this, sliceId]() {
+                const double displayMhz = m_sliceDragTargetMhz;
+                if (displayMhz <= 0.0) {
+                    return;
+                }
+                if (!m_sliceDragInProgress
+                    && QDateTime::currentMSecsSinceEpoch() >= m_sliceDragEchoHoldUntilMs) {
+                    return;
+                }
+                SliceModel* slice = m_radioModel.slice(sliceId);
+                if (!slice) {
+                    return;
+                }
+                pushSliceFrequencyToOverlays(slice, displayMhz);
+            });
             return;
+        }
+        if (activeTuning
+            && (s->sliceId() == m_activeSliceId || activeDiversityPartner)
+            && !memoryRevealPending) {
+            return;
+        }
 
         m_updatingFromModel = true;
-        if (auto* sw = spectrumForSlice(s))
-            sw->setSliceOverlay(s->sliceId(), mhz,
-                s->filterLow(), s->filterHigh(), s->isTxSlice(),
-                s->sliceId() == m_activeSliceId,
-                s->mode(), s->rttyMark(), s->rttyShift(),
-                s->ritOn(), s->ritFreq(), s->xitOn(), s->xitFreq());
+        pushSliceFrequencyToOverlays(s, mhz);
         m_updatingFromModel = false;
         if (s->isTxSlice())
             syncTxWaterfallSliceToSpectrums();
@@ -395,19 +647,43 @@ void MainWindow::onSliceAdded(SliceModel* s)
         sw->setSliceOverlay(s->sliceId(), s->frequency(),
             lo, hi, s->isTxSlice(), s->sliceId() == m_activeSliceId,
             s->mode(), s->rttyMark(), s->rttyShift(),
-            s->ritOn(), s->ritFreq(), s->xitOn(), s->xitFreq());
+            s->ritOn(), s->ritFreq(), s->xitOn(), s->xitFreq(),
+            s->diversity(), s->isDiversityParent(),
+            s->isDiversityChild(), s->diversityIndex());
         if (s->isTxSlice())
             syncTxWaterfallSliceToSpectrums();
     });
-    // Squelch threshold line on the spectrum overlay — only update for the
-    // active slice so that inactive slices sharing a pan don't overwrite it.
+    // Squelch threshold line on the spectrum overlay. Flex follows the active
+    // slice only; Kiwi replacement audio owns an independent line on its own
+    // pan even when a Flex slice is active elsewhere.
     connect(s, &SliceModel::squelchChanged, this, [this, s](bool on, int level) {
+        Q_UNUSED(on);
+        Q_UNUSED(level);
         if (s != activeSlice()) return;
-        if (auto* sw = spectrumForSlice(s))
-            sw->setSquelchLine(on, level);
+        syncActiveSliceSquelchLineToSpectrums();
     });
-    if (auto* sw = spectrumForSlice(s))
+    connect(s, &SliceModel::externalReceiveSquelchChanged,
+            this, [this, s](bool on, int level) {
+        const bool kiwiAssigned = m_kiwiSdrManager
+            && !m_kiwiSdrManager->assignedProfileForSlice(s->sliceId()).isEmpty();
+        if (!kiwiAssigned) {
+            return;
+        }
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+        if (SpectrumWidget* sw = spectrumForSlice(s)) {
+            sw->setKiwiSdrSquelchLine(
+                on, kiwiSdrSquelchMarginDbForSliceLevel(s, level),
+                s->externalReceiveAutoSquelchOn());
+        }
+        if (s == activeSlice()) {
+            syncActiveSliceSquelchLineToSpectrums();
+        }
+    });
+    if (s == activeSlice()) {
+        syncActiveSliceSquelchLineToSpectrums();
+    } else if (auto* sw = spectrumForSlice(s)) {
         sw->setSquelchLine(s->squelchOn(), s->squelchLevel());
+    }
 
     connect(s, &SliceModel::txSliceChanged, this, [this, s](bool tx) {
         // Update hasTxSlice on all spectrums for waterfall freeze logic
@@ -424,7 +700,9 @@ void MainWindow::onSliceAdded(SliceModel* s)
                 s->filterLow(), s->filterHigh(), tx,
                 s->sliceId() == m_activeSliceId,
                 s->mode(), s->rttyMark(), s->rttyShift(),
-                s->ritOn(), s->ritFreq(), s->xitOn(), s->xitFreq());
+                s->ritOn(), s->ritFreq(), s->xitOn(), s->xitFreq(),
+                s->diversity(), s->isDiversityParent(),
+                s->isDiversityChild(), s->diversityIndex());
         syncTxWaterfallSliceToSpectrums();
         updateSplitState();
 
@@ -475,14 +753,12 @@ void MainWindow::onSliceAdded(SliceModel* s)
                     QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setNr2Enabled(false); });
                 if (m_audio->rn2Enabled())
                     QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setRn2Enabled(false); });
-#ifdef HAVE_BNR
-                if (m_audio->bnrEnabled())
-                    QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setBnrEnabled(false); });
-#endif
                 if (m_audio->nr4Enabled())
                     QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setNr4Enabled(false); });
                 if (m_audio->dfnrEnabled())
                     QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setDfnrEnabled(false); });
+                if (m_audio->nvAfxEnabled())  // AFX is a speech denoiser too
+                    QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setNvAfxEnabled(false); });
             }
         }
 #ifdef HAVE_RADE
@@ -530,6 +806,10 @@ void MainWindow::onSliceAdded(SliceModel* s)
         pushSliceOverlay(s);
         if (s->isTxSlice())
             syncTxWaterfallSliceToSpectrums();
+        updateKiwiSdrVirtualTrackingForSlice(s);
+        refreshKiwiSdrWaterfallAvailability();
+        syncKiwiSdrPanadapterUiStates();
+        syncKiwiSdrDiversityEscControls();
     });
 
     // Create a VfoWidget for this slice on the correct panadapter
@@ -560,35 +840,77 @@ void MainWindow::onSliceAdded(SliceModel* s)
         activateFdvDisplay(s->sliceId());
 #endif
 
-    // Show DIV button on dual-SCU radios
-    {
-        const QString& model = m_radioModel.model();
-        bool divAllowed = model.contains("6500") || model.contains("6600")
-                       || model.contains("6700") || model.contains("8600")
-                       || model.contains("AU-520");
-        vfo->setDiversityAllowed(divAllowed);
-    }
+    // Show DIV button on dual-SCU radios (ModelCapabilities table, Principle I)
+    vfo->setDiversityAllowed(m_radioModel.isDiversityAllowed());
 
     // Feed S-meter per-slice — only this VFO's slice level
     const int sid = s->sliceId();
+    const QPointer<VfoWidget> vfoPtr(vfo);
     connect(&m_radioModel.meterModel(), &MeterModel::sLevelChanged,
-            vfo, [vfo, sid](int sliceIndex, float dbm) {
-        if (sliceIndex == sid)
-            vfo->setSignalLevel(dbm);
+            vfo, [this, vfoPtr, sid](int sliceIndex, float dbm) {
+        if (sliceIndex == sid
+            && (!m_kiwiSdrManager
+                || m_kiwiSdrManager->assignedProfileForSlice(sid).isEmpty())) {
+            deferReceivePresentation(
+                ReceivePresentationSource::Flex,
+                ReceivePresentationSurface::Meter,
+                [this, vfoPtr, sid, dbm]() {
+                    if (!vfoPtr
+                        || (m_kiwiSdrManager
+                            && !m_kiwiSdrManager
+                                    ->assignedProfileForSlice(sid).isEmpty())) {
+                        return;
+                    }
+                    vfoPtr->setSignalLevel(dbm);
+                },
+                QString::number(sid));
+        }
     });
     // Feed ESC meter per-slice — signal strength after ESC processing
     connect(&m_radioModel.meterModel(), &MeterModel::escLevelChanged,
-            vfo, [vfo, sid](int sliceIndex, float dbm) {
-        if (sliceIndex == sid)
-            vfo->setEscLevel(dbm);
+            vfo, [this, vfoPtr, sid](int sliceIndex, float dbm) {
+        if (sliceIndex == sid) {
+            deferReceivePresentation(
+                ReceivePresentationSource::Flex,
+                ReceivePresentationSurface::Meter,
+                [vfoPtr, dbm]() {
+                    if (vfoPtr) {
+                        vfoPtr->setEscLevel(dbm);
+                    }
+                },
+                QString::number(sid));
+        }
     });
+    // Feed the SmartMTR TX scales: mic level + compression (dBFS / dB) from
+    // micMetersChanged, and forward power + SWR from txMetersChanged. The VFO
+    // shows the operator-selected meter only on its own TX slice while
+    // transmitting. No amp-operate gate (unlike the analog S-Meter below): the
+    // meter reports the truth of whatever the operator selected.
+    connect(&m_radioModel.meterModel(), &MeterModel::micMetersChanged,
+            vfo, [vfo](float micLevel, float, float micPeak, float compPeak) {
+        vfo->setMicLevel(micLevel, micPeak);
+        vfo->setTxCompression(compPeak);
+    });
+    connect(&m_radioModel.meterModel(), &MeterModel::txMetersChanged,
+            vfo, [vfo](float fwd, float swr) {
+        vfo->setTxPower(fwd);
+        vfo->setTxSwr(swr);
+    });
+    connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
+            vfo, &VfoWidget::setTransmitting);
     connect(&m_radioModel, &RadioModel::antListChanged,
             vfo, &VfoWidget::setAntennaList);
+
+    // Refresh the split-pair visualization whenever this slice's TX role changes,
+    // so an externally-initiated split (rigctld / CAT / TCI / front panel) is
+    // reflected on the panadapter, not just GUI-initiated split. (#3726)
+    connect(s, &SliceModel::txSliceChanged, this, [this](bool) { updateSplitState(); });
 
     // Reset band-stack auto-save dwell timer on every active-slice tune
     connect(s, &SliceModel::frequencyChanged, this, [this, s]() {
         if (s->sliceId() != m_activeSliceId) return;
         if (!m_bsAutoSaveTimer) return;
+        if (profileLoadRadioStateWritesHeld()) return;
         const int dwellSec = BandStackSettings::instance().autoSaveDwellSeconds();
         if (dwellSec <= 0) return;
         m_bsAutoSaveTimer->start(dwellSec * 1000);
@@ -643,6 +965,14 @@ void MainWindow::onSliceAdded(SliceModel* s)
 
     // Refresh slice tab buttons (#1278)
     m_appletPanel->updateSliceButtons(m_radioModel.slices(), m_activeSliceId);
+    refreshKiwiSdrSlices();
+    refreshKiwiSdrWaterfallAvailability();
+    syncKiwiSdrDiversityEscControls();
+
+    // A slice can arrive already flagged as the TX slice (e.g. external split
+    // created the TX slice out-of-band). Re-derive the split-pair from the model
+    // so the panadapter pairs it without a GUI action. (#3726)
+    updateSplitState();
 }
 
 void MainWindow::onSliceRemoved(int id)
@@ -650,6 +980,18 @@ void MainWindow::onSliceRemoved(int id)
     if (m_applyingLayout) return;
 
     qDebug() << "MainWindow: slice removed" << id;
+
+    m_kiwiSdrVirtualPreviousMute.remove(id);
+    if (m_kiwiSdrManager) {
+        m_kiwiSdrManager->clearSliceAssignment(id);
+    }
+
+    // Drop the adaptive-filter engine's per-slice smoothing/baseline state.
+    // processFrame() only self-clears state for slices it still sees; a deleted
+    // slice is never seen again, so without this a recreated slice reusing the
+    // same id inherits the closed slice's baseline/fit (RFC #3878).
+    if (m_adaptiveFilterEngine)
+        m_adaptiveFilterEngine->resetSlice(id);
 
 #ifdef HAVE_RADE
     // If the RADE slice was closed, deactivate RADE
@@ -733,6 +1075,449 @@ void MainWindow::onSliceRemoved(int id)
 
     // Refresh slice tab buttons (#1278)
     m_appletPanel->updateSliceButtons(m_radioModel.slices(), m_activeSliceId);
+    refreshKiwiSdrSlices();
+    refreshKiwiSdrWaterfallAvailability();
+    syncKiwiSdrDiversityEscControls();
+
+    // Removing one half of a split pair (e.g. external controller deletes the TX
+    // slice) must re-derive the panadapter split-pair from the model. (#3726)
+    updateSplitState();
+}
+
+void MainWindow::beginProfileLoadRadioStateWriteHold(const QString& profileType,
+                                                     const QString& profileName)
+{
+    if (!profileLoadMayRebuildRadioTopology(profileType)) {
+        qCDebug(lcProtocol).noquote()
+            << "MainWindow: profile load does not require topology write hold"
+            << QStringLiteral("type=%1").arg(profileType)
+            << QStringLiteral("name=%1").arg(profileName);
+        return;
+    }
+
+    const qint64 untilMs = QDateTime::currentMSecsSinceEpoch() + kProfileLoadStateWriteHoldMs;
+    m_profileLoadRadioStateWriteHoldUntilMs =
+        std::max(m_profileLoadRadioStateWriteHoldUntilMs, untilMs);
+    m_suppressStartupPanLayoutRearrange = false;
+    m_layoutRestoreUntilMs = kPanLayoutRestoreWaitingForFirstPan;
+    if (m_layoutRestoreTimer) {
+        m_layoutRestoreTimer->stop();
+    }
+    if (m_bsAutoSaveTimer) {
+        m_bsAutoSaveTimer->stop();
+    }
+    m_pendingProfileLoadPanDimensions.clear();
+    m_profileLoadPendingFftYpixels.clear();
+    m_profileLoadPanDimensionsSettlingUntilMs.clear();
+    holdNoiseFloorAutoAdjustForProfileLoad(untilMs);
+    if (m_panStack) {
+        for (PanadapterApplet* applet : m_panStack->allApplets()) {
+            if (applet && applet->spectrumWidget()) {
+                applet->spectrumWidget()->clearDisplay();
+            }
+        }
+    }
+    setPanadapterConnectionAnimation(true, "Loading profile...");
+
+    qCInfo(lcProtocol).noquote()
+        << "MainWindow: holding profile-owned radio state writes"
+        << QStringLiteral("type=%1").arg(profileType)
+        << QStringLiteral("name=%1").arg(profileName);
+}
+
+bool MainWindow::profileLoadRadioStateWritesHeld() const
+{
+    return QDateTime::currentMSecsSinceEpoch() < m_profileLoadRadioStateWriteHoldUntilMs;
+}
+
+bool MainWindow::profileLoadPanDisplaySettling(const QString& panId) const
+{
+    return m_pendingProfileLoadPanDimensions.contains(panId)
+        || m_profileLoadPendingFftYpixels.contains(panId)
+        || m_profileLoadPanDimensionsSettlingUntilMs.contains(panId);
+}
+
+void MainWindow::holdNoiseFloorAutoAdjustForProfileLoad(qint64 untilMs)
+{
+    // Do not let auto noise-floor reposition the client-side dBm scale while a
+    // profile is rebuilding pans. The radio owns profile dBm ranges; auto floor
+    // can reacquire only after those ranges and deferred xpixels/ypixels settle.
+    if (!m_panStack) {
+        return;
+    }
+
+    for (PanadapterApplet* applet : m_panStack->allApplets()) {
+        if (!applet || !applet->spectrumWidget()) {
+            continue;
+        }
+        applet->spectrumWidget()->suspendNoiseFloorAutoAdjustUntil(untilMs);
+    }
+}
+
+void MainWindow::reacquireNoiseFloorLocksAfterProfileLoad()
+{
+    if (m_shuttingDown || !m_radioModel.isConnected() || !m_panStack) {
+        return;
+    }
+
+    for (PanadapterApplet* applet : m_panStack->allApplets()) {
+        if (!applet || !applet->spectrumWidget()) {
+            continue;
+        }
+
+        SpectrumWidget* sw = applet->spectrumWidget();
+        if (auto* pan = m_radioModel.panadapter(applet->panId())) {
+            if (pan->panStreamId()) {
+                m_radioModel.panStream()->setDbmRange(
+                    pan->panStreamId(), pan->minDbm(), pan->maxDbm());
+            }
+            if (!sw->noiseFloorAutoAdjustEnabled()) {
+                sw->setDbmRange(pan->minDbm(), pan->maxDbm());
+            }
+        }
+        if (sw->noiseFloorAutoAdjustEnabled()) {
+            sw->resumeNoiseFloorAutoAdjust();
+        } else {
+            sw->reacquireNoiseFloorLock();
+        }
+    }
+}
+
+void MainWindow::releaseProfileLoadPanDisplayHold(const QString& panId, SpectrumWidget* sw)
+{
+    if (panId.isEmpty()) {
+        return;
+    }
+
+    m_pendingProfileLoadPanDimensions.remove(panId);
+    m_profileLoadPendingFftYpixels.remove(panId);
+    m_profileLoadPanDimensionsSettlingUntilMs.remove(panId);
+    if (sw) {
+        sw->resumeNoiseFloorAutoAdjust();
+    }
+}
+
+void MainWindow::markProfileLoadPanDimensionsReady(const QString& panId, int yPixels)
+{
+    auto expectedIt = m_profileLoadPendingFftYpixels.find(panId);
+    if (expectedIt == m_profileLoadPendingFftYpixels.end()
+        || expectedIt.value() != yPixels) {
+        return;
+    }
+
+    releaseProfileLoadPanDisplayHold(
+        panId,
+        m_panStack ? m_panStack->spectrum(panId) : nullptr);
+}
+
+bool MainWindow::profileLoadPanDimensionsMatchExpected(const QString& panId,
+                                                       SpectrumWidget* sw) const
+{
+    auto expectedIt = m_profileLoadPendingFftYpixels.find(panId);
+    if (expectedIt == m_profileLoadPendingFftYpixels.end()) {
+        return true;
+    }
+
+    return sw
+        && panPixelDimensionsReady(sw)
+        && panYpixelsFor(sw) == expectedIt.value();
+}
+
+void MainWindow::retryProfileLoadPanDimensions(const QString& panId, SpectrumWidget* sw)
+{
+    if (panId.isEmpty() || !sw) {
+        return;
+    }
+
+    m_profileLoadPendingFftYpixels.remove(panId);
+    m_profileLoadPanDimensionsSettlingUntilMs.remove(panId);
+
+    if (!panPixelDimensionsReady(sw)) {
+        m_pendingProfileLoadPanDimensions.insert(panId);
+        return;
+    }
+
+    m_profileLoadPendingFftYpixels.insert(panId, panYpixelsFor(sw));
+    m_profileLoadPanDimensionsSettlingUntilMs.insert(
+        panId,
+        QDateTime::currentMSecsSinceEpoch() + kProfileLoadDimensionSettleMs);
+    sendPanDimensionsToRadio(panId, sw, false);
+}
+
+void MainWindow::sendPanDimensionsToRadio(const QString& panId,
+                                          SpectrumWidget* sw,
+                                          bool updateLocalDecoderImmediately)
+{
+    // Raw sender for radio FFT dimensions. Normal lifecycle/resize paths must
+    // call requestPanDimensionsForRadio() instead so profile loads can defer
+    // these writes; sending xpixels/ypixels while the radio is rebuilding a
+    // profile can make the radio autosave a partial GUIClient slice layout.
+    if (panId.isEmpty() || !sw || !panPixelDimensionsReady(sw)) {
+        return;
+    }
+
+    auto* pan = m_radioModel.panadapter(panId);
+    if (!pan) {
+        return;
+    }
+
+    const int xpix = panXpixelsFor(sw);
+    const int ypix = panYpixelsFor(sw);
+    m_radioModel.sendCommand(
+        QString("display pan set %1 xpixels=%2 ypixels=%3")
+            .arg(panId).arg(xpix).arg(ypix));
+
+    if (profileLoadRadioStateWritesHeld()) {
+        m_profileLoadPendingFftYpixels.insert(panId, ypix);
+        m_profileLoadPanDimensionsSettlingUntilMs.insert(
+            panId,
+            QDateTime::currentMSecsSinceEpoch() + kProfileLoadDimensionSettleMs);
+    }
+
+    const quint32 streamId = pan->panStreamId();
+    if (streamId) {
+        QPointer<SpectrumWidget> swGuard(sw);
+        auto updateLocalDecoder = [this, panId, swGuard, streamId, ypix]() {
+            if (m_shuttingDown || !swGuard) {
+                return;
+            }
+            auto* currentPan = m_radioModel.panadapter(panId);
+            if (!currentPan || currentPan->panStreamId() != streamId) {
+                return;
+            }
+            if (!panPixelDimensionsReady(swGuard.data())
+                || panYpixelsFor(swGuard.data()) != ypix) {
+                return;
+            }
+            m_radioModel.panStream()->setYPixels(streamId, ypix);
+            swGuard->prepareForFftScaleChange();
+        };
+
+        if (updateLocalDecoderImmediately) {
+            updateLocalDecoder();
+        } else {
+            // Radio status echo is the normal sync point. The delayed fallback
+            // preserves resize recovery if the echo is missed, without decoding
+            // queued old-height FFT frames with the new height.
+            QTimer::singleShot(kPanDimensionDecoderFallbackMs,
+                               this,
+                               updateLocalDecoder);
+        }
+    }
+}
+
+void MainWindow::requestPanDimensionsForRadio(const QString& panId,
+                                              SpectrumWidget* sw,
+                                              bool updateLocalDecoderImmediately)
+{
+    if (panId.isEmpty() || !sw || !panPixelDimensionsReady(sw)) {
+        return;
+    }
+
+    // Pixel dimensions are client-owned display metadata, but sending them
+    // while the radio is tearing down/rebuilding a profile can dirty the
+    // GUIClient restore snapshot with an intermediate topology. That was the
+    // root cause of profile-loaded sessions later restarting with missing
+    // slices. Keep all pan size pushes on this path so they are deferred and
+    // coalesced until the profile load has been accepted and settled.
+    if (profileLoadRadioStateWritesHeld()) {
+        m_pendingProfileLoadPanDimensions.insert(panId);
+        qCDebug(lcProtocol).noquote()
+            << "MainWindow: deferring pan dimensions during profile load"
+            << QStringLiteral("pan=%1").arg(panId);
+        return;
+    }
+
+    sendPanDimensionsToRadio(panId, sw, updateLocalDecoderImmediately);
+}
+
+void MainWindow::flushPendingProfileLoadPanDimensions()
+{
+    if (m_shuttingDown || !m_radioModel.isConnected()
+            || m_pendingProfileLoadPanDimensions.isEmpty() || !m_panStack) {
+        return;
+    }
+
+    const QSet<QString> pending = m_pendingProfileLoadPanDimensions;
+    m_pendingProfileLoadPanDimensions.clear();
+
+    int sent = 0;
+    for (PanadapterApplet* applet : m_panStack->allApplets()) {
+        if (!applet || !pending.contains(applet->panId())) {
+            continue;
+        }
+
+        sendPanDimensionsToRadio(applet->panId(), applet->spectrumWidget(), false);
+        ++sent;
+    }
+
+    if (sent > 0) {
+        qCDebug(lcProtocol).noquote()
+            << "MainWindow: flushed deferred profile-load pan dimensions"
+            << QStringLiteral("count=%1").arg(sent);
+    }
+}
+
+void MainWindow::scheduleProfileLoadRecovery(const QString& profileType,
+                                             const QString& profileName)
+{
+    if (!profileLoadMayRebuildRadioTopology(profileType)) {
+        qCInfo(lcProtocol).noquote()
+            << "MainWindow: scheduling lightweight profile-load recovery"
+            << QStringLiteral("type=%1").arg(profileType)
+            << QStringLiteral("name=%1").arg(profileName);
+        QTimer::singleShot(350, this, [this, profileType, profileName]() {
+            runProfileLoadRecoveryPass(profileType, profileName, false, false);
+        });
+        return;
+    }
+
+    const qint64 untilMs = QDateTime::currentMSecsSinceEpoch() + kProfileLoadStateWriteHoldMs;
+    m_profileLoadRadioStateWriteHoldUntilMs =
+        std::max(m_profileLoadRadioStateWriteHoldUntilMs, untilMs);
+    holdNoiseFloorAutoAdjustForProfileLoad(m_profileLoadRadioStateWriteHoldUntilMs);
+
+    qCInfo(lcProtocol).noquote()
+        << "MainWindow: scheduling profile-load recovery"
+        << QStringLiteral("type=%1").arg(profileType)
+        << QStringLiteral("name=%1").arg(profileName);
+
+    QTimer::singleShot(350, this, [this, profileType, profileName]() {
+        runProfileLoadRecoveryPass(profileType, profileName, false, true);
+    });
+    QTimer::singleShot(1200, this, [this, profileType, profileName]() {
+        runProfileLoadRecoveryPass(profileType, profileName, true, false);
+    });
+    QTimer::singleShot(2500, this, [this, profileType, profileName]() {
+        runProfileLoadRecoveryPass(profileType, profileName, false, false);
+    });
+    QTimer::singleShot(1500, this, [this]() {
+        flushPendingProfileLoadPanDimensions();
+    });
+    QTimer::singleShot(3500, this, [this]() {
+        flushPendingProfileLoadPanDimensions();
+    });
+    QTimer::singleShot(kProfileLoadDeferredPanFlushDelayMs, this, [this]() {
+        flushPendingProfileLoadPanDimensions();
+    });
+    QTimer::singleShot(kProfileLoadPostHoldRecoveryDelayMs, this, [this]() {
+        m_profileLoadPendingFftYpixels.clear();
+        m_profileLoadPanDimensionsSettlingUntilMs.clear();
+        reacquireNoiseFloorLocksAfterProfileLoad();
+#ifdef HAVE_WEBSOCKETS
+        if (tciServer()) {
+            tciServer()->rearmDaxForProfileLoad();
+        }
+#endif
+    });
+}
+
+void MainWindow::runProfileLoadRecoveryPass(const QString& profileType,
+                                            const QString& profileName,
+                                            bool rearmDaxIq,
+                                            bool resetDaxRxStreams)
+{
+    Q_UNUSED(profileType);
+    Q_UNUSED(profileName);
+
+    if (m_shuttingDown || !m_radioModel.isConnected()) {
+        return;
+    }
+
+    // Keep this pass to client-owned sessions. A profile load can rewrite
+    // radio-owned pan/slice topology; pushing display pan state here can dirty
+    // the radio's GUIClient restore snapshot while it is settling.
+
+    SliceModel* referenceSlice = m_radioModel.slice(m_activeSliceId);
+    if (!referenceSlice && !m_radioModel.slices().isEmpty()) {
+        referenceSlice = m_radioModel.slices().first();
+    }
+    if (referenceSlice && referenceSlice->frequency() > 0.0) {
+        const QString bandName = BandSettings::bandForFrequency(referenceSlice->frequency());
+        if (!bandName.isEmpty()) {
+            m_bandSettings.setCurrentBand(bandName);
+        }
+        if (referenceSlice->sliceId() == m_activeSliceId) {
+            m_antennaGenius.setRadioFrequency(referenceSlice->frequency());
+        }
+    }
+
+    if (AppSettings::instance().value("PcAudioEnabled", "True").toString() == "True") {
+        audioStartRx();
+    }
+
+#ifdef HAVE_WEBSOCKETS
+    if (resetDaxRxStreams && tciServer() && !profileLoadRadioStateWritesHeld()) {
+        tciServer()->rearmDaxForProfileLoad();
+    }
+#endif
+
+#if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
+    if (m_daxBridge) {
+        auto* panStream = m_radioModel.panStream();
+        bool txSliceIsDigital = false;
+
+        // Post-profile-load reconcile (#3305): reseed the slice→channel shadow
+        // and (re)acquire whatever the restored slices carry. The manager
+        // dedupes against live streams, and streams the radio destroyed during
+        // the load are re-created automatically by its removed-status recreate
+        // path — no manual stream remove/create here anymore. Channels held by
+        // TCI or RADE are simply co-held; nothing is stomped.
+        for (auto* slice : m_radioModel.slices()) {
+            if (!slice) {
+                continue;
+            }
+            if (!m_radioModel.sliceMayBelongToUs(slice->sliceId())) {
+                continue;
+            }
+
+            if (slice->isTxSlice()) {
+                const QString mode = slice->mode();
+                txSliceIsDigital = (mode == "DIGU" || mode == "DIGL" || mode == "RTTY"
+                                  || mode == "DFM"  || mode == "NFM"  || mode == "NT");
+            }
+
+            const int channel = slice->daxChannel();
+            m_daxSliceLastCh[slice->sliceId()] = channel;
+            if (channel < 1 || channel > 4) {
+                continue;
+            }
+            if (panStream) {
+                panStream->acquireDaxChannel(
+                    channel, PanadapterStream::DaxConsumer::Bridge);
+            }
+        }
+
+        m_audio->setDaxTxMode(txSliceIsDigital);
+        if (txSliceIsDigital && m_radioModel.transmitModel().daxOn()) {
+            m_radioModel.ensureDaxTxStream(DaxTxRequestReason::HostedDaxBridge);
+        }
+    }
+#endif
+
+    if (rearmDaxIq) {
+        auto& settings = AppSettings::instance();
+        for (int channel = 1; channel <= 4; ++channel) {
+            if (settings.value(QStringLiteral("DaxIqEnabled%1").arg(channel), "False").toString() != "True") {
+                continue;
+            }
+            const DaxIqModel::IqStream stream = m_radioModel.daxIqModel().stream(channel);
+            if (stream.exists && stream.streamId != 0) {
+                if (m_radioModel.panStream()) {
+                    m_radioModel.panStream()->unregisterIqStream(stream.streamId);
+                }
+                m_radioModel.daxIqModel().removeStream(channel);
+                m_radioModel.daxIqModel().handleStreamRemoved(stream.streamId);
+            }
+            m_radioModel.daxIqModel().createStream(channel);
+            const int rate = settings.value(QStringLiteral("DaxIqRate%1").arg(channel), "48000").toInt();
+            QTimer::singleShot(600, this, [this, channel, rate]() {
+                if (m_radioModel.isConnected()) {
+                    m_radioModel.daxIqModel().setSampleRate(channel, rate);
+                }
+            });
+        }
+    }
 }
 
 
@@ -740,6 +1525,13 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
 {
     auto* sw = applet->spectrumWidget();
     auto* menu = sw->overlayMenu();
+    if (profileLoadRadioStateWritesHeld()) {
+        // Profile recall briefly rebuilds pan topology and pixel dimensions.
+        // Keep auto noise-floor from sliding the client-side dBm scale during
+        // that window; the radio's profile-owned min_dbm/max_dbm status must
+        // seed the display first, then auto floor can reacquire afterward.
+        sw->suspendNoiseFloorAutoAdjustUntil(m_profileLoadRadioStateWriteHoldUntilMs);
+    }
 
     struct PendingDbmRange {
         bool active{false};
@@ -760,6 +1552,18 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         }
     };
     auto sendDbmRangeCommand = [this, applet](float minDbm, float maxDbm) {
+        if (!dbmRangeLooksPlausible(minDbm, maxDbm)) {
+            qCWarning(lcProtocol).noquote()
+                << "MainWindow: rejecting implausible dBm range"
+                << QStringLiteral("pan=%1").arg(applet->panId())
+                << QStringLiteral("min=%1").arg(minDbm, 0, 'f', 2)
+                << QStringLiteral("max=%1").arg(maxDbm, 0, 'f', 2);
+            return;
+        }
+
+        // #3977 ownership note: foreign-owned pans are refused at the handler
+        // entry (before the local decoder commit) and again centrally in
+        // RadioModel::sendCommand — no per-command gate needed here.
         m_radioModel.sendCommand(
             QString("display pan set %1 min_dbm=%2 max_dbm=%3")
                 .arg(applet->panId())
@@ -776,6 +1580,110 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     sw->disconnect(this);
     menu->disconnect(this);
     applet->disconnect(this);
+    if (m_appletPanel && m_appletPanel->rxApplet()) {
+        QObject::disconnect(m_appletPanel->rxApplet(), nullptr, sw, nullptr);
+    }
+    sw->setFpsMeterSyncStatsProvider([this]() {
+        return receivePresentationOverlayStatsText();
+    });
+
+    auto updateKiwiWaterfallView = [this, applet, sw](double centerMhz,
+                                                      double bandwidthMhz) {
+        if (m_kiwiSdrManager && applet && sw) {
+            const QString displayProfileId =
+                kiwiSdrProfileForPan(applet->panId());
+            for (SliceModel* slice : m_radioModel.slices()) {
+                if (!slice || slice->panId() != applet->panId()
+                    || !m_radioModel.sliceMayBelongToUs(slice->sliceId())) {
+                    continue;
+                }
+                const QString profileId =
+                    m_kiwiSdrManager->assignedProfileForSlice(slice->sliceId());
+                if (profileId.isEmpty()) {
+                    continue;
+                }
+                m_kiwiSdrManager->updateWaterfallView(
+                    slice->sliceId(), applet->panId(), centerMhz,
+                    bandwidthMhz, sw->wfLineDuration());
+                const bool profileCanDriveWaterfall =
+                    KiwiSdrClient::stateAllowsReceiverControl(
+                        m_kiwiSdrManager->state(profileId))
+                    && m_kiwiSdrManager->waterfallAvailable(profileId);
+                if (profileId == displayProfileId && profileCanDriveWaterfall) {
+                    sw->setKiwiSdrWaterfallAvailable(
+                        m_kiwiSdrManager->waterfallAvailable(profileId));
+                    sw->setKiwiSdrWaterfallProfile(profileId);
+                    sw->setKiwiSdrWaterfallActive(true);
+                    syncKiwiSdrAppletWaterfallState();
+                }
+            }
+        }
+    };
+
+    auto kiwiGestureLastViewUpdate = std::make_shared<QElapsedTimer>();
+    const auto updateKiwiWaterfallViewForGesture =
+        [updateKiwiWaterfallView,
+         kiwiGestureLastViewUpdate](double centerMhz, double bandwidthMhz) {
+            const bool updateDue =
+                !kiwiGestureLastViewUpdate->isValid()
+                || kiwiGestureLastViewUpdate->elapsed()
+                       >= kKiwiGestureViewUpdateMs;
+            if (!updateDue) {
+                return;
+            }
+            updateKiwiWaterfallView(centerMhz, bandwidthMhz);
+            kiwiGestureLastViewUpdate->restart();
+        };
+
+    const auto updateKiwiWaterfallViewUnlessDeferred =
+        [updateKiwiWaterfallView, updateKiwiWaterfallViewForGesture, sw,
+         kiwiGestureLastViewUpdate](double centerMhz, double bandwidthMhz) {
+            if (sw && sw->waterfallViewUpdateDeferred()) {
+                return;
+            }
+            if (sw && sw->frequencyRangeGestureActive()) {
+                updateKiwiWaterfallViewForGesture(centerMhz, bandwidthMhz);
+                return;
+            }
+            updateKiwiWaterfallView(centerMhz, bandwidthMhz);
+            kiwiGestureLastViewUpdate->invalidate();
+        };
+
+    connect(sw, &SpectrumWidget::frequencyRangeChanged,
+            this, updateKiwiWaterfallViewUnlessDeferred);
+    connect(sw, &SpectrumWidget::frequencyRangeChangeRequested,
+            this, updateKiwiWaterfallViewUnlessDeferred);
+    connect(sw, &SpectrumWidget::centerChangeRequested,
+            this, [updateKiwiWaterfallView, updateKiwiWaterfallViewForGesture,
+                   sw, kiwiGestureLastViewUpdate](double centerMhz) {
+                if (!sw) {
+                    return;
+                }
+                if (sw->frequencyRangeGestureActive()) {
+                    return;
+                }
+                if (sw->panDragActive()) {
+                    updateKiwiWaterfallViewForGesture(centerMhz,
+                                                      sw->bandwidthMhz());
+                    return;
+                }
+                updateKiwiWaterfallView(centerMhz, sw->bandwidthMhz());
+                kiwiGestureLastViewUpdate->invalidate();
+            });
+    connect(sw, &SpectrumWidget::panDragSettled,
+            this, [updateKiwiWaterfallView,
+                   kiwiGestureLastViewUpdate](double centerMhz,
+                                              double bandwidthMhz) {
+                updateKiwiWaterfallView(centerMhz, bandwidthMhz);
+                kiwiGestureLastViewUpdate->invalidate();
+            });
+    connect(sw, &SpectrumWidget::frequencyRangeSettled,
+            this, [updateKiwiWaterfallView,
+                   kiwiGestureLastViewUpdate](double centerMhz,
+                                              double bandwidthMhz) {
+                updateKiwiWaterfallView(centerMhz, bandwidthMhz);
+                kiwiGestureLastViewUpdate->invalidate();
+            });
 
     // Wire band plan manager to this spectrum widget
     sw->setBandPlanManager(m_bandPlanMgr);
@@ -788,6 +1696,7 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     menu->setPanId(applet->panId());
     menu->setMemories(m_radioModel.memories());
     menu->setRadioModel(&m_radioModel);
+    menu->setKiwiSdrManager(m_kiwiSdrManager);
     menu->setRadioCapabilities(m_radioModel.capabilities());
 
     // Antenna list → this overlay menu (per-pan, mirrors VfoWidget pattern) (#1260)
@@ -895,15 +1804,7 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             if (!panPixelDimensionsReady(sw)) {
                 return;
             }
-            const int xpix = panXpixelsFor(sw);
-            const int ypix = panYpixelsFor(sw);
-            m_radioModel.sendCommand(
-                QString("display pan set %1 xpixels=%2 ypixels=%3")
-                    .arg(pan->panId()).arg(xpix).arg(ypix));
-            if (pan->panStreamId()) {
-                m_radioModel.panStream()->setYPixels(pan->panStreamId(), ypix);
-                sw->prepareForFftScaleChange();
-            }
+            requestPanDimensionsForRadio(pan->panId(), sw);
         });
     }
 
@@ -923,7 +1824,10 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             this, [this](const QString& panId) {
         // Don't close the last pan
         if (m_panStack->count() <= 1) return;
-        m_radioModel.sendCommand(QString("display pan remove %1").arg(panId));
+        // Single source of truth for teardown: removePanadapter sends the
+        // FlexLib-correct "display pan remove" + "display panafall remove"
+        // pair, so a panafall-created pan also frees its waterfall. (#3843)
+        m_radioModel.removePanadapter(panId);
     });
 
     // ── User drag actions from spectrum → radio (per-pan) ──────────────────
@@ -933,11 +1837,17 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     });
     connect(sw, &SpectrumWidget::bandwidthChangeRequested,
             this, [this, applet](double bw) {
+        if (!kiwiSdrProfileForPan(applet->panId()).isEmpty()) {
+            return;
+        }
         m_radioModel.sendCommand(
             QString("display pan set %1 bandwidth=%2").arg(applet->panId()).arg(bw, 0, 'f', 6));
     });
     connect(sw, &SpectrumWidget::centerChangeRequested,
             this, [this, applet](double center) {
+        if (!kiwiSdrProfileForPan(applet->panId()).isEmpty()) {
+            return;
+        }
         if (const auto* pan = m_radioModel.panadapter(applet->panId()))
             center = std::max(center, pan->bandwidthMhz() / 2.0);
         m_radioModel.sendCommand(
@@ -963,7 +1873,49 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     });
 
     connect(sw, &SpectrumWidget::dbmRangeChangeRequested,
-            this, [pendingDbm, setStreamDbmRange, sendDbmRangeCommand](float minDbm, float maxDbm) {
+            this, [this, applet, sw, pendingDbm, setStreamDbmRange, sendDbmRangeCommand]
+                  (float minDbm, float maxDbm) {
+        if (sw->kiwiSdrWaterfallActive()) {
+            sw->setDbmRange(minDbm, maxDbm);
+            sw->prepareForFftScaleChange();
+            sw->reacquireNoiseFloorLock();
+            return;
+        }
+
+        const bool profileLoadHeld = profileLoadRadioStateWritesHeld();
+        const bool autoFloorChange = sw->pendingAutoNoiseFloorDbmRange();
+        if (profileLoadPanDisplaySettling(applet->panId()) && autoFloorChange) {
+            if (auto* pan = m_radioModel.panadapter(applet->panId())) {
+                if (pan->panStreamId()) {
+                    setStreamDbmRange(pan->minDbm(), pan->maxDbm());
+                }
+                sw->setDbmRange(pan->minDbm(), pan->maxDbm());
+            }
+            sw->reacquireNoiseFloorLock();
+            return;
+        }
+
+        const bool localOnly = profileLoadHeld || autoFloorChange;
+        if (localOnly) {
+            // Local-only dBm changes must not update PanadapterStream. The
+            // stream decodes radio FFT pixel values using the radio's actual
+            // min_dbm/max_dbm; changing that decoder without sending the same
+            // range to the radio creates a feedback loop where the estimated
+            // noise floor and display scale chase each other indefinitely.
+            sw->setDbmRange(minDbm, maxDbm);
+            return;
+        }
+
+        // #3977: refuse the WHOLE operation — local decoder commit included —
+        // when this session no longer owns the pan. Gating only the outbound
+        // command (RadioModel::sendCommand backstop) would leave the local
+        // FFT decoder committed to a range the radio never adopted, with no
+        // levelChanged echo to ever resync it.
+        if (auto* pan = m_radioModel.panadapter(applet->panId());
+            pan && !pan->ownedByClient(m_radioModel.ourClientHandle())) {
+            return;
+        }
+
         pendingDbm->active = true;
         pendingDbm->minDbm = minDbm;
         pendingDbm->maxDbm = maxDbm;
@@ -972,7 +1924,20 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         sendDbmRangeCommand(minDbm, maxDbm);
     });
     connect(sw, &SpectrumWidget::dbmRangeDragFinished,
-            this, [pendingDbm, setStreamDbmRange, sendDbmRangeCommand](float minDbm, float maxDbm) {
+            this, [this, applet, sw, pendingDbm, setStreamDbmRange, sendDbmRangeCommand](float minDbm, float maxDbm) {
+        if (sw->kiwiSdrWaterfallActive()) {
+            sw->setDbmRange(minDbm, maxDbm);
+            sw->prepareForFftScaleChange();
+            sw->reacquireNoiseFloorLock();
+            return;
+        }
+
+        // #3977: same whole-operation refusal as dbmRangeChangeRequested.
+        if (auto* pan = m_radioModel.panadapter(applet->panId());
+            pan && !pan->ownedByClient(m_radioModel.ourClientHandle())) {
+            return;
+        }
+
         pendingDbm->active = true;
         pendingDbm->minDbm = minDbm;
         pendingDbm->maxDbm = maxDbm;
@@ -1128,17 +2093,69 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     // ── Auto-squelch wiring ───────────────────────────────────────────────
     // RxApplet signals → per-pan spectrum widget
     connect(m_appletPanel->rxApplet(), &RxApplet::sqlAutoChanged,
-            sw, &SpectrumWidget::setAutoSquelchEnable);
+            sw, [this, applet, sw](bool) {
+        const QString panId = applet ? applet->panId() : QString();
+        sw->setAutoSquelchEnable(
+            autoSquelchShouldRunOnSpectrum(panId, sw));
+    });
     connect(m_appletPanel->rxApplet(), &RxApplet::squelchStateChanged,
-            sw, &SpectrumWidget::setSquelchLine);
+            sw, [this, applet, sw](bool on, int level) {
+        SliceModel* s = activeSlice();
+        const bool kiwiActive = s && m_kiwiSdrManager
+            && !m_kiwiSdrManager->assignedProfileForSlice(s->sliceId()).isEmpty();
+        if (kiwiActive) {
+            if (applet && applet->panId() == s->panId()) {
+                sw->setKiwiSdrSquelchLine(
+                    on, kiwiSdrSquelchMarginDbForSliceLevel(s, level),
+                    s->externalReceiveAutoSquelchOn());
+            } else {
+                sw->clearKiwiSdrSquelchLine();
+                sw->setSquelchLine(false, 0);
+            }
+            return;
+        }
+        const QString panId = applet ? applet->panId() : QString();
+        if (!kiwiSdrProfileForPan(panId).isEmpty()
+            || sw->kiwiSdrWaterfallActive()) {
+            sw->clearKiwiSdrSquelchLine();
+            sw->setSquelchLine(false, 0);
+            return;
+        }
+        sw->clearKiwiSdrSquelchLine();
+        sw->setSquelchLine(on, level);
+    });
     // Spectrum widget → radio + back to overlay: apply level and immediately
     // update the squelch line on sw so the yellow line never depends on the
     // RxApplet → squelchStateChanged → setSquelchLine round-trip, which can
     // miss the first emission if wirePanadapter runs before setSlice.
     connect(sw, &SpectrumWidget::autoSquelchLevelSuggested,
-            this, [this, sw](int level) {
-        if (auto* s = activeSlice()) s->setSquelch(true, level);
-        sw->setSquelchLine(true, level);
+            this, [this, applet, sw](int level) {
+        const QString panId = applet ? applet->panId() : QString();
+        if (!autoSquelchShouldRunOnSpectrum(panId, sw)) {
+            return;
+        }
+        if (SliceModel* kiwiSlice =
+                kiwiAssignedSliceForPan(m_radioModel, m_kiwiSdrManager, panId)) {
+            const int margin = currentAutoSqlMarginDb();
+            kiwiSlice->setSquelch(true, margin);
+            sw->setKiwiSdrSquelchLine(true, margin, true);
+            return;
+        }
+        SliceModel* s = activeSlice();
+        if (!s) {
+            return;
+        }
+        const bool kiwiActive = m_kiwiSdrManager
+            && !m_kiwiSdrManager->assignedProfileForSlice(s->sliceId()).isEmpty();
+        if (kiwiActive) {
+            const int margin = currentAutoSqlMarginDb();
+            s->setSquelch(true, margin);
+            sw->setKiwiSdrSquelchLine(
+                true, margin, true);
+        } else {
+            s->setSquelch(true, level);
+            sw->setSquelchLine(true, level);
+        }
     });
     // Auto-squelch margin: now driven by the RX Applet's SQL slider when
     // SQL mode is Auto (instead of a separate slider in the Display
@@ -1151,6 +2168,11 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         auto& s = AppSettings::instance();
         int margin = std::clamp(s.value("AutoSqlMarginDb", "10").toInt(), 5, 20);
         sw->setAutoSqlMarginDb(margin);
+    }
+    {
+        const QString panId = applet ? applet->panId() : QString();
+        sw->setAutoSquelchEnable(
+            autoSquelchShouldRunOnSpectrum(panId, sw));
     }
 
     // Pop out / dock panadapter
@@ -1175,6 +2197,16 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         m_radioModel.sendCommand(
             QString("display pan set %1 daxiq_channel=%2")
                 .arg(applet->panId()).arg(channel));
+    });
+
+    // WFM software-demod toggle from the DAX panel. Acts on the menu's slice;
+    // WFM is mode-independent (raw IQ from this pan's DAX stream). Mirrors the
+    // VFO-flag toggle's deactivate guard: only the WFM slice may deactivate,
+    // and not during the activation cooldown. (#3853)
+    connect(menu, &SpectrumOverlayMenu::wfmToggleRequested,
+            this, [this](bool on, int sliceId) {
+        if (on) activateWFM(sliceId);
+        else if (sliceId == m_wfmSliceId && !m_wfmCooldown) deactivateWFM();
     });
 
     // Sync DAX IQ combo from radio status + restore saved assignment (#1221)
@@ -1216,8 +2248,19 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     });
     connect(menu, &SpectrumOverlayMenu::wfColorSchemeChanged,
             sw, &SpectrumWidget::setWfColorScheme);
+    connect(menu, &SpectrumOverlayMenu::spectrumRenderModeChanged,
+            sw, &SpectrumWidget::setSpectrumRenderMode);
+    connect(menu, &SpectrumOverlayMenu::dssFloorDepthChanged,
+            sw, &SpectrumWidget::setDssFloorDepth);
+    connect(sw, &SpectrumWidget::dssFloorDepthResolved,
+            menu, &SpectrumOverlayMenu::syncDssFloorDepth);
+    connect(menu, &SpectrumOverlayMenu::dssGainChanged,
+            sw, &SpectrumWidget::setDssGain);
     connect(menu, &SpectrumOverlayMenu::wfColorGainChanged,
             this, [this, applet, sw](int v) {
+        if (!kiwiSdrProfileForPan(applet->panId()).isEmpty()) {
+            return;
+        }
         sw->setWfColorGain(v);
         auto* pan = m_radioModel.panadapter(applet->panId());
         if (pan && !pan->waterfallId().isEmpty())
@@ -1226,6 +2269,9 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
     });
     connect(menu, &SpectrumOverlayMenu::wfBlackLevelChanged,
             this, [this, applet, sw](int v) {
+        if (!kiwiSdrProfileForPan(applet->panId()).isEmpty()) {
+            return;
+        }
         sw->setWfBlackLevel(v);
         auto* pan = m_radioModel.panadapter(applet->panId());
         if (pan && !pan->waterfallId().isEmpty())
@@ -1233,15 +2279,51 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
                 QString("display panafall set %1 black_level=%2").arg(pan->waterfallId()).arg(v));
     });
     connect(menu, &SpectrumOverlayMenu::wfAutoBlackChanged,
-            this, [this, sw](bool on) {
+            this, [this, applet, sw](bool on) {
+        if (!kiwiSdrProfileForPan(applet->panId()).isEmpty()) {
+            return;
+        }
         sw->setWfAutoBlack(on);
+        // Keep the radio's auto_black flag in sync at runtime; it only reaches
+        // 1 when auto-black is on AND the radio-side source is selected.
+        m_radioModel.setWaterfallAutoBlack(on);
     });
     connect(menu, &SpectrumOverlayMenu::wfAutoBlackOffsetChanged,
-            this, [sw](int offset) {
+            this, [this, applet, sw](int offset) {
+        if (!kiwiSdrProfileForPan(applet->panId()).isEmpty()) {
+            return;
+        }
         sw->setWfAutoBlackOffset(offset);
+    });
+    connect(menu, &SpectrumOverlayMenu::wfAutoBlackSourceChanged,
+            this, [this, sw](bool radioSide) {
+        sw->setWfAutoBlackRadioSide(radioSide);
+        // Radio-side → tell the radio to compute its per-tile auto-black level;
+        // client-side → stop it (auto_black=0) and use our own estimate.
+        m_radioModel.setWaterfallAutoBlackSource(radioSide);
     });
     const auto applyWaterfallLineDuration = [this, applet, sw](int ms) {
         const int clampedMs = std::clamp(ms, 1, 100);
+        const QString profileId = kiwiSdrProfileForPan(applet->panId());
+        if (!profileId.isEmpty()) {
+            const KiwiSdrAntennaProfile profile =
+                m_kiwiSdrManager ? m_kiwiSdrManager->profile(profileId)
+                                 : KiwiSdrAntennaProfile{};
+            if (m_kiwiSdrManager && profile.waterfallRate == 0) {
+                for (SliceModel* slice : m_radioModel.slices()) {
+                    if (!slice || slice->panId() != applet->panId()
+                        || m_kiwiSdrManager->assignedProfileForSlice(slice->sliceId())
+                            != profileId) {
+                        continue;
+                    }
+                    m_kiwiSdrManager->updateWaterfallView(
+                        slice->sliceId(), applet->panId(), sw->centerMhz(),
+                        sw->bandwidthMhz(), clampedMs);
+                    break;
+                }
+            }
+            return;
+        }
         sw->setWfLineDuration(clampedMs);
         auto* pan = m_radioModel.panadapter(applet->panId());
         if (pan && !pan->waterfallId().isEmpty())
@@ -1252,13 +2334,65 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             this, applyWaterfallLineDuration);
     connect(sw, &SpectrumWidget::waterfallLineDurationChangeRequested,
             this, applyWaterfallLineDuration);
+    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallCellChanged,
+            this, [this, applet, sw](int cellDb) {
+        if (!m_kiwiSdrManager) {
+            return;
+        }
+        const QString profileId = kiwiSdrProfileForPan(applet->panId());
+        if (profileId.isEmpty()) {
+            return;
+        }
+        const KiwiSdrAntennaProfile profile =
+            m_kiwiSdrManager->profile(profileId);
+        m_kiwiSdrManager->setProfileWaterfallSettings(
+            profileId, cellDb, profile.waterfallFloorDb,
+            profile.waterfallRate);
+        sw->setKiwiSdrWaterfallAdjustments(cellDb,
+                                           profile.waterfallFloorDb);
+        syncKiwiSdrPanadapterUiState(applet->panId());
+    });
+    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallFloorChanged,
+            this, [this, applet, sw](int floorDb) {
+        if (!m_kiwiSdrManager) {
+            return;
+        }
+        const QString profileId = kiwiSdrProfileForPan(applet->panId());
+        if (profileId.isEmpty()) {
+            return;
+        }
+        const KiwiSdrAntennaProfile profile =
+            m_kiwiSdrManager->profile(profileId);
+        m_kiwiSdrManager->setProfileWaterfallSettings(
+            profileId, profile.waterfallCellDb, floorDb,
+            profile.waterfallRate);
+        sw->setKiwiSdrWaterfallAdjustments(profile.waterfallCellDb,
+                                           floorDb);
+        syncKiwiSdrPanadapterUiState(applet->panId());
+    });
+    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallRateChanged,
+            this, [this, applet](int rate) {
+        if (!m_kiwiSdrManager) {
+            return;
+        }
+        const QString profileId = kiwiSdrProfileForPan(applet->panId());
+        if (profileId.isEmpty()) {
+            return;
+        }
+        const KiwiSdrAntennaProfile profile =
+            m_kiwiSdrManager->profile(profileId);
+        m_kiwiSdrManager->setProfileWaterfallSettings(
+            profileId, profile.waterfallCellDb, profile.waterfallFloorDb,
+            rate);
+        syncKiwiSdrPanadapterUiState(applet->panId());
+    });
     // NB Waterfall Blanker (#277)
     connect(menu, &SpectrumOverlayMenu::wfBlankerEnabledChanged,
             sw, &SpectrumWidget::setWfBlankerEnabled);
     connect(menu, &SpectrumOverlayMenu::wfBlankerThresholdChanged,
             sw, &SpectrumWidget::setWfBlankerThreshold);
     connect(menu, &SpectrumOverlayMenu::backgroundImageRequested,
-            this, [this, sw] {
+            this, [sw] {
         QString path = QFileDialog::getOpenFileName(
             sw->window(),
             "Choose Background Image",
@@ -1277,6 +2411,15 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         sw->setBackgroundImage(":/bg-default.jpg");
         auto& s = AppSettings::instance();
         s.setValue(sw->settingsKey("BackgroundImage"), ":/bg-default.jpg");
+        s.save();
+    });
+    // Right-click "Clear": turn the background off entirely (no image, just the
+    // fill colour) and persist as "none" so it stays off across restarts.
+    connect(menu, &SpectrumOverlayMenu::backgroundImageDisabled,
+            this, [sw] {
+        sw->setBackgroundImage(QString());
+        auto& s = AppSettings::instance();
+        s.setValue(sw->settingsKey("BackgroundImage"), "none");
         s.save();
     });
     connect(menu, &SpectrumOverlayMenu::backgroundOpacityChanged,
@@ -1302,6 +2445,7 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         sw->setFftFps(25);
         sw->setFftFillAlpha(0.70f);
         sw->setFftFillColor(QColor(0x00, 0xe5, 0xff));
+        sw->setFftLineWidth(2.0f);
         sw->setFftWeightedAvg(false);
         sw->setFftHeatMap(true);
         sw->setWfColorScheme(0);
@@ -1309,6 +2453,7 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         sw->setWfBlackLevel(15);
         sw->setWfAutoBlack(true);
         sw->setWfAutoBlackOffset(50);
+        sw->setWfAutoBlackRadioSide(false);
         sw->setWfLineDuration(100);
         sw->setWfBlankerEnabled(false);
         sw->setWfBlankerThreshold(1.15f);
@@ -1351,12 +2496,14 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         s.setValue(sw->settingsKey("DisplayFftFps"),              "25");
         s.setValue(sw->settingsKey("DisplayFftFillAlpha"),        "0.70");
         s.setValue(sw->settingsKey("DisplayFftFillColor"),        "#00e5ff");
+        s.setValue(sw->settingsKey("DisplayFftLineWidth"),        "2.0");
         s.setValue(sw->settingsKey("DisplayFftWeightedAvg"),      "False");
         s.setValue(sw->settingsKey("DisplayFftHeatMap"),          "True");
         s.setValue(sw->settingsKey("DisplayWfColorScheme"),       "0");
         s.setValue(sw->settingsKey("DisplayWfColorGain"),         "50");
         s.setValue(sw->settingsKey("DisplayWfBlackLevel"),        "15");
         s.setValue(sw->settingsKey("DisplayWfAutoBlack"),         "True");
+        s.setValue(sw->settingsKey("DisplayWfAutoBlackRadioSide"), "False");
         s.setValue(sw->settingsKey("DisplayWfLineDuration"),      "100");
         s.setValue(sw->settingsKey("WaterfallBlankingEnabled"),   "False");
         s.setValue(sw->settingsKey("WaterfallBlankingThreshold"), "1.15");
@@ -1368,11 +2515,21 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         s.setValue(sw->settingsKey("DisplayFreqGridSpacing"),     "0");
         s.setValue(sw->settingsKey("DisplayNoiseFloorEnable"),    "False");
         s.setValue(sw->settingsKey("DisplayNoiseFloorPosition"),  "75");
+        s.setValue(sw->settingsKey("DisplaySpectrumRenderMode"),  "0");
+        s.setValue(sw->settingsKey("Display3DFloorDepth"),        "6");
+        s.setValue(sw->settingsKey("Display3DGain"),        "70");
         s.save();
 
-        // Sync all Display panel UI controls
+        // Apply the render-mode + 3D-floor reset to the widget too (the keys
+        // above only update settings, not the live SpectrumWidget).
+        sw->setSpectrumRenderMode(0);
+        sw->setDssFloorDepth(6);
+        sw->setDssGain(70);
+
+        // Sync all Display panel UI controls (incl. the 2D/3D combo + 3D Floor).
         menu->syncDisplaySettings(0, 25, 70, false, QColor(0x00, 0xe5, 0xff),
-                                  50, 15, true, 50, 100, 75, false, true, 0);
+                                  50, 15, true, 50, 100, 75, false, true, 0,
+                                  true, 2.0f, false, 0, 6);
         menu->syncExtraDisplaySettings(false, 1.15f, 80, 0,
                                        QColor(0x0a, 0x0a, 0x14));
     });
@@ -1434,6 +2591,65 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         // conjure a slice; click is the explicit "create here" affordance.
     });
 
+    // ── Edge auto-pan step during slice drag (user-reported) ─────────────────
+    // Pan the view AND tune the slice in one shot, deliberately bypassing the
+    // pan-follow/reveal path: the SpectrumWidget already computed the explicit
+    // center, so re-running reveal here would fight the velocity controller.
+    // The slice tune uses setFrequency (autopan=0), so the radio doesn't
+    // recenter either.
+    connect(sw, &SpectrumWidget::edgePanTuneRequested,
+            this, [this, resolveSpectrumTuneTarget](double centerMhz, double sliceFreqMhz) {
+        auto* target = resolveSpectrumTuneTarget();
+        if (!target) {
+            return;
+        }
+        // Honour the same lock / SWR-sweep guards as applyTuneRequest: bypassing
+        // it (to avoid pan-follow) must not also drop the lock affordance or
+        // retune mid-sweep. A blocked tune pans nothing either, matching the
+        // pre-existing locked-slice drag behaviour.
+        if (tuneBlockedByGuards(target)) {
+            return;
+        }
+        if (auto* pan = m_radioModel.panadapter(target->panId())) {
+            centerMhz = std::max(centerMhz, pan->bandwidthMhz() / 2.0);
+            // In-window drag moves pass the unchanged center purely to tune
+            // without reveal — only emit the pan command when it actually moves.
+            if (!qFuzzyCompare(centerMhz, pan->centerMhz())) {
+                m_radioModel.sendCommand(
+                    QString("display pan set %1 center=%2")
+                        .arg(pan->panId()).arg(centerMhz, 0, 'f', 6));
+            }
+        }
+        queueActiveSliceForSpectrumTarget(target->sliceId());
+        m_sliceDragTargetSliceId = target->sliceId();
+        m_sliceDragTargetMhz = sliceFreqMhz;
+        m_sliceDragEchoHoldUntilMs = 0;
+        pushSliceFrequencyToOverlays(target, sliceFreqMhz);
+        target->setFrequency(sliceFreqMhz);
+    });
+    // Pan Follow ("Pan Lock") stands down for the whole duration of a slice drag
+    // so it doesn't fight the drag (in-window tune or edge auto-pan) with per-tick
+    // recenters; on release it recenters once so Pan Lock re-asserts. (user-reported)
+    connect(sw, &SpectrumWidget::sliceDragActiveChanged, this, [this](bool active) {
+        m_sliceDragInProgress = active;
+        if (active) {
+            m_sliceDragTargetSliceId = -1;
+            m_sliceDragTargetMhz = 0.0;
+            m_sliceDragEchoHoldUntilMs = 0;
+            return;
+        }
+        if (!active) {
+            if (m_sliceDragTargetSliceId >= 0 && m_sliceDragTargetMhz > 0.0) {
+                if (SliceModel* target = m_radioModel.slice(m_sliceDragTargetSliceId)) {
+                    pushSliceFrequencyToOverlays(target, m_sliceDragTargetMhz);
+                    target->setFrequency(m_sliceDragTargetMhz);
+                }
+                m_sliceDragEchoHoldUntilMs = QDateTime::currentMSecsSinceEpoch() + 350;
+            }
+            recenterPanFollowOnSlice0();   // re-assert Pan Lock on release (self-guards if off)
+        }
+    });
+
     // ── Spot trigger — notify the radio/TCI clients when a spot label is clicked (#341)
     connect(sw, &SpectrumWidget::spotTriggered, this, [this, applet](int spotIndex) {
         const auto& spots = m_radioModel.spotModel().spots();
@@ -1462,8 +2678,8 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         // Do not "normalise" these — collapsing the guards regresses Log4OM
         // behavior under lock or SWR sweep.
         if (tciSpot) {
-            if (m_tciServer && s && !s->isLocked() && !m_swrSweep.running)
-                m_tciServer->notifySpotClicked(spotIndex, s);
+            if (tciServer() && s && !s->isLocked() && !m_swrSweep.running)
+                tciServer()->notifySpotClicked(spotIndex, s);
         } else if (!isPassiveLocalSpotId(spotIndex)) {
             m_radioModel.sendCommand(
                 QString("spot trigger %1 pan=%2").arg(spotIndex).arg(applet->panId()));
@@ -1587,6 +2803,10 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             this, [this](const QString& panId) {
         showQuickAddMemoryDialog(panId);
     });
+    connect(menu, &SpectrumOverlayMenu::kiwiRxAntennaSelected,
+            this, &MainWindow::setKiwiSdrVirtualAntennaForSlice);
+    connect(menu, &SpectrumOverlayMenu::flexRxAntennaSelected,
+            this, &MainWindow::clearKiwiSdrVirtualAntennaForSlice);
 
     // ── Slice marker clicks ──────────────────────────────────────────────
     connect(sw, &SpectrumWidget::sliceClicked,
@@ -1697,7 +2917,8 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         const bool wasFresh = !m_radioSetupDialog;
         showOrRaisePersistent(m_radioSetupDialog,
                               &m_radioModel, m_audio,
-                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius);
+                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius,
+                              m_kiwiSdrManager);
         if (wasFresh && m_radioSetupDialog)
             wireRadioSetupDialogSignals(m_radioSetupDialog, prevComp);
         if (m_radioSetupDialog)
@@ -1746,10 +2967,13 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             this, &MainWindow::startSwrSweep);
     connect(menu, &SpectrumOverlayMenu::swrSweepClearRequested,
             this, &MainWindow::clearSwrSweepPlot);
+    connect(menu, &SpectrumOverlayMenu::swrSweepSaveCsvRequested,
+            this, &MainWindow::saveSwrSweepCsv);
 
     // Client-side DSP toggles (NR2 / RN2 / NR4 / MNR / BNR / DFNR) now
     // live exclusively in the AetherDSP applet; the spectrum overlay menu
     // no longer surfaces them.
+    refreshKiwiSdrWaterfallAvailability();
 }
 
 MainWindow::TuneCenteringResult MainWindow::revealFrequencyIfNeeded(
@@ -1896,10 +3120,10 @@ MainWindow::TuneCenteringResult MainWindow::panFollowVfo(
     // against the *outer edge of the flag* rather than the slice frequency
     // itself — so the flag panel doesn't clip the pan edge before the pan
     // starts to scroll.  Split pairs (LockLeft + LockRight rendered on the
-    // same marker) extend the trigger on *both* sides; single-flag slices
-    // extend only on the side the flag currently renders on.  Non-flagged
-    // and compact-mode slices fall through to the original slice-frequency
-    // comparison (both offsets stay 0.0).
+    // same marker) extend the trigger on *both* sides; non-split slices extend
+    // on the side the flag placement rules predict for the new frequency.
+    // Non-flagged and compact-mode slices fall through to the original
+    // slice-frequency comparison (both offsets stay 0.0).
     double leftFlagOffsetMhz  = 0.0;
     double rightFlagOffsetMhz = 0.0;
     if (auto* sw = spectrumForSlice(s)) {
@@ -1914,7 +3138,8 @@ MainWindow::TuneCenteringResult MainWindow::panFollowVfo(
                     // Split pair: LockLeft + LockRight, flags on both sides.
                     leftFlagOffsetMhz  = flagWidthMhz;
                     rightFlagOffsetMhz = flagWidthMhz;
-                } else if (vfo->onLeft()) {
+                } else if (sw->vfoFlagOnLeftForSlice(
+                               s->sliceId(), mhz, vfo->width(), vfo->onLeft())) {
                     leftFlagOffsetMhz  = flagWidthMhz;
                 } else {
                     rightFlagOffsetMhz = flagWidthMhz;
@@ -1938,10 +3163,82 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
     // algorithm enable/disable, and the manual cache stay in one place.
     if (m_appletPanel && m_appletPanel->rxApplet())
         w->setRxApplet(m_appletPanel->rxApplet());
+    w->setKiwiSdrManager(m_kiwiSdrManager);
 
     // Note: w->setSlice(s) is called at the end of this method (line ~1895)
 
     // Per-slice signals — these are specific to the slice this widget represents
+    connect(w, &VfoWidget::kiwiRxAntennaSelected,
+            this, &MainWindow::setKiwiSdrVirtualAntennaForSlice);
+    connect(w, &VfoWidget::flexRxAntennaSelected,
+            this, &MainWindow::clearKiwiSdrVirtualAntennaForSlice);
+    connect(s, &SliceModel::frequencyChanged, this, [this, s](double) {
+        updateKiwiSdrVirtualTrackingForSlice(s);
+    });
+    connect(s, &SliceModel::modeChanged, this, [this, s](const QString&) {
+        updateKiwiSdrVirtualTrackingForSlice(s);
+    });
+    connect(s, &SliceModel::filterChanged, this, [this, s](int, int) {
+        updateKiwiSdrVirtualTrackingForSlice(s);
+    });
+    connect(s, &SliceModel::panIdChanged, this, [this, s](const QString&) {
+        updateKiwiSdrVirtualTrackingForSlice(s);
+    });
+    connect(s, &SliceModel::audioGainChanged, this, [this, s](float) {
+        updateKiwiSdrVirtualAudioControlsForSlice(s);
+    });
+    connect(s, &SliceModel::audioMuteChanged, this, [this, s](bool) {
+        updateKiwiSdrVirtualAudioControlsForSlice(s);
+        syncFlexRxPanToAudioEngine();
+    });
+    connect(s, &SliceModel::audioPanChanged, this, [this, s](int) {
+        updateKiwiSdrVirtualAudioControlsForSlice(s);
+    });
+    connect(s, &SliceModel::agcModeChanged, this, [this, s](const QString&) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::agcThresholdChanged, this, [this, s](int) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::agcOffLevelChanged, this, [this, s](int) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::externalReceiveAgcModeChanged,
+            this, [this, s](const QString&) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::externalReceiveAgcThresholdChanged,
+            this, [this, s](int) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::externalReceiveAgcOffLevelChanged,
+            this, [this, s](int) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::squelchChanged, this, [this, s](bool, int) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::externalReceiveSquelchChanged,
+            this, [this, s](bool, int) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+    });
+    connect(s, &SliceModel::externalReceiveAutoSquelchChanged,
+            this, [this, s](bool) {
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+        syncActiveSliceAutoSquelchToSpectrums();
+        syncActiveSliceSquelchLineToSpectrums();
+    });
+    connect(m_appletPanel->rxApplet(), &RxApplet::autoSqlMarginDbChanged,
+            s, [this, sliceId](int) {
+        if (sliceId == m_activeSliceId) {
+            updateKiwiSdrVirtualReceiverControlsForSlice(
+                m_radioModel.slice(sliceId));
+        }
+    });
+    connect(s, &SliceModel::diversityChanged, this, [this, s](bool) {
+        pushSliceOverlay(s);
+        syncKiwiSdrDiversityEscControls();
+    });
     connect(w, &VfoWidget::closeSliceRequested, this, [this, sliceId]() {
         if (m_radioModel.slices().size() <= 1) return;
         m_radioModel.sendCommand(QString("slice remove %1").arg(sliceId));
@@ -1966,7 +3263,7 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
     });
     // Record/playback — route to radio or client-side QsoRecorder (#1297)
     connect(w, &VfoWidget::recordToggled, this, [this, w, sliceId](bool on) {
-        bool clientSide = AppSettings::instance().value("RecordingMode", "Radio").toString() == "Client";
+        bool clientSide = AppSettings::instance().value("RecordingMode", "Client").toString() == "Client";
         if (clientSide) {
             if (on)
                 m_qsoRecorder->startRecording();
@@ -1984,8 +3281,8 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
         w->setPlayEnabled(true);
     });
     // Client-side playback
-    connect(w, &VfoWidget::playToggled, this, [this, w, sliceId](bool on) {
-        bool clientSide = AppSettings::instance().value("RecordingMode", "Radio").toString() == "Client";
+    connect(w, &VfoWidget::playToggled, this, [this, sliceId](bool on) {
+        bool clientSide = AppSettings::instance().value("RecordingMode", "Client").toString() == "Client";
         if (clientSide) {
             if (on)
                 m_qsoRecorder->startPlayback();
@@ -2095,12 +3392,40 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
     });
 #endif
 
-    // AetherDSP button on the per-slice DSP tab — same entry point as the
-    // Settings menu action and the RX chain double-click; reuses the
-    // existing modeless m_dspDialog when one is already open.
+    // WFM is toggled from the spectrum overlay DAX menu (wired in the per-pan
+    // setup beside daxIqChannelChanged), not the flag — no connect here. (#3853)
+
+    // AetherDSP button on the per-slice DSP tab — toggles the modeless
+    // m_dspDialog (press to open, press again to close) so it matches its
+    // sibling AetherVoice button instead of being a one-way launcher (#3877).
+    // The Settings menu action and the RX chain double-click keep pure open
+    // semantics by calling ensureAetherDspDialog() directly.
     connect(w, &VfoWidget::aetherDspRequested, this, [this] {
-        ensureAetherDspDialog();
+        toggleAetherDspDialog();
     });
+
+    // Accent the ADSP launcher whenever any client-side NR module is active, so
+    // the reporter's gap — "enable NR4 and nothing on the main surface shows it"
+    // — is closed without opening the applet (#3800). The client modules are
+    // global AudioEngine state, so every slice's ADSP button tracks the same OR
+    // of the six *Enabled() flags. Bound to w so it drops when the slice closes.
+    if (m_audio) {
+        auto syncAetherDsp = [this, w] {
+            if (!m_audio) return;
+            const bool active = m_audio->nr2Enabled() || m_audio->nr4Enabled()
+                             || m_audio->mnrEnabled()
+                             || m_audio->dfnrEnabled() || m_audio->rn2Enabled()
+                             || m_audio->nvAfxEnabled();
+            w->setAetherDspActive(active);
+        };
+        connect(m_audio, &AudioEngine::nr2EnabledChanged,  w, [syncAetherDsp](bool){ syncAetherDsp(); });
+        connect(m_audio, &AudioEngine::nr4EnabledChanged,  w, [syncAetherDsp](bool){ syncAetherDsp(); });
+        connect(m_audio, &AudioEngine::mnrEnabledChanged,  w, [syncAetherDsp](bool){ syncAetherDsp(); });
+        connect(m_audio, &AudioEngine::dfnrEnabledChanged, w, [syncAetherDsp](bool){ syncAetherDsp(); });
+        connect(m_audio, &AudioEngine::rn2EnabledChanged,  w, [syncAetherDsp](bool){ syncAetherDsp(); });
+        connect(m_audio, &AudioEngine::nvAfxEnabledChanged, w, [syncAetherDsp](bool){ syncAetherDsp(); });
+        syncAetherDsp();  // apply current state to this freshly-wired slice
+    }
 
     // AetherVoice button on the per-slice DSP tab — toggles the Aetherial
     // Audio Channel Strip, matching the existing menu / chain entry points.
@@ -2118,14 +3443,30 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
             sw->setSliceOverlayMarkerStyle(sliceId, markerWidth, hideEdges);
     });
 
+    // Adaptive RX filter (RFC #3878): show/hide this slice's floor-level edge
+    // markers on its panadapter overlay as the feature is toggled.
+    connect(s, &SliceModel::adaptiveFilterEnabledChanged, this,
+            [this, sliceId](bool on) {
+        auto* sl = m_radioModel.slice(sliceId);
+        if (!sl) return;
+        if (auto* sw = spectrumForSlice(sl))
+            sw->setSliceOverlayAdaptive(sliceId, on);
+    });
+    // ...and the green/red status ball follows the live-fit (active) state.
+    connect(s, &SliceModel::adaptiveActiveChanged, this,
+            [this, sliceId](bool active) {
+        auto* sl = m_radioModel.slice(sliceId);
+        if (!sl) return;
+        if (auto* sw = spectrumForSlice(sl))
+            sw->setSliceOverlayAdaptiveActive(sliceId, active);
+    });
+
     // Pan re-apply after NR mono-mix (#1460, #1796): keep AudioEngine in sync
-    // with the radio-side pan value from ALL sources (VFO panel, RX applet,
-    // MIDI, radio echo-back on connect).  Connecting SliceModel::audioPanChanged
-    // covers every path that calls setAudioPan(); only the active slice's value
-    // matters because AudioEngine plays one slice at a time.
-    connect(s, &SliceModel::audioPanChanged, this, [this, sliceId](int v) {
-        if (sliceId == m_activeSliceId)
-            m_audio->setRxPan(v);
+    // with the active Flex-backed slice's radio-side pan value. Kiwi-backed
+    // slices update their own external source pan via
+    // updateKiwiSdrVirtualAudioControlsForSlice().
+    connect(s, &SliceModel::audioPanChanged, this, [this](int) {
+        syncFlexRxPanToAudioEngine();
     });
     connect(s, &SliceModel::rxAntennaChanged, this, [this, sliceId](const QString&) {
         if (auto* sl = m_radioModel.slice(sliceId)) {
@@ -2133,6 +3474,21 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
                 sw->reacquireNoiseFloorLock();
             }
         }
+    });
+    connect(w, &VfoWidget::autoSqlMarginDbChanged,
+            this, [this, s](int marginDb) {
+        if (m_panStack) {
+            for (PanadapterApplet* applet : m_panStack->allApplets()) {
+                if (!applet || !applet->spectrumWidget()) {
+                    continue;
+                }
+                applet->spectrumWidget()->setAutoSqlMarginDb(marginDb);
+            }
+        } else if (SpectrumWidget* sw = spectrumForSlice(s)) {
+            sw->setAutoSqlMarginDb(marginDb);
+        }
+        updateKiwiSdrVirtualReceiverControlsForSlice(s);
+        syncActiveSliceSquelchLineToSpectrums();
     });
 
     // Wire slice data into widget
@@ -2145,5 +3501,404 @@ void MainWindow::wireVfoWidget(VfoWidget* w, SliceModel* s)
 // wireActiveVfoSignals removed — NR2/RN2/RADE are now wired permanently
 // in wireVfoWidget() so connections survive focus switches (#227).
 
+
+// ─── One-shot meter wiring (#3351 Phase 2a) ─────────────────────────────────
+//
+// Extracted verbatim from the constructor: MeterModel → S-Meter / Tuner /
+// MTR / HLTH / TX applet routing. Runs once at construction; kept in this
+// TU with the rest of the model→UI wiring.
+
+void MainWindow::wireMeters()
+{
+    // ── S-Meter: MeterModel → SMeterWidget (active slice only) ─────────────
+    connect(&m_radioModel.meterModel(), &MeterModel::sLevelChanged,
+            this, [this](int sliceIndex, float dbm) {
+        if (sliceIndex == m_activeSliceId
+            && (!m_kiwiSdrManager
+                || m_kiwiSdrManager
+                       ->assignedProfileForSlice(sliceIndex).isEmpty())) {
+            deferReceivePresentation(
+                ReceivePresentationSource::Flex,
+                ReceivePresentationSurface::Meter,
+                [this, sliceIndex, dbm]() {
+                    if (!m_appletPanel
+                        || sliceIndex != m_activeSliceId
+                        || (m_kiwiSdrManager
+                            && !m_kiwiSdrManager
+                                    ->assignedProfileForSlice(sliceIndex)
+                                    .isEmpty())) {
+                        return;
+                    }
+                    m_appletPanel->sMeterWidget()->setLevel(dbm);
+#ifdef HAVE_HIDAPI
+                    m_tmate2SmeterDbm = dbm;
+                    updateTMate2Display();
+                    updateTMate2Indicators();
+#endif
+                },
+                QString::number(sliceIndex));
+        }
+    });
+    // Symmetric with the amp-side guard at line ~3654 and the PGXL TCP path
+    // at line ~3525: in OPERATE the amp owns the analog S-Meter, so drop the
+    // exciter sample here to stop the alternating-writer pulse where exciter
+    // (~100 W) and amp (~1500 W) values race into the same widget. (#2927)
+    connect(&m_radioModel.meterModel(), &MeterModel::txMetersChanged,
+            this, [this](float fwd, float swr) {
+        if (m_radioModel.hasAmplifier() && m_radioModel.ampOperate())
+            return;
+        m_appletPanel->sMeterWidget()->setTxMeters(fwd, swr);
+#ifdef HAVE_HIDAPI
+        m_tmate2TxWatts = fwd;
+        if (m_radioModel.transmitModel().isTransmitting()) {
+            updateTMate2Display();
+            updateTMate2Indicators();
+        }
+#endif
+    });
+    connect(&m_radioModel.meterModel(), &MeterModel::micMetersChanged,
+            m_appletPanel->sMeterWidget(), &SMeterWidget::setMicMeters);
+    connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
+            m_appletPanel->sMeterWidget(), &SMeterWidget::setTransmitting);
+
+    // ── Tuner: MeterModel TX meters → TunerApplet gauges ────────────────
+    // Use TGXL-specific meters when available (disambiguated from PGXL by handle)
+    connect(&m_radioModel.meterModel(), &MeterModel::tgxlMetersChanged,
+            m_appletPanel->tunerApplet(), &TunerApplet::updateMeters);
+    // Note: txMetersChanged NOT connected to TunerApplet — exciter power
+    // would overwrite TGXL readings. TGXL meters come from TunerModel
+    // via the direct TCP connection (port 9010). (#625)
+    m_appletPanel->tunerApplet()->setTunerModel(&m_radioModel.tunerModel());
+    m_appletPanel->tunerApplet()->setMeterModel(&m_radioModel.meterModel());
+
+    // Show/hide TUNE button + applet based on TGXL presence
+    connect(&m_radioModel.tunerModel(), &TunerModel::presenceChanged,
+            m_appletPanel, &AppletPanel::setTunerVisible);
+    connect(&m_radioModel.tunerModel(), &TunerModel::presenceChanged,
+            this, [this](bool present) {
+        m_tgxlContainer->setVisible(present);
+        m_tgxlSeparator->setVisible(present);
+        updateStatusBarMinimumWidth();
+        // Auto-connect/disconnect direct TGXL connection for manual relay control (#469)
+        if (present) {
+            QString ip = m_radioModel.tunerModel().tgxlIp();
+            if (!ip.isEmpty() && !m_tgxlConn.isConnected()) {
+                m_tgxlConn.connectToTgxl(ip);
+            }
+        } else {
+            m_tgxlConn.disconnect();
+        }
+    });
+    // Apply auto-reconnect setting at startup so it's active before any connection is made
+    {
+        const bool ar = PeripheralSettings::autoReconnect();
+        m_tgxlConn.setAutoReconnect(ar);
+        m_pgxlConn.setAutoReconnect(ar);
+        m_antennaGenius.setAutoReconnect(ar);
+    }
+
+    // Wire TgxlConnection to TunerModel
+    m_radioModel.tunerModel().setDirectConnection(&m_tgxlConn);
+    // Also attempt connection when TGXL IP arrives (may come after presence)
+    connect(&m_radioModel.tunerModel(), &TunerModel::stateChanged, this, [this]() {
+        auto* tuner = &m_radioModel.tunerModel();
+        if (tuner->isPresent() && !tuner->tgxlIp().isEmpty() && !m_tgxlConn.isConnected()) {
+            m_tgxlConn.connectToTgxl(tuner->tgxlIp());
+        }
+    });
+
+    // Auto-connect to PGXL when detected
+    connect(&m_radioModel, &RadioModel::amplifierChanged, this, [this](bool present) {
+        if (present && !m_radioModel.ampIp().isEmpty() && !m_pgxlConn.isConnected()) {
+            m_pgxlConn.connectToPgxl(m_radioModel.ampIp());
+        } else if (!present) {
+            m_pgxlConn.disconnect();
+        }
+    });
+    // PGXL status → AmpApplet (direct telemetry: vac, vdd, id, temp, tempb, state, etc.)
+    connect(&m_pgxlConn, &PgxlConnection::statusUpdated, this, [this](const QMap<QString, QString>& kvs) {
+        qCDebug(lcTuner) << "PGXL status:" << kvs;
+        auto* amp = m_appletPanel->ampApplet();
+        if (kvs.contains("temp")) {
+            // Some PGXL firmware encodes both PA module temps as "A/B" in a
+            // single field (e.g. "30.5/26.5"); others use separate tempb key.
+            const QString tv = kvs["temp"];
+            const int slash = tv.indexOf('/');
+            if (slash >= 0) {
+                amp->setTemp(tv.left(slash).toFloat());
+                amp->setTempB(tv.mid(slash + 1).toFloat());
+            } else {
+                amp->setTemp(tv.toFloat());
+            }
+        }
+        // Separate tempb field (firmware variant)
+        if (kvs.contains("tempb"))
+            amp->setTempB(kvs["tempb"].toFloat());
+        if (kvs.contains("id"))
+            amp->setDrainCurrent(kvs["id"].toFloat());
+        if (kvs.contains("vdd"))
+            amp->setDrainVoltage(kvs["vdd"].toFloat());
+        if (kvs.contains("vac"))
+            amp->setMainsVoltage(kvs["vac"].toInt());
+        if (kvs.contains("state"))
+            amp->setState(kvs["state"]);
+        if (kvs.contains("fanmode"))
+            amp->setFanMode(kvs["fanmode"]);
+        if (kvs.contains("meffa"))
+            amp->setMeff(kvs["meffa"]);
+        // Convert PGXL dBm to watts and feed S-Meter alongside radio meters.
+        // Use peakfwd (actual peak power) not fwd (floor/minimum).
+        // Skip when amp is STANDBY — peakfwd reads ~0 dBm in standby and would
+        // stomp on the exciter feed that should drive the barefoot scale.
+        if (kvs.contains("peakfwd") && m_radioModel.hasAmplifier()
+                && m_radioModel.ampOperate()) {
+            float dbm = kvs["peakfwd"].toFloat();
+            float watts = std::pow(10.0f, (dbm - 30.0f) / 10.0f);
+            qCDebug(lcTuner) << "PGXL→SMeter: peakfwd=" << dbm << "dBm =" << watts << "W";
+            float swr = 1.0f;
+            if (kvs.contains("swr")) {
+                float rl = std::abs(kvs["swr"].toFloat());
+                float rho = std::pow(10.0f, -rl / 20.0f);
+                swr = (rho < 0.999f) ? (1.0f + rho) / (1.0f - rho) : 99.0f;
+            }
+            // Ensure S-Meter is in TX mode when PGXL reports transmitting
+            if (kvs.value("state").startsWith("TRANSMIT"))
+                m_appletPanel->sMeterWidget()->setTransmitting(true);
+            else if (kvs.contains("state") && !kvs.value("state").startsWith("TRANSMIT"))
+                m_appletPanel->sMeterWidget()->setTransmitting(false);
+            m_appletPanel->sMeterWidget()->setTxMeters(watts, swr);
+#ifdef HAVE_HIDAPI
+            m_tmate2TxWatts = watts;
+            if (m_radioModel.transmitModel().isTransmitting()) {
+                updateTMate2Display();
+                updateTMate2Indicators();
+            }
+#endif
+        }
+    });
+    connect(&m_pgxlConn, &PgxlConnection::connected, this, [this]() {
+        qDebug() << "PGXL direct connection established, version:" << m_pgxlConn.version();
+        m_appletPanel->ampApplet()->setDirectConnected(true);
+    });
+    connect(&m_pgxlConn, &PgxlConnection::disconnected, this, [this]() {
+        m_appletPanel->ampApplet()->setDirectConnected(false);
+    });
+    // Radio amplifier status → AmpApplet telemetry (fallback path).
+    // The radio proxies PGXL telemetry fields (id, vac, vdd, meffa, temp, tempb, state) in its
+    // amplifier status messages, so the applet keeps updating even when the direct
+    // PGXL TCP connection isn't established.  When direct TCP IS connected, that
+    // path is faster and higher-precision (the radio rebroadcast may round/lag),
+    // so we skip the radio fallback to avoid display jitter from two paths
+    // alternately writing slightly-different values.
+    connect(&m_radioModel, &RadioModel::ampTelemetryUpdated,
+            this, [this](const QMap<QString, QString>& kvs) {
+        if (m_pgxlConn.isConnected()) return;
+        auto* amp = m_appletPanel->ampApplet();
+        if (kvs.contains("temp")) {
+            const QString tv = kvs["temp"];
+            const int slash = tv.indexOf('/');
+            if (slash >= 0) {
+                amp->setTemp(tv.left(slash).toFloat());
+                amp->setTempB(tv.mid(slash + 1).toFloat());
+            } else {
+                amp->setTemp(tv.toFloat());
+            }
+        }
+        if (kvs.contains("tempb"))
+            amp->setTempB(kvs["tempb"].toFloat());
+        if (kvs.contains("id"))
+            amp->setDrainCurrent(kvs["id"].toFloat());
+        if (kvs.contains("vdd"))
+            amp->setDrainVoltage(kvs["vdd"].toFloat());
+        if (kvs.contains("vac"))
+            amp->setMainsVoltage(kvs["vac"].toInt());
+        if (kvs.contains("state"))
+            amp->setState(kvs["state"]);
+        if (kvs.contains("meffa"))
+            amp->setMeff(kvs["meffa"]);
+    });
+    // Fan mode cycle button → direct PGXL command (fan control is not in the radio API)
+    connect(m_appletPanel->ampApplet(), &AmpApplet::fanModeChanged, this, [this](const QString& mode) {
+        m_pgxlConn.sendCommand(QString("setup fanmode=%1").arg(mode));
+    });
+    // OPERATE button → PGXL standby/operate command via radio amplifier API
+    connect(m_appletPanel->ampApplet(), &AmpApplet::operateToggled, this, [this](bool on) {
+        if (!m_radioModel.ampHandle().isEmpty())
+            m_radioModel.sendCommand(
+                QString("amplifier set %1 operate=%2").arg(m_radioModel.ampHandle()).arg(on ? 1 : 0));
+    });
+
+    // Switch Fwd Power gauge scale based on radio max power and amplifier presence.
+    // All three power gauges (TxApplet, TunerApplet, SMeterWidget) update together.
+    // When the PGXL is in STANDBY we fall back to the barefoot scale — only the
+    // radio's forward power is reaching the meter, so the 2kW arc would make
+    // every reading look tiny and useless.
+    auto updatePowerScale = [this]() {
+        int maxW = m_radioModel.transmitModel().maxPowerLevel();
+        // Aurora (AU-) radios have an integrated 600W PA (Overlord) but
+        // max_power_level only reports the exciter limit (100W). Use model
+        // name to detect the true PA capability. (#484)
+        const QString& model = m_radioModel.model();
+        if (model.startsWith("AU-") && maxW <= 100) {
+            maxW = 500;
+        }
+        const bool ampActive = m_radioModel.hasAmplifier()
+                            && m_radioModel.ampOperate();
+        m_appletPanel->txApplet()->setPowerScale(maxW, ampActive);
+        m_appletPanel->tunerApplet()->setPowerScale(maxW, ampActive);
+        m_appletPanel->sMeterWidget()->setPowerScale(maxW, ampActive);
+        m_appletPanel->healthApplet()->setPowerScale(maxW, ampActive);
+    };
+    connect(&m_radioModel, &RadioModel::amplifierChanged, this, updatePowerScale);
+    connect(&m_radioModel, &RadioModel::ampStateChanged, this, updatePowerScale);
+
+    // TGXL indicator: two-line rich text — label on top, state smaller below.
+    // Green = OPERATE, amber = BYPASS, grey = STANDBY (matches SmartSDR)
+    auto setIndicatorHtml = [](QLabel* nameLbl, QLabel* stateLbl,
+                               const QString& state, const QString& color) {
+        nameLbl->setStyleSheet(
+            QString("QLabel { color: %1; font-size:18px; font-weight:bold; }").arg(color));
+        stateLbl->setStyleSheet(
+            QString("QLabel { color: %1; font-size:11px; }").arg(color));
+        stateLbl->setText(state);
+    };
+
+    auto updateTgxlStyle = [this, setIndicatorHtml]() {
+        auto& t = m_radioModel.tunerModel();
+        if (t.isOperate() && !t.isBypass())
+            setIndicatorHtml(m_tgxlIndicator, m_tgxlStateLabel, "OPERATE", "#00e060");
+        else if (t.isOperate() && t.isBypass())
+            setIndicatorHtml(m_tgxlIndicator, m_tgxlStateLabel, "BYPASS", "#e0a000");
+        else
+            setIndicatorHtml(m_tgxlIndicator, m_tgxlStateLabel, "STANDBY", "#404858");
+    };
+    connect(&m_radioModel.tunerModel(), &TunerModel::stateChanged, this, updateTgxlStyle);
+
+    // PGXL indicator: OPERATE (green) or STANDBY (grey) — no bypass for PGXL
+    auto updatePgxlStyle = [this, setIndicatorHtml]() {
+        if (m_radioModel.ampOperate())
+            setIndicatorHtml(m_pgxlIndicator, m_pgxlStateLabel, "OPERATE", "#00e060");
+        else
+            setIndicatorHtml(m_pgxlIndicator, m_pgxlStateLabel, "STANDBY", "#404858");
+    };
+    connect(&m_radioModel, &RadioModel::ampStateChanged, this, [this, updatePgxlStyle]() {
+        updatePgxlStyle();
+        // Sync the AmpApplet button — the direct PGXL TCP path may not deliver
+        // a state update fast enough, leaving the button stuck on the old state.
+        // RadioModel is authoritative; use it to keep the button consistent.
+        m_appletPanel->ampApplet()->setState(
+            m_radioModel.ampOperate() ? QStringLiteral("OPERATE") : QStringLiteral("STANDBY"));
+    });
+
+    connect(&m_radioModel, &RadioModel::amplifierChanged, this, [this, updatePgxlStyle](bool present) {
+        m_pgxlContainer->setVisible(present);
+        m_pgxlSeparator->setVisible(present);
+        m_appletPanel->setAmpVisible(present);
+        updateStatusBarMinimumWidth();
+        if (present) {
+            updatePgxlStyle();
+            m_appletPanel->ampApplet()->setState(
+                m_radioModel.ampOperate() ? QStringLiteral("OPERATE") : QStringLiteral("STANDBY"));
+        }
+    });
+    connect(&m_radioModel.meterModel(), &MeterModel::ampMetersChanged,
+            this, [this](float fwdPwr, float swr, float temp) {
+        m_appletPanel->ampApplet()->setFwdPower(fwdPwr);
+        m_appletPanel->ampApplet()->setSwr(swr);
+        m_appletPanel->ampApplet()->setTemp(temp);
+        // S-Meter TX power follows the scale: amp output when PGXL is OPERATE,
+        // exciter output when it's STANDBY (txMetersChanged already handles that
+        // path, so we just stop overriding it here).
+        if (m_radioModel.hasAmplifier() && m_radioModel.ampOperate()) {
+            m_appletPanel->sMeterWidget()->setTxMeters(fwdPwr, swr);
+#ifdef HAVE_HIDAPI
+            m_tmate2TxWatts = fwdPwr;
+            if (m_radioModel.transmitModel().isTransmitting()) {
+                updateTMate2Display();
+                updateTMate2Indicators();
+            }
+#endif
+            static int ampDbg = 0;
+            if (++ampDbg % 50 == 1)
+                qCDebug(lcTuner) << "AMP→SMeter: fwd=" << fwdPwr << "W swr=" << swr;
+        }
+    });
+    connect(&m_radioModel.transmitModel(), &TransmitModel::maxPowerLevelChanged,
+            this, updatePowerScale);
+
+    // ── Meter applet: all meters consolidated ──────────────────────────────
+    m_appletPanel->meterApplet()->setMeterModel(&m_radioModel.meterModel());
+
+    // ── PROF applet: Global / TX / Mic profile switcher (#3376) ─────────────
+    m_appletPanel->profileSwitcherApplet()->setRadioModel(&m_radioModel);
+
+    // ── HLTH applet: same meter model — derives antenna-health state from
+    //    SWR / power trends across radio / tuner / amp sources.
+    m_appletPanel->healthApplet()->setMeterModel(&m_radioModel.meterModel());
+
+    // ── TX applet: meters + model ───────────────────────────────────────────
+    connect(&m_radioModel.meterModel(), &MeterModel::txMetersChanged,
+            m_appletPanel->txApplet(), &TxApplet::updateMeters);
+    // PEP peak-hold tick on the FWDPWR gauge: feed the raw pre-smoothed
+    // sample and reset the hold on un-key. (#2561)
+    connect(&m_radioModel.meterModel(), &MeterModel::txPeakChanged,
+            m_appletPanel->txApplet(), &TxApplet::updatePeakPower);
+    connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
+            m_appletPanel->txApplet(), &TxApplet::setTransmitting);
+    m_appletPanel->txApplet()->setTransmitModel(&m_radioModel.transmitModel());
+    m_appletPanel->txApplet()->setTunerModel(&m_radioModel.tunerModel());
+    // ATU right-click → pre-tune dialog needs RadioModel for slice access
+    // and BandPlanManager for region-correct band edges. (#2624)
+    m_appletPanel->txApplet()->setRadioModel(&m_radioModel);
+    m_appletPanel->txApplet()->setBandPlanManager(m_bandPlanMgr);
+    m_appletPanel->rxApplet()->setRadioModel(&m_radioModel);
+    m_appletPanel->rxApplet()->setKiwiSdrManager(m_kiwiSdrManager);
+    m_appletPanel->rxApplet()->setTransmitModel(&m_radioModel.transmitModel());
+    connect(m_appletPanel->rxApplet(), &RxApplet::kiwiRxAntennaSelected,
+            this, &MainWindow::setKiwiSdrVirtualAntennaForSlice);
+    connect(m_appletPanel->rxApplet(), &RxApplet::flexRxAntennaSelected,
+            this, &MainWindow::clearKiwiSdrVirtualAntennaForSlice);
+
+    // Hide APD row on radios that don't support it
+    connect(&m_radioModel.transmitModel(), &TransmitModel::apdStateChanged, this, [this]() {
+        m_appletPanel->txApplet()->setApdVisible(
+            m_radioModel.transmitModel().apdConfigurable());
+    });
+
+}
+
+// Adaptive RX filter (RFC #3878): per FFT frame, drive the fit engine for every
+// SSB slice on the pan that produced the frame. The engine itself gates on
+// mode/enabled and only does real work for enabled SSB slices, so this is a
+// cheap pan/slice lookup otherwise. The pan span + noise floor come from the
+// same source the S-History detector uses (SpectrumWidget::noiseFloorDbm()).
+void MainWindow::onSpectrumReadyForAdaptiveFilter(quint32 streamId,
+                                                  const QVector<float>& bins,
+                                                  qint64 emittedNs)
+{
+    if (m_shuttingDown || !m_panStack) return;
+    // Suspend while transmitting: the panadapter shows the TX signal (or muted
+    // RX), so fitting against it would chase garbage. Returning early holds the
+    // current passband and per-slice state untouched, so the fit resumes cleanly
+    // on unkey instead of re-fitting from scratch.
+    if (m_radioModel.isRadioTransmitting()) return;
+    if (!m_adaptiveFilterEngine)
+        m_adaptiveFilterEngine = new AdaptiveFilterEngine(this);
+
+    for (auto* pan : m_radioModel.panadapters()) {
+        if (!pan || pan->panStreamId() != streamId) continue;
+
+        SpectrumWidget* sw = m_panStack->spectrum(pan->panId());
+        const float noiseFloor = sw ? sw->noiseFloorDbm() : -1000.0f;
+
+        for (auto* slice : m_radioModel.slices()) {
+            if (!slice || slice->panId() != pan->panId()) continue;
+            m_adaptiveFilterEngine->processFrame(
+                slice, pan->centerMhz(), pan->bandwidthMhz(), bins, noiseFloor,
+                emittedNs);
+        }
+        break;  // one pan owns this stream id
+    }
+}
 
 } // namespace AetherSDR

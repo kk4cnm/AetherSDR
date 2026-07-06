@@ -6,6 +6,428 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 > **Versioning:** Starting with **v26.5.1**, AetherSDR moves to **CalVer**
 > (`YY.M.patch`). Earlier tags used semver through v0.9.8.
 
+## [Unreleased]
+
+## [v26.7.1] — 2026-07-02
+
+### 3D stacked-trace spectrum + in-process NVIDIA BNR + TX meter readouts + 60 fps panadapters
+
+29 commits since v26.6.5. Headlined by a new **3D stacked-trace spectrum**
+panadapter render mode, the **NVIDIA in-process AI noise removal** engine (BNR,
+no container), **mouse-over numeric readouts** on the TX meters, and a **60 fps
+GPU panadapter** rendering path — plus platform-based model capability gating
+from FlexLib and a broad wave of audio, spectrum, and UI fixes.
+
+### Added
+
+- **3D stacked-trace spectrum panadapter.** A new **Spectrum: 2D / 3D** display
+  mode turns the spectrum region into a perspective stacked-trace surface — a
+  rolling history of FFT traces receding into the distance — with the waterfall,
+  scales, and all overlays (spots, memories, markers, band plan) still rendering
+  underneath. Ridge height is anchored to the measured noise floor with a
+  floor→peak colour gradient, single-frame impulse bursts are rejected, and a
+  **3D Floor** depth slider tunes how far below the floor to surface.
+  Cross-platform (macOS / Windows / Linux) with graceful GPU→CPU degradation. (#3899)
+- **dBm / noise-floor scale in 3D mode.** The right-edge amplitude scale returns
+  in 3D stacked-trace mode as a full-height linear axis that reads just like the
+  2D scale, synced to and persisted with the **3D Floor** slider. (#3937)
+- **BNR — NVIDIA GPU AI noise removal, in-process, no container.** The AetherDSP
+  **BNR** module runs the NVIDIA Maxine **Audio Effects (AFX)** denoiser directly
+  inside AetherSDR on your local NVIDIA RTX/GeForce GPU (Turing+) — lowest
+  latency, no Docker, no microservice to manage. Supported on **Linux and
+  Windows** (`-DENABLE_NVIDIA_AFX=ON`); macOS / non-NVIDIA machines use DFNR. An
+  intensity slider, status, and a one-time **Download** for the AFX runtime live
+  in the panel below the button row. See [`docs/nvidia-bnr.md`](docs/nvidia-bnr.md). (#3902)
+- **AFX download-on-demand (`NvidiaAfxPack`).** BNR fetches its ~2 GB GPU runtime
+  on first use and caches it, so the shipped app carries none of it. On Linux the
+  CUDA libs come from NVIDIA's PyPI wheels (pinned, sha256-verified) and the
+  AFX/TensorRT/model bits from a small sha-pinned release asset; on Windows the
+  whole runtime ships as one self-contained sha-pinned `.zip`. (#3902)
+- **Mouse-over numeric readouts on the TX meters.** Hover any TX meter — SWR,
+  forward power, ALC, mic Level, or Compression — and a floating badge shows the
+  exact value (e.g. `12 W`, `1.12 : 1`, `-6.4 dBFS`) instead of making you
+  eyeball the bar. Updates live while hovered and fades a second after you
+  leave. (#3936)
+- **SWR sweep — optional manual range.** A **Limit range** checkbox with
+  **From** / **To** fields confines a sweep to a licence sub-band or a slice of
+  interest instead of always sweeping the whole band. Off by default; the fields
+  seed with the current band's edges, and the bounds can only ever narrow the
+  sweep — never widen it past what the regional band plan permits. (#3885)
+- **Local CW/CWX sidetone captured in Client-Side recordings.** QSO recordings
+  now carry the AetherSDR-generated CW sidetone alongside voice, so a single
+  continuous file holds both across SSB↔CW switches — usable at last for contest
+  CW review. Client-Side recording is now the out-of-box default (Radio Side
+  stays selectable). Scope is AetherSDR-keyed CW (keyboard / paddle / CWX). (#3895)
+- **KiwiSDR protocol metadata scaffolding.** Richer read-only receiver metadata,
+  protocol/capability handling, and monitor/camping state for public KiwiSDR
+  receivers, with new `get kiwi` / `get kiwisdr` automation-bridge snapshots.
+  Clean-room per Constitution Principle IV. (#3898)
+- **Automation bridge — `get dsp`, `streams resync`, `selectRow` / `window`
+  verbs.** A `get dsp` model for the client-side AetherDSP modules (NR2 / NR4 /
+  MNR / DFNR / RN2 / BNR), `streams resync` to force the radio to re-dump its
+  display inventory, item-view row selection, and top-level window state control
+  — plus a TX-guard fix so the RX-only "Tune Now" button is no longer wrongly
+  blocked, and a11y names on the six DSP buttons. (#3920)
+
+### Changed
+
+- **BNR's container/microservice (NIM, gRPC) backend was removed.** BNR is now
+  purely the local in-process AFX denoiser — ham operators shouldn't have to
+  stand up a container to denoise audio. This also drops the grpc/protobuf build
+  dependency entirely. BNR is auto-disabled in digital/CW modes and accents the
+  ADSP launcher like the other client-NR engines. (#3902)
+- **Faster panadapters — 60 fps ceiling and a per-pixel GPU FFT trace.** The 2D
+  spectrum trace is now evaluated per pixel on the GPU from a single column
+  texture, eliminating the per-frame CPU vertex bake (pan main-thread prep
+  dropped ~5×). Data-driven repaints coalesce into one present per 16 ms slot,
+  and the FFT frame-rate ceiling is raised from 30 to 60 fps. A new
+  `get panstats` bridge verb reports per-panadapter frame-cost counters for
+  before/after profiling. (#3958)
+- **Model capabilities now sourced from FlexLib.** Extended-DSP (NRS/RNN/NRF)
+  and diversity gating migrated from hand-maintained model-name sniffing to the
+  FlexLib `ModelCapabilities` table (Principle I), fixing the AU-510 and
+  "S"-variant (MLS-9601 / CLS-9301) extended-DSP toggles that never appeared,
+  correcting diversity for FLEX-6500 (now off) and dual-SCU ML/CL/MLS/CLS models
+  (now on), and refreshing the flag when a late `model` status arrives. All 23
+  current FlexLib models resolve. (#3954, #2177)
+- **Cut RX speaker latency for USB and local audio.** The app-side RX buffer cap
+  default drops from 200 ms to 100 ms and the Windows RX sink now requests an
+  explicit 50 ms device buffer, taking the worst-case Windows USB path from
+  ~300–500 ms toward ~150 ms. Still fully adjustable (50–1000 ms) for
+  VPN/SmartLink users who need a larger cushion. (#3897)
+- **Display pane grouped into labeled sections.** The panadapter's Display panel
+  is split into six labeled, divided sections — Panadapter, Waterfall,
+  Background, Appearance, 3D View, System — and the background-off gesture is now
+  a dedicated **Off** button instead of an undiscoverable right-click on Clear. (#3935)
+
+### Fixed
+
+- **Windows multi-pan crash.** The QRhiWidget cleanup callback is now
+  deregistered on all GPU platforms, fixing a crash when tearing down
+  panadapters on Windows. (#3922)
+- **Profile Switcher swallowed the first Space PTT / CW key.** The non-editable
+  Profile Switcher combo no longer eats the first Space press after gaining
+  focus. (#3926)
+- **New Panadapter Cancel button overlapped the layout grid.** The layout-picker
+  window now sizes its height to the content, so the Cancel button sits below the
+  thumbnail grid instead of on top of the bottom row. (#3941)
+- **RC-28 auto-snap now sticks.** After the 600 ms auto-snap rounds to the
+  nearest 1 kHz, the wheel accumulator is re-based to the snapped frequency, so
+  the next knob tick no longer resumes from the stale pre-snap target and undoes
+  the snap. (#3940)
+- **KiwiSDR 3D trace / waterfall alignment.** DSS history is preserved and
+  reprojected when the visible frequency frame changes during pan/zoom, keeping
+  the 3D stacked trace aligned with the waterfall on Kiwi receivers and
+  eliminating a one-frame line flash. (#3942)
+- **Cross-band net tune routed through the canonical tune policy.** (#3921)
+- **DX spot tooltip blocked by the passband hit-test.** Hovering a DX spot inside
+  the active slice passband now shows its tooltip; the spot hit-test runs ahead
+  of the passband cursor check, matching the click path. (#3903)
+- **TCI TX resamples from the client-declared rate, not a hardcoded 48 kHz.** A
+  TCI client that negotiated 8/12/24 kHz and then transmitted was mis-pitched
+  (tones offset, digital decodes failing); TX now resamples from each frame's
+  declared rate. WSJT-X (48 kHz) is unaffected. (#3892)
+- **TCI TX soak-telemetry field rename** (`inputFrames48k` / `input48k=`) for
+  accuracy. (#3924)
+- **QsoRecorder playback stuck-mute on sink-open failure.** If the playback sink
+  failed to open, live RX could be muted with no path to unmute until restart;
+  the failure path now returns with RX left live. (#3891)
+- **Auto-unkey momentary keyboard PTT/CW on focus loss and modifier-release**, so
+  a held key can't leave the radio stuck keyed. (#3890)
+- **Antenna Genius Port B visibility on manual-IP connections.** AetherSDR now
+  probes the device with `info get` to read the authoritative port/antenna
+  counts, restoring Port B parity with the UDP-discovery path for 2-radio-input
+  hardware. (#3900)
+- **Windows manifest embedded via `target_sources`** rather than a linker flag,
+  fixing the build. (#3947)
+
+## [v26.6.5] — 2026-06-28
+
+### KiwiSDR receive sync + SmartMTR TX meters + Profile Switcher applet + agent automation bridge expansion
+
+50 commits since v26.6.4. Headlined by **KiwiSDR receive sync** (GCC-PHAT
+audio + visual alignment between the Flex and a public Kiwi), **SmartMTR TX
+meters** (SWR / forward-power / compression gauges for the VFO flag), a new
+**PROF profile-switcher applet** for live Global/TX/Mic profile selection, and a
+large **agent automation/test bridge** expansion (radio connect/disconnect,
+display-stream leak detection, custom context-menu inspection, and a
+panadapter/waterfall control surface) — plus a broad wave of spectrum, VFO-flag,
+and KiwiSDR stability fixes.
+
+### Added
+
+- **KiwiSDR receive sync** — GCC-PHAT Auto-Assist that time-aligns the Flex and a
+  public KiwiSDR receiver in both audio and the spectrum/waterfall. (#3872)
+- **SmartMTR TX meters** — selectable SWR, forward-power, and compression gauges
+  with analog ballistics for the VFO flag meter. (#3776)
+- **PROF (Profile Switcher) applet** — live Global / TX / Mic profile selection
+  from a sidebar applet. (#3829)
+- **Resizable CW decode panel** with an adjustable, persistent font size. (#3824)
+- **APRS message-services picker** on the Recipient field. (#3828)
+- **RC-28 rotation-sensitivity divider** with auto-snap to 1 kHz. (#3875)
+- **SWR sweep CSV export.** (#3882)
+- **Master Volume Up/Down configurable keyboard shortcuts.** (#3820)
+- **S-meter config context menu** plus a needle pivot cover with a themed
+  backlight glow (both tokenized for the theme subsystem). (#3859)
+- **Agent automation bridge — major expansion:** radio connect/disconnect
+  commands (#3851); radio-side display-stream inventory + leak detection
+  (`streams` verb) that surfaces leaked/duplicate panadapter & waterfall streams
+  `get pans` can't show (#3856); the `contextMenu` verb to trigger/inspect custom
+  right-click menus (#3883); observability fields plus close/drag/showMenu/pan
+  verbs, grab pan, and a token-anchored TX guard (#3842); a Panadapter/Waterfall
+  control surface — antennas, CWX, floors, pan management (#3832); and bridge
+  fidelity for slice TX, key/PTT, menu reachability, lineedit submit, resize, and
+  multi-instance station identity (#3819). RX/observe verbs are observe-only; see
+  `docs/automation-bridge.md`.
+
+### Changed
+
+- **WFM toggle relocated to the DAX pan menu** so the frequency digits no longer
+  clip. (#3853)
+- **KiwiSDR audio mutes during non-FDX transmit.** (#3865)
+- **AetherDSP Settings now toggle from the DSP-tab ADSP button.** (#3881)
+- **PTT (Hold) honors its reassigned key** instead of a hardcoded Space. (#3884)
+- **ADSP launcher accents** when a client NR module is active. (#3822)
+- **`pan close` verb** drives the production `RadioModel::removePanadapter`
+  teardown path instead of duplicating the commands. (#3843)
+- **GPU flag-sprite machinery excised** — slice flags are now always live. (#3806)
+- CI: SHA-pinned actions drop version comments to stop Dependabot drift (#3867);
+  `actions/cache` → 6.1.0 (#3864); `actions/setup-python` → 6.3.0 (#3863).
+
+### Fixed
+
+- **Closing a panafall-created panadapter now frees its waterfall stream on the
+  radio** — the teardown now sends the FlexLib-correct Panadapter.Close +
+  Waterfall.Close pair through `RadioModel::removePanadapter`. (#3843, #3855)
+- **KiwiSDR proxy redirect transport** (proxy → proxy2). (#3850)
+- **Kiwi waterfall pan/zoom stalls** — moved off the GUI thread. (#3825)
+- **VOX-keyed transmit** now engages the SmartMTR TX meter and audio gate. (#3862)
+- **Pan Lock** stands down during a slice drag and recenters on release. (#3786)
+- **VFO flag-side pan following** and **diversity-pair flag placement**. (#3866, #3880)
+- **Zoomed FFT spectrum rendering.** (#3836)
+- **Smooth FFT trace + clamped display scale**, with EMA reset on TX→RX so the
+  floor doesn't linger. (#3847, #3831)
+- **DAX RX stream create/remove storm** that dropped connection quality to red. (#3796)
+- **Keyboard/space PTT** routed through the Quindar coordinator. (#3798)
+- **AetherControl window** clamped to the screen height. (#3795)
+- **Panadapter split-pair** shown for an externally-initiated split. (#3794)
+- **SpotHub clear buttons** persist; counter-desync and console-clear fixes. (#3823)
+- **Floating window fill** for width-capped applets. (#3827)
+- Automation: widget click/toggle deferred out of the socket read callback (#3826);
+  tightened mark→tail log correlation (#3793).
+- CWX drift-test teardown heap-use-after-free. (#3799)
+
+### Performance
+
+- **VITA-49 RX buffer** default raised to 4 MiB with an operator-adjustable
+  slider — eliminates burst drops and auto-throttle fps caps. (#3811)
+- Reuse GPU FFT-trace vertex scratch buffers + guard against a 1-bin spectrum. (#3782)
+- Skip overlay re-bake on cursor-move when no readout is shown. (#3780)
+
+### Removed
+
+- Dead `m_overlayDynamic` overlay image (#59a19681), leftover `RxApplet.h.bak`
+  (#3818), and a reverted half-baked frequency shrink-to-fit (#3846, #3839).
+
+## [v26.6.4] — 2026-06-23
+
+### KiwiSDR public-receiver browser + SmartMTR meter view + agent automation bridge + GPU-composite flags + accessibility
+
+80 commits since v26.6.3. Headlined by a **KiwiSDR public-receiver
+integration**, a selectable **SmartMTR meter view** for the VFO flag, an in-app
+**agent automation/test bridge** for the GUI, **GPU-composited slice flags** with
+a multi-GPU render selector, a first **accessibility** pass for custom-painted
+widgets, and a large round of **CAT/rigctld parity** fixes. Governance moves to
+**Constitution v2.0.0**.
+
+### New features
+
+- **KiwiSDR public-receiver browser** — an API-policy-aware directory browser to
+  find and connect to public KiwiSDR receivers worldwide, independent of the
+  FlexRadio path. Honest, policy-aware receiver picker with the public-directory
+  **Limits** marker; diversity receive interlock with receive-only TX inhibit on
+  Kiwi panadapters; source-attributed terminal denial messages (badp codes + MSG
+  keys); clearer connection-failure messages; dedicated Support-menu logging
+  categories. See `docs/kiwisdr-public-directory.md`. (#3668, #3679, #3676, #3678,
+  #3699, #3706, #3707, #3716, #3749, #3759)
+- **SmartMTR selectable meter view** for the VFO flag — an opt-in alternative to
+  the S-meter (which stays pixel-identical when not selected). Analog d'Arsonval
+  bar ballistics, sliding-window min/max "extremes" markers (1s/3s/5s), optional
+  numeric value labels, and a TX mic-level meter. Renders correctly in the GPU
+  flag-sprite path. (#3723, #3750, #3751, #3752, #3753, #3760, #3771)
+- **Agent automation / test bridge** — an in-app, agent-drivable bridge for the
+  GUI (`dumpTree`/`grab`/`invoke`/`get`, slice/VFO verbs), with TX automation
+  hardening (meter freshness, ATU, two-tone, safety rails), input validation,
+  redaction of masked fields, and a log-observability suite. Off in production,
+  gated behind `AETHER_AUTOMATION`. See `docs/automation-bridge.md`. (#3646,
+  #3710, #3722, #3727, #3728, #3738, #3717, #3747)
+- **GPU-composite slice flags** instead of translucent raster siblings — removes
+  the main-thread re-blend over the QRhi waterfall each frame, plus a multi-GPU
+  **render-GPU selector** (Display menu) for multi-adapter systems and a
+  flag re-raster pause when a flag isn't presented. (#3617, #3695, #3656, #3746,
+  #3713)
+- **Accessibility** — `QAccessibleInterface` implementations for custom-painted
+  widgets (a Grouping summary for the VFO flag; the ESC level bar), backed by a
+  new CI accessibility static-analysis check. See `docs/a11y.md`. (#3754, #3758)
+- **Net Reminder Scheduler** — recurring net reminders with one-click tuning.
+  (#3684)
+- **PSK Reporter map** gains band-condition shading, a lookback window, and a
+  hover card, with cross-platform spot-delivery fixes. (#3635)
+- **FreeDV Reporter**: 6m+ band coverage and multi-select. (#3591)
+- Maidenhead **grid-locator** field in the APRS position row. (#3672)
+- **Memory** editor: NUL sanitisation, field dropdowns, smoother editing. (#3657)
+- Continuous **edge auto-pan** while dragging a slice. (#3581)
+- Status-bar **date** follows the system locale. (#3690)
+- **Support bundles** are deflate-compressed. (#3691)
+- **Waveform** install over the Docker file-upload protocol. (#3585)
+
+### CAT / rigctld parity
+
+- Resolve SmartSDR Flex/TS-2000 split-behavior gaps + block TS-2000 satellite-mode
+  TX. (#3739)
+- Resolve rigctld behavior gaps and fix on-demand split VFO. (#3724)
+- Match missing Hamlib rigctld functionality — VFO mode, mode mapping, CTCSS/FM
+  tones, levels & funcs. (#3619)
+- **Behaviour:** VFO B is a dialect capability — disabled for rigctld, preserved
+  across dialect switches and smaller-radio reconnects. (#3694/#3698)
+- Don't cap running CAT ports by receiver count. (#3693/#3697)
+- **Fix (safety):** a bare `ZZTX;` is a read, not a key — no more uncommanded TX
+  in the Flex dialect. (#3625/#3629)
+- Make the CAT per-port enable toggle visible. (#3618)
+
+### Fixes & hardening
+
+- **TCI DAX RX audio** routed by a cached channel→TRX map, resilient to transient
+  `dax=0`; cache cleared on disconnect teardown. (#3669/#3759, #3766/#3767)
+- **Crash:** guard the slice DAX-recall single-shot against a dangling slice
+  (use-after-free). (#3733)
+- **Live state (Principle II):** `setDax`, `setCwSidetone`, `setSbMonitor`, and
+  `setAmCarrierLevel` now update their cached state optimistically. (#3737, #3736,
+  #3734, #3712)
+- Reproject only the active waterfall stream while panning. (#3700/#3701)
+- Draw the panadapter grid below the FFT trace in the GPU path. (#3606/#3713)
+- Use the radio's auto-black level for an evenly-levelled waterfall floor. (#3586)
+- Independently themable **LIVE** chip (red live / grey history). (#3761)
+- Pace TX waterfall rows to `line_duration` to match the RX scroll rate. (#3686)
+- Profile FFT settling on load. (#3604, #3573)
+- Prune dead followers in `AudioOutputRouter`. (#3660/#3661)
+- Capture TX audio in client-side QSO recordings. (#3556/#3632)
+- Run the CWX local sidetone keyer on a `steady_clock` worker thread. (#3644)
+- Stream Deck Tune Toggle parsed the wrong TCI status field. (#3647)
+- Migrate hardcoded highlight/disabled-state colours to ThemeManager tokens
+  (Principle IX); persist Theme Editor overrides under pre-seeded applet scopes.
+  (#3645, #3688)
+- Ulanzi dial on Linux: detect an inaccessible evdev device and offer a one-click
+  udev grant. (#3677)
+- RX BW indicator shows bandwidth, not the hi-cut. (#3659/#3696)
+- Idle MOX button gets a distinct accent so it reads as the transmit button.
+  (#3763)
+- Fan-mode button label clarity; Fahrenheit toggle for amplifier temperature.
+  (#3651, #3652)
+
+### Internal — audio sink factory (Phase 6, #3306)
+
+- New `AudioOutputRouter` registry for output-following sinks; Pudu/QSO/CW and
+  Quindar sinks finished onto the factory with format negotiated through it.
+  (#3630, #3631, #3655)
+- Architecture note: WebSDR-sourced VFO/slice design. (#3621)
+
+### Governance
+
+- **Constitution v2.0.0** — trims the domain conventions (relocated to
+  `AGENTS.md`) and adds governance principles; net 14 principles. (#3602)
+
+### Packaging / CI
+
+- Build and bundle **qtkeychain** for SmartLink credential persistence on the
+  Linux **AppImage** (#3640) and **Windows** (#3634).
+- **Pin + verify SHA256** for all `third_party` setup-script downloads. (#3665/#3692)
+- **AppStream metainfo** for Linux + Flathub-submission polish; a simple
+  **manpage**. (#3673, #3709, #3674)
+- Dependabot: `actions/checkout` 6.0.3→7.0.0, `microsoft-store-apppublisher`
+  1.1→1.3, `action-gh-release` 3.0.0→3.0.1. (#3682, #3681, #3680)
+
+## [v26.6.3] — 2026-06-14
+
+### Satellite WFM + APRS/PSK-Reporter mapping + packet AFSK + MainWindow decomposition
+
+58 commits since v26.6.2. Headlined by a WFM software demodulator for
+satellite data, an APRS client and a PSK Reporter reception map built on a new
+reusable Qt mapping engine, a Direwolf-derived VHF packet demodulator, and the
+internal #3351 decomposition of the MainWindow monolith.
+
+### New features
+
+- **WFM software demodulator** for satellite data work (G3RUH 9600 bd):
+  DAX IQ → SkyRoof-parity DSP chain (phase-continuous NCO Doppler correction,
+  exact 48 kHz resampling, flat atan2 discriminator) → virtual audio cable for
+  HS-SoundModem. Per-slice WFM toggle on FM modes. (#3407, #3522, #3562)
+- **APRS client** — the AetherModem AX.25 tab becomes a lightweight APRS
+  client: live station table with wireframe symbol icons and weather decode, a
+  timed GPS position beacon (grid-locator fallback), and two-way messaging with
+  retries, auto-ack, and digipeat de-duplication — all on the shared one-at-a-
+  time TX keying queue. (#3530)
+- **PSK Reporter reception map** (View ▸ PSK Reporter) showing who is hearing
+  your callsign on an OpenStreetMap basemap — mode-coloured markers, great-circle
+  paths, live MQTT feed plus HTTP polling, persistent spot cache. Built on a new
+  **reusable Qt mapping engine** (vendored QGeoView, LGPL-3.0) intended for reuse
+  by the APRS tab. (#3565)
+- **Direwolf-derived AFSK demodulator** for VHF 1200-baud AX.25, replacing
+  libmodem's AFSK on the VHF path (HF 300-baud unchanged). A 1,875-packet
+  overnight comparator beat both Direwolf and Graywolf on copy rate. (#3527)
+- **DAX-IQ fully usable** — end-to-end IQ sample delivery, a dBFS level meter,
+  24/48/96/192 kHz rate switching with persistence, and startup state restore.
+  (#2529, #3521, #3522)
+
+### Packet radio
+
+- `HdlcCodec`: pure-C++ HDLC framer replacing libmodem's `bitstream_state`. (#3475)
+- AX.25 shim isolated on a dedicated `QThread`. (#3473)
+- MQTT: per-topic control, CW keyer, radio state, AX.25, debug logging. (#3460)
+
+### Fixes & hardening
+
+- **Behaviour change (CAT):** rigctl/TCI `set_freq` retunes that stay within the
+  panadapter span no longer recenter the pan (`autopan=0`); cross-band tunes
+  still recenter, preserving the #536 behaviour. Satellite trackers issuing
+  Doppler steps every few seconds previously yanked the pan on every step.
+- Profile-load recovery hardening for Multi-Flex — suppress/defer profile-owned
+  slice/pan/waterfall writes during global profile restore. (#3563)
+- DEXP controls now use the `compander`/`compander_level` protocol keys SmartSDR
+  actually uses (were silently rejected). (#3568)
+- Multi-Flex ping-watchdog grace during a second client's join, so AetherSDR no
+  longer false-disconnects mid-join. (#3570)
+- TCI: dB on the wire for the VOLUME command; `ready;` sent after the full
+  settings dump, not mid-burst. (#3498, #3502)
+- ARRL US bandplan license-class accuracy. (#3518)
+- Narrow-passband drag hit-testing. (#3523)
+- GPU spectrum builds without `Qt6GuiPrivate` (Windows/macOS aqtinstall). (#3561)
+- Keep inactive-slice bandwidth visible via a neutral colour rather than
+  near-invisible dimming. (#3484/#2389)
+- Per-row waterfall-history frequency frames (no per-pan reproject). (#3578)
+- TMate2 enhanced display — TX bargraph, text overlays, encoder labels. (#3542)
+- RC-28 velocity-proportional tuning. (#3467)
+- SmartSDR-parity **"Purple"** waterfall colour scheme — additive and opt-in,
+  joining the existing presets. (#3583)
+
+### Internal — MainWindow decomposition (#3351)
+
+- `MainWindow.cpp` reduced from ~19,500 to ~8,100 lines, split across sibling
+  translation units (`MainWindow_Controllers/Menus/Shortcuts/Wiring/DigitalModes/
+  SwrSweep/Spots/Session/DspApplets.cpp`, `MainWindowHelpers`,
+  `MainWindowShortcutState.h`) — pure code motion, no behaviour change. Mapped in
+  `docs/architecture/mainwindow-decomposition.md`.
+- New **`RadioSession`** aggregate owns `RadioModel` + `TciServer` + `CatPorts`
+  per radio, making teardown order structural (fixes the #2385 crash-on-quit
+  class). (#3544, #3545)
+
+### Packaging / CI
+
+- Microsoft Store: a `v*` release tag now auto-stages a **draft** submission via
+  the `msstore` CLI — safe-by-construction (SHA-pinned action, secrets via env,
+  tag + opt-in + fork gates, `--noCommit`), dormant until credentials are set.
+  (#3567)
+
 ## [v26.6.2] — 2026-06-07
 
 ### Theming + HID controllers + packet-radio suite + Windows Store + 206-commit consolidation

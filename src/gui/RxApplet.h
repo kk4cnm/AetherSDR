@@ -23,6 +23,7 @@ namespace AetherSDR {
 
 class SliceModel;
 class RadioModel;
+class KiwiSdrManager;
 
 // RX Applet — controls for a single receive slice.
 //
@@ -53,18 +54,21 @@ public:
 
     // Cross-widget access for the bidirectional SQL sync with VfoWidget.
     // VfoWidget mirrors mode + value via these methods; RxApplet stays the
-    // source of truth for SqlMode, the manual-level cache, and the
-    // AutoSqlMarginDb persistence.
+    // source of truth for SqlMode, the current surface's manual level, and
+    // the AutoSqlMarginDb persistence.
     SqlMode sqlMode() const { return m_sqlMode; }
-    int     sqlManualLevel() const { return m_sqlManualLevel; }
+    bool    isAttachedToSlice(const SliceModel* slice) const { return m_slice == slice; }
+    int     sqlManualLevel() const;
+    int     sqlManualMaximum() const;
     int     autoSqlMarginDb() const;
     // Externally cycle the mode (Off → Manual → Auto → Off) — same path the
     // RxApplet's own SQL button takes.  Emits sqlModeChanged.
     void    cycleSqlModeExternal();
     // Programmatic slider drag from another UI surface.  Branches by mode
-    // exactly like the in-applet slider does: Manual writes the slice and
-    // persists m_sqlManualLevel; Auto writes AppSettings AutoSqlMarginDb
-    // and emits autoSqlMarginDbChanged.  Off is a no-op.
+    // exactly like the in-applet slider does: Manual writes the current
+    // receive surface; Flex also persists m_sqlManualLevel, while Kiwi keeps
+    // its replacement-source level independent. Auto writes AppSettings
+    // AutoSqlMarginDb and emits autoSqlMarginDbChanged. Off is a no-op.
     void    setSqlSliderValueExternal(int v);
     void syncStepFromSlice(int stepHz, const QVector<int>& stepList);
     void cycleStepUp();
@@ -78,6 +82,7 @@ public:
     // Connect to transmit model for QSK (break_in) indicator.
     void setTransmitModel(class TransmitModel* txModel);
     void setRadioModel(class RadioModel* radioModel);
+    void setKiwiSdrManager(KiwiSdrManager* manager);
 
     // Set the available antenna list (from ant_list in panadapter status).
     void setAntennaList(const QStringList& ants);
@@ -109,6 +114,8 @@ signals:
     // that should not fire on radio-driven syncs: pushing to the radio,
     // persisting, and the "Step: …" status-bar toast.
     void stepSizeChangedByUser(int hz);
+    void kiwiRxAntennaSelected(int sliceId, const QString& profileId);
+    void flexRxAntennaSelected(int sliceId);
     // Emitted when Auto SQL tracking is toggled.
     void sqlAutoChanged(bool on);
     // Emitted on every SQL mode transition (Off / Manual / Auto), so any
@@ -133,6 +140,7 @@ signals:
     // Emitted when user selects/deselects RADE digital voice mode
     void radeActivated(bool on, int sliceId);
 #endif
+    void wfmActivated(bool on, int sliceId);
 
 public:
     void setInitialStepSize(int hz);
@@ -151,11 +159,14 @@ private:
     void updateAntennaButton(QPushButton* button, const QString& token, bool tx);
     void updateAntennaButtons();
     void updateFreqLabel();
+    void scheduleFrequencyAnnouncement(const QString& text);
+    QStringList rxAntennaOptions() const;
     QStringList txAntennaOptions() const;
     QString antennaMenuLabel(const QString& token, const QStringList& options) const;
 
     void applyFilterPreset(int widthHz);
     void updateFilterButtons();
+    void refreshFilterWidth();   // "AUTO" while adaptive is live, else the width
     void updateModeSettings(const QString& mode);
     void rebuildFilterButtons();
     void saveFilterPresets();
@@ -166,17 +177,16 @@ private:
     static QString formatHz(int hz);
     static QString formatStepLabel(int hz);
 
-    // Recomputes the "all owned slices muted" state from RadioModel and
-    // dims the slice-tab buttons accordingly.  Called on any owned-slice
-    // audioMuteChanged + on slice add/remove + after slice-button rebuild.
-    // The dim is the visual ack the user gets after a double-click on
-    // m_muteBtn that toggles every slice.
+    // Keeps slice-tab styling on the normal slice identity palette. The
+    // speaker button owns mute feedback; slice letters must not grey out and
+    // read as disabled after mute-all or Kiwi receive routing changes.
     void refreshAllMutedDim();
     void setSliceButtonsDimmed(bool dim);
 
     SliceModel* m_slice{nullptr};
     TransmitModel* m_txModel{nullptr};
     RadioModel* m_radioModel{nullptr};
+    KiwiSdrManager* m_kiwiSdrManager{nullptr};
     QStringList m_antList{"ANT1", "ANT2"};   // populated from ant_list key
 
     // Step sizes (Hz) — per-mode, swapped on mode change
@@ -212,6 +222,9 @@ private:
     QLabel*      m_freqLabel{nullptr};     // frequency readout e.g. "14.289.510"
     QLineEdit*   m_freqEdit{nullptr};
     QStackedWidget* m_freqStack{nullptr};
+    QTimer       m_accessibleFrequencyTimer;
+    QString      m_pendingAccessibleFrequencyText;
+    QString      m_lastAccessibleFrequencyText;
 
     // Filter presets (Hz widths) — per-mode, swapped on mode change
     QVector<int>            m_filterWidths{1800, 2100, 2400, 2700, 3300, 6000};
@@ -257,6 +270,7 @@ private:
     QPushButton* m_sqlBtn{nullptr};
     QSlider*     m_sqlSlider{nullptr};
     SqlMode      m_sqlMode{SqlMode::Off};
+    SqlMode      m_flexSqlMode{SqlMode::Off};
     bool         m_savedSquelchOn{false};
     // Last user-chosen Manual squelch level (0–100).  Auto mode overwrites
     // the slice's squelchLevel with algorithm-suggested values every FFT
@@ -267,6 +281,12 @@ private:
     void applySqlModeVisuals();
     void cycleSqlMode();
     void setSqlMode(SqlMode m, bool propagateToRadio);
+    bool usingExternalReceiveSquelch() const;
+    int clampManualSqlLevelForCurrentSurface(int level) const;
+    void setManualSqlLevelForCurrentSurface(int level);
+    int agcThresholdMinimum() const;
+    int agcThresholdMaximum() const;
+    void syncAgcSliderFromSlice();
 
 
     // RIT

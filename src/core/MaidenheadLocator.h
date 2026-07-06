@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <algorithm>
 #include <cmath>
 
 namespace AetherSDR {
@@ -44,6 +45,46 @@ public:
             lat = latDeg + 0.5;
         }
         return true;
+    }
+
+    // Encode a lat/lon (decimal degrees) to a 6-character Maidenhead locator,
+    // in the conventional mixed case (field upper, square digits, subsquare
+    // lower), e.g. "IM99sc". Returns empty if the inputs are out of range.
+    // Inverse of toLatLon(): a value produced by toLatLon() round-trips back to
+    // the grid square that contains it.
+    static QString toMaidenhead(double lat, double lon)
+    {
+        if (lat < -90.0 || lat > 90.0 || lon < -180.0 || lon > 180.0)
+            return QString();
+
+        // Shift to 0..360 / 0..180 and nudge the upper edge inward so a point
+        // exactly on +180/+90 lands in the last field rather than overflowing.
+        double adjLon = std::min(lon + 180.0, 359.999999);
+        double adjLat = std::min(lat + 90.0, 179.999999);
+
+        QString loc;
+        loc.reserve(6);
+
+        const int lonField = static_cast<int>(adjLon / 20.0);
+        const int latField = static_cast<int>(adjLat / 10.0);
+        loc.append(QChar::fromLatin1(static_cast<char>('A' + lonField)));
+        loc.append(QChar::fromLatin1(static_cast<char>('A' + latField)));
+        adjLon -= lonField * 20.0;
+        adjLat -= latField * 10.0;
+
+        const int lonSq = static_cast<int>(adjLon / 2.0);
+        const int latSq = static_cast<int>(adjLat);
+        loc.append(QChar::fromLatin1(static_cast<char>('0' + lonSq)));
+        loc.append(QChar::fromLatin1(static_cast<char>('0' + latSq)));
+        adjLon -= lonSq * 2.0;
+        adjLat -= latSq;
+
+        const int lonSub = static_cast<int>(adjLon / (2.0 / 24.0));
+        const int latSub = static_cast<int>(adjLat / (1.0 / 24.0));
+        loc.append(QChar::fromLatin1(static_cast<char>('a' + lonSub)));
+        loc.append(QChar::fromLatin1(static_cast<char>('a' + latSub)));
+
+        return loc;
     }
 
     // Haversine distance in km between two lat/lon points (decimal degrees).

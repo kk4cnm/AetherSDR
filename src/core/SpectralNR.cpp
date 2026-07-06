@@ -29,6 +29,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "SpectralNR.h"
 #include "LogManager.h"
+#include <QByteArray>
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
@@ -280,9 +281,9 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
     // This gives us a head start if Thetis is installed
 #ifdef _WIN32
     {
-        const char* appData = std::getenv("APPDATA");
-        if (appData) {
-            std::string thetisWisdom = std::string(appData)
+        const QByteArray appData = qgetenv("APPDATA");
+        if (!appData.isEmpty()) {
+            std::string thetisWisdom = std::string(appData.constData())
                 + "\\OpenHPSDR\\Thetis-x64\\wdspWisdom00";
             std::lock_guard<std::mutex> lock(s_fftwMutex);
             if (fftw_import_wisdom_from_filename(thetisWisdom.c_str())) {
@@ -421,6 +422,25 @@ SpectralNR::WisdomResult SpectralNR::generateWisdom(const std::string& directory
 
 void SpectralNR::process(const float* input, float* output, int numSamples)
 {
+    if (numSamples <= 0) {
+        return;
+    }
+
+    // The overlap-add rings are sized for streaming at the native hop cadence.
+    // Larger packet-sized calls can wrap the output ring before the call reads
+    // its output, aliasing future synthesis data into the returned samples.
+    // Split internally so callers with bursty packet sizes still get the same
+    // result as the normal 128-sample Flex RX cadence.
+    if (numSamples > m_hopSize) {
+        int offset = 0;
+        while (offset < numSamples) {
+            const int chunk = std::min(m_hopSize, numSamples - offset);
+            process(input + offset, output + offset, chunk);
+            offset += chunk;
+        }
+        return;
+    }
+
     const int accSize = static_cast<int>(m_inAccum.size());
     const int outSize = static_cast<int>(m_outAccum.size());
 

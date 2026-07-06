@@ -3,6 +3,9 @@
 #include "LogManager.h"
 
 #include <portaudio.h>
+#if defined(Q_OS_LINUX) && __has_include(<pa_jack.h>)
+#  include <pa_jack.h>  // PaJack_SetClientName — name the PipeWire/JACK node
+#endif
 
 #include <QString>
 
@@ -162,6 +165,24 @@ bool CwSidetonePortAudioSink::start(const QAudioDevice& device,
     m_fallbackReason.clear();
 
     if (!m_paInitialized) {
+#if defined(Q_OS_LINUX) && __has_include(<pa_jack.h>)
+        // Name the PortAudio->JACK/PipeWire client so the CW sidetone shows
+        // as "AetherSDR CW Sidetone" in qpwgraph/JACK patchbays instead of
+        // the bare PortAudio default. Must precede Pa_Initialize, and pa_jack
+        // references (does not copy) the string -> static lifetime. CW sidetone
+        // is AetherSDR's only PortAudio user, so naming the process-global JACK
+        // client here is unambiguous.
+        static const char kJackClientName[] = "AetherSDR CW Sidetone";
+        // PaJack_SetClientName returns PaError; surface a failure like the
+        // Pa_Initialize path below. Non-fatal — the node keeps its default
+        // name — so log and continue rather than abort.
+        const PaError nameErr = PaJack_SetClientName(kJackClientName);
+        if (nameErr != paNoError) {
+            qCWarning(lcAudio) << "CwSidetonePortAudioSink: PaJack_SetClientName failed —"
+                               << Pa_GetErrorText(nameErr)
+                               << "(node keeps its default name)";
+        }
+#endif
         const PaError err = Pa_Initialize();
         if (err != paNoError) {
             qCWarning(lcAudio) << "CwSidetonePortAudioSink: Pa_Initialize failed —"

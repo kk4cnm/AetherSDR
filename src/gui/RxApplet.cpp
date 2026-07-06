@@ -6,6 +6,8 @@
 #include "InteractionSettings.h"
 #include "SliceColorManager.h"
 #include "SliceLabel.h"
+#include "core/KiwiSdrManager.h"
+#include "core/KiwiSdrProtocol.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
 #include "Theme.h"
@@ -19,6 +21,7 @@
 #include <QComboBox>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QFrame>
 #include <QGridLayout>
 #include <QMenu>
 #include <QApplication>
@@ -30,8 +33,10 @@
 #include <QFormLayout>
 #include "core/AppSettings.h"
 #include <QAction>
+#include <QAccessible>
 #include <QFontMetrics>
 #include <QPainter>
+#include <QPointer>
 #include <QWheelEvent>
 #include <QKeyEvent>
 #include <QStyle>
@@ -43,6 +48,7 @@
 #include <cmath>
 #include <limits>
 #include "core/ThemeManager.h"
+#include "FreqLineEdit.h"
 
 // Slider that resets to a default value on double-click.
 // Extends GuardedSlider for controls-lock support (#745).
@@ -187,10 +193,6 @@ static const QString& kButtonBase()
 static constexpr const char* kDimLabelStyle =
     "QLabel { color: #8090a0; font-size: 11px; }";
 
-static constexpr const char* kInsetValueStyle =
-    "QLabel { font-size: 10px; background: #0a0a18; border: 1px solid #1e2e3e; "
-    "border-radius: 3px; padding: 1px 2px; color: #c8d8e8; }";
-
 static const QString& kBlueActive()
 {
     static const QString s = AetherSDR::ThemeManager::instance().resolve(
@@ -328,6 +330,19 @@ RxApplet::RxApplet(QWidget* parent) : QWidget(parent)
     m_sqlManualLevel = std::clamp(
         AppSettings::instance().value("LastManualSquelchLevel", "20").toInt(),
         0, 100);
+    m_accessibleFrequencyTimer.setSingleShot(true);
+    connect(&m_accessibleFrequencyTimer, &QTimer::timeout, this, [this]() {
+        if (!QAccessible::isActive() || !m_freqLabel) {
+            return;
+        }
+        if (m_pendingAccessibleFrequencyText == m_lastAccessibleFrequencyText) {
+            return;
+        }
+        m_lastAccessibleFrequencyText = m_pendingAccessibleFrequencyText;
+        QAccessibleValueChangeEvent event(m_freqLabel,
+                                          m_pendingAccessibleFrequencyText);
+        QAccessible::updateAccessibility(&event);
+    });
     buildUI();
 }
 
@@ -395,23 +410,58 @@ void RxApplet::buildUI()
             "font-size: 10px; font-weight: bold; padding: 0 2px; }"
             "QPushButton:hover { color: #66aaff; }");
         connect(m_rxAntBtn, &QPushButton::clicked, this, [this] {
-            QMenu menu(this);
-            const QString cur = m_slice ? m_slice->rxAntenna() : "";
-            const QStringList options = m_slice && !m_slice->rxAntennaList().isEmpty()
-                ? m_slice->rxAntennaList()
-                : m_antList;
-            for (const QString& ant : options) {
-                QAction* act = menu.addAction(antennaMenuLabel(ant, options));
+            if (!m_slice) {
+                return;
+            }
+            QPointer<SliceModel> slice = m_slice;
+            const QString cur = slice->rxAntenna();
+            QStringList menuOptions = rxAntennaOptions();
+            if (m_kiwiSdrManager) {
+                for (const QString& ant : m_kiwiSdrManager->virtualAntennaTokens()) {
+                    if (!ant.isEmpty() && !menuOptions.contains(ant)) {
+                        menuOptions.append(ant);
+                    }
+                }
+            }
+            if (menuOptions.isEmpty()) {
+                menuOptions << QStringLiteral("ANT1") << QStringLiteral("ANT2");
+            }
+            const QString activeKiwiProfile =
+                m_kiwiSdrManager
+                    ? m_kiwiSdrManager->assignedProfileForSlice(slice->sliceId())
+                    : QString();
+            QMenu* menu = new QMenu(m_rxAntBtn);
+            connect(menu, &QMenu::aboutToHide, menu, &QObject::deleteLater);
+            for (const QString& ant : menuOptions) {
+                QAction* act = menu->addAction(antennaMenuLabel(ant, menuOptions));
                 act->setData(ant);
                 act->setCheckable(true);
-                act->setChecked(ant == cur);
+                const QString profileId = m_kiwiSdrManager
+                    ? m_kiwiSdrManager->profileIdForVirtualAntennaToken(ant)
+                    : QString();
+                act->setChecked(profileId.isEmpty()
+                    ? ant == cur && activeKiwiProfile.isEmpty()
+                    : profileId == activeKiwiProfile);
                 act->setToolTip(ant);
                 act->setStatusTip(ant);
             }
-            const QAction* sel = menu.exec(
+            connect(menu, &QMenu::triggered, this, [this, slice](QAction* sel) {
+                if (!sel || !slice) {
+                    return;
+                }
+                const QString token = sel->data().toString();
+                const QString profileId = m_kiwiSdrManager
+                    ? m_kiwiSdrManager->profileIdForVirtualAntennaToken(token)
+                    : QString();
+                if (!profileId.isEmpty()) {
+                    emit kiwiRxAntennaSelected(slice->sliceId(), profileId);
+                } else {
+                    emit flexRxAntennaSelected(slice->sliceId());
+                    slice->setRxAntenna(token);
+                }
+            });
+            menu->popup(
                 m_rxAntBtn->mapToGlobal(QPoint(0, m_rxAntBtn->height())));
-            if (sel && m_slice)
-                m_slice->setRxAntenna(sel->data().toString());
         });
         row->addWidget(m_rxAntBtn);
 
@@ -496,6 +546,11 @@ void RxApplet::buildUI()
                 this, [this](int) {
             if (m_modeCombo->signalsBlocked()) return;
             QString mode = m_modeCombo->currentText();
+            // Selecting a real radio mode tears down the WFM software-demod
+            // overlay if it was running on this slice. ("WFM" is never an
+            // entry in m_modeCombo — it is toggled from the VFO-flag WFM
+            // button — so there is no "turn WFM on" branch here.)
+            emit wfmActivated(false, m_slice ? m_slice->sliceId() : -1);
 #ifdef HAVE_RADE
             if (mode == "RADE") {
                 emit radeActivated(true, m_slice ? m_slice->sliceId() : -1);
@@ -527,13 +582,14 @@ void RxApplet::buildUI()
         m_freqLabel->installEventFilter(this);
         m_freqStack->addWidget(m_freqLabel);
 
-        m_freqEdit = new QLineEdit;
+        auto* freqEdit = new FreqLineEdit;
+        m_freqEdit = freqEdit;
         AetherSDR::ThemeManager::instance().applyStyleSheet(m_freqEdit, "QLineEdit { background: {{color.background.0}}; border: 1px solid {{color.accent}};"
             " border-radius: 3px; color: #00e5ff; font-size: 20px;"
             " font-family: \"{{font.family.freq}}\";"
             " font-weight: bold; padding: 0 4px; }");
         m_freqEdit->setAlignment(Qt::AlignRight);
-        m_freqEdit->setPlaceholderText("MHz");
+        freqEdit->setHintText("MHz");
         m_freqEdit->installEventFilter(this);
         m_freqStack->addWidget(m_freqEdit);
         m_freqStack->setCurrentIndex(0);
@@ -891,25 +947,23 @@ void RxApplet::buildUI()
         connect(m_sqlSlider, &QSlider::valueChanged, this, [this](int v) {
             if (m_sqlMode == SqlMode::Manual) {
                 // Cache the user's chosen manual level so re-entering
-                // Manual from Auto/Off restores it, and persist it so the
-                // choice survives launch (the slice's squelchLevel gets
-                // clobbered by Auto's algorithm pushes and can no longer
-                // be trusted as the manual baseline).
-                m_sqlManualLevel = v;
-                auto& s = AppSettings::instance();
-                s.setValue("LastManualSquelchLevel", QString::number(v));
-                s.save();
+                // Manual from Auto/Off restores it on Flex. Kiwi replacement
+                // receive keeps its level in the external receive state, so
+                // it does not update the Flex manual cache.
+                const int level = clampManualSqlLevelForCurrentSurface(v);
+                setManualSqlLevelForCurrentSurface(level);
                 if (m_slice)
-                    m_slice->setSquelch(true, v);
+                    m_slice->setSquelch(true, level);
             } else if (m_sqlMode == SqlMode::Auto) {
                 // Auto SQL: slider sets the dB margin above the measured
                 // noise floor (5–20 dB).  Persist + broadcast so every
                 // pan's auto-squelch algorithm picks up the new margin
                 // and the suggested level recomputes on the next FFT.
+                const int margin = std::clamp(v, 5, 20);
                 auto& s = AppSettings::instance();
-                s.setValue("AutoSqlMarginDb", QString::number(v));
+                s.setValue("AutoSqlMarginDb", QString::number(margin));
                 s.save();
-                emit autoSqlMarginDbChanged(v);
+                emit autoSqlMarginDbChanged(margin);
             }
         });
         rightCol->addLayout(row);
@@ -951,24 +1005,27 @@ void RxApplet::buildUI()
                 return;
             }
             QMenu menu(m_agcTSlider);
-            menu.addAction(QStringLiteral("Calibrate AGC-T against noise floor…"),
-                           this, [this] {
+            QAction* calibrateAction =
+                menu.addAction(QStringLiteral("Calibrate AGC-T against noise floor…"),
+                               this, [this] {
                 if (m_slice) {
                     emit calibrateAgcTRequested(m_slice->sliceId());
                 }
             });
+            calibrateAction->setEnabled(
+                !m_slice->externalReceiveReplacementActive());
             menu.exec(m_agcTSlider->mapToGlobal(pos));
         });
 
         connect(m_agcTSlider, &QSlider::valueChanged, this, [this](int v) {
             if (m_slice) {
-                if (m_slice->agcMode() == "off") {
+                if (m_slice->receiveAgcMode() == "off") {
                     m_agcTSlider->setToolTip(
-                        QString("AGC Off Level: %1\nRight-click to calibrate against the noise floor").arg(v));
+                        QString("AGC Off Level: %1 dB\nRight-click to calibrate against the noise floor").arg(v));
                     m_slice->setAgcOffLevel(v);
                 } else {
                     m_agcTSlider->setToolTip(
-                        QString("AGC Threshold: %1\nRight-click to calibrate against the noise floor").arg(v));
+                        QString("AGC Threshold: %1 dB\nRight-click to calibrate against the noise floor").arg(v));
                     m_slice->setAgcThreshold(v);
                 }
             }
@@ -1086,6 +1143,11 @@ void RxApplet::buildUI()
 
     root->addLayout(columns);
 
+    // The adaptive RX filter controls (RFC #3878) live solely in the VFO flag —
+    // a single host avoids syncing the enable/bounds/preset state across two
+    // widgets. The applet's filter-width readout still shows "AUTO" while a fit
+    // is live (refreshFilterWidth()).
+
     // Tooltips
     m_lockBtn->setToolTip("Locks the VFO frequency to prevent accidental tuning.");
     m_rxAntBtn->setToolTip("Select the receive antenna port.");
@@ -1101,7 +1163,7 @@ void RxApplet::buildUI()
     m_sqlSlider->setToolTip("Squelch threshold. Increase to require a stronger signal before audio opens.");
     // Auto SQL tooltip set inline at construction
     m_agcCombo->setToolTip("AGC speed. Slow resists pumping on quiet bands; Fast tracks rapid signal changes.");
-    m_agcTSlider->setToolTip(QString("AGC Threshold: %1").arg(m_agcTSlider->value()));
+    m_agcTSlider->setToolTip(QString("AGC Threshold: %1 dB").arg(m_agcTSlider->value()));
     m_ritOnBtn->setToolTip("Receive Incremental Tuning \u2014 offsets the receive frequency without moving transmit.");
     m_ritZero->setToolTip("Resets the RIT offset to zero.");
     m_xitOnBtn->setToolTip("Transmit Incremental Tuning \u2014 offsets the transmit frequency without moving receive.");
@@ -1211,7 +1273,7 @@ void RxApplet::applySqlModeVisuals()
         break;
     }
     // Slider has two distinct roles depending on mode:
-    //   Manual: threshold input (0–100, squelch_level units).
+    //   Manual: threshold input (Flex 0-100, Kiwi 0-99 signed-offset UI).
     //   Auto:   dB margin above measured noise floor (5–20).
     //   Off:    disabled.
     // Switching modes resizes the slider's range and restores the
@@ -1222,15 +1284,21 @@ void RxApplet::applySqlModeVisuals()
         QSignalBlocker b(m_sqlSlider);
         switch (m_sqlMode) {
         case SqlMode::Manual: {
-            m_sqlSlider->setRange(0, 100);
-            // Restore the cached manual level — slice->squelchLevel() may
+            m_sqlSlider->setRange(0, sqlManualMaximum());
+            // Restore the cached manual level — receiveSquelchLevel() may
             // hold a stale Auto-algorithm value that doesn't represent the
-            // user's chosen manual threshold.
-            m_sqlSlider->setValue(m_sqlManualLevel);
-            m_sqlSlider->setEnabled(true);
-            m_sqlSlider->setToolTip(
-                "Squelch threshold (0–100). Increase to require a stronger "
-                "signal before audio opens.");
+            // user's chosen manual threshold. Kiwi replacement receive has
+            // its own visible squelch state, independent of the Flex cache.
+            m_sqlSlider->setValue(sqlManualLevel());
+            m_sqlSlider->setEnabled(m_sqlBtn->isEnabled());
+            m_sqlSlider->setToolTip(usingExternalReceiveSquelch()
+                ? QStringLiteral("Kiwi SQL threshold (0-99, mapped to a "
+                                 "signed dB offset from the receiver noise "
+                                 "floor). Increase to require a stronger "
+                                 "signal before audio opens.")
+                : QStringLiteral("Squelch threshold (0-100). Increase to "
+                                 "require a stronger signal before audio "
+                                 "opens."));
             break;
         }
         case SqlMode::Auto: {
@@ -1239,7 +1307,7 @@ void RxApplet::applySqlModeVisuals()
                 AppSettings::instance().value("AutoSqlMarginDb", "10").toInt(),
                 5, 20);
             m_sqlSlider->setValue(margin);
-            m_sqlSlider->setEnabled(true);
+            m_sqlSlider->setEnabled(m_sqlBtn->isEnabled());
             m_sqlSlider->setToolTip(
                 "Auto SQL margin (5–20 dB). dB above the measured noise "
                 "floor where the squelch gate opens.");
@@ -1252,6 +1320,9 @@ void RxApplet::applySqlModeVisuals()
                 "before audio opens.");
             break;
         }
+        m_sqlSlider->style()->unpolish(m_sqlSlider);
+        m_sqlSlider->style()->polish(m_sqlSlider);
+        m_sqlSlider->update();
     }
 }
 
@@ -1285,27 +1356,66 @@ int RxApplet::autoSqlMarginDb() const
         AppSettings::instance().value("AutoSqlMarginDb", "10").toInt(), 5, 20);
 }
 
+bool RxApplet::usingExternalReceiveSquelch() const
+{
+    return m_slice && m_slice->externalReceiveReplacementActive();
+}
+
+int RxApplet::sqlManualLevel() const
+{
+    if (usingExternalReceiveSquelch()) {
+        return clampManualSqlLevelForCurrentSurface(
+            m_slice->receiveSquelchLevel());
+    }
+    return clampManualSqlLevelForCurrentSurface(m_sqlManualLevel);
+}
+
+int RxApplet::sqlManualMaximum() const
+{
+    return usingExternalReceiveSquelch()
+        ? KiwiSdrProtocol::kSquelchUiMaxLevel
+        : 100;
+}
+
+int RxApplet::clampManualSqlLevelForCurrentSurface(int level) const
+{
+    return std::clamp(level, 0, sqlManualMaximum());
+}
+
+void RxApplet::setManualSqlLevelForCurrentSurface(int level)
+{
+    const int clamped = clampManualSqlLevelForCurrentSurface(level);
+    if (usingExternalReceiveSquelch()) {
+        return;
+    }
+
+    m_sqlManualLevel = clamped;
+    auto& s = AppSettings::instance();
+    s.setValue("LastManualSquelchLevel", QString::number(clamped));
+    s.save();
+}
+
 void RxApplet::setSqlSliderValueExternal(int v)
 {
     if (m_sqlMode == SqlMode::Manual) {
-        m_sqlManualLevel = v;
-        auto& s = AppSettings::instance();
-        s.setValue("LastManualSquelchLevel", QString::number(v));
-        s.save();
+        const int level = clampManualSqlLevelForCurrentSurface(v);
+        setManualSqlLevelForCurrentSurface(level);
         if (m_slice)
-            m_slice->setSquelch(true, v);
+            m_slice->setSquelch(true, level);
         if (m_sqlSlider) {
             QSignalBlocker b(m_sqlSlider);
-            m_sqlSlider->setValue(v);
+            m_sqlSlider->setRange(0, sqlManualMaximum());
+            m_sqlSlider->setValue(level);
         }
     } else if (m_sqlMode == SqlMode::Auto) {
+        const int margin = std::clamp(v, 5, 20);
         auto& s = AppSettings::instance();
-        s.setValue("AutoSqlMarginDb", QString::number(v));
+        s.setValue("AutoSqlMarginDb", QString::number(margin));
         s.save();
-        emit autoSqlMarginDbChanged(v);
+        emit autoSqlMarginDbChanged(margin);
         if (m_sqlSlider) {
             QSignalBlocker b(m_sqlSlider);
-            m_sqlSlider->setValue(v);
+            m_sqlSlider->setValue(margin);
         }
     }
     // Off: ignored — slider is disabled on both UIs.
@@ -1313,10 +1423,23 @@ void RxApplet::setSqlSliderValueExternal(int v)
 
 void RxApplet::setSqlMode(SqlMode m, bool propagateToRadio)
 {
-    if (m == m_sqlMode) return;
+    if (m == m_sqlMode) {
+        if (m_slice && usingExternalReceiveSquelch()) {
+            m_slice->setExternalReceiveAutoSquelch(m == SqlMode::Auto);
+        } else {
+            m_flexSqlMode = m;
+        }
+        applySqlModeVisuals();
+        return;
+    }
     const bool wasAuto = (m_sqlMode == SqlMode::Auto);
     const bool nowAuto = (m == SqlMode::Auto);
     m_sqlMode = m;
+    if (m_slice && usingExternalReceiveSquelch()) {
+        m_slice->setExternalReceiveAutoSquelch(nowAuto);
+    } else {
+        m_flexSqlMode = m;
+    }
     applySqlModeVisuals();
 
     // Notify any mirroring UI (VfoWidget's SQL button + slider) so it can
@@ -1329,13 +1452,15 @@ void RxApplet::setSqlMode(SqlMode m, bool propagateToRadio)
     if (wasAuto != nowAuto)
         emit sqlAutoChanged(nowAuto);
 
-    // Manual / Auto both want the radio squelch ON.  Auto's first level push
-    // arrives from the algorithm via autoSquelchLevelSuggested → setSquelch
-    // routed through MainWindow; the immediate setSquelch(true, slider) here
-    // just makes sure the gate is open while the algorithm warms up.
+    // Manual / Auto both want the radio squelch ON. Use the same model-backed
+    // value that applySqlModeVisuals() displays so the first Kiwi command
+    // cannot diverge from the slider/overlay before the operator drags it.
     if (propagateToRadio && m_slice) {
         const bool sqOn = (m != SqlMode::Off);
-        m_slice->setSquelch(sqOn, m_sqlSlider->value());
+        const int level = (m == SqlMode::Manual)
+            ? sqlManualLevel()
+            : autoSqlMarginDb();
+        m_slice->setSquelch(sqOn, level);
     }
 }
 
@@ -1429,9 +1554,8 @@ void RxApplet::setMaxSlices(int maxSlices)
         m_sliceTabRow->setVisible(true);
     }
 
-    // Re-apply the all-muted dim to the freshly-rebuilt buttons so the
-    // visual stays in sync if the rebuild happens while the user is in
-    // the all-muted state.
+    // Re-apply the normal slice-tab palette after rebuild. Mute state belongs
+    // on the speaker control; the slice tabs keep their identity colours.
     refreshAllMutedDim();
 }
 
@@ -1528,9 +1652,14 @@ void RxApplet::updateSliceButtons(const QList<SliceModel*>& slices, int activeSl
     // string itself doesn't need to change for those.
     auto applyStyleIfChanged = [](QToolButton* btn, int colourIdx,
                                    const QString& stylesheet) {
+        btn->setProperty("normalStyleSheet", stylesheet);
         const QVariant prev = btn->property("colourIdx");
-        if (prev.isValid() && prev.toInt() == colourIdx) return;
+        if (prev.isValid() && prev.toInt() == colourIdx
+            && btn->styleSheet() == stylesheet) {
+            return;
+        }
         btn->setProperty("colourIdx", colourIdx);
+        btn->setProperty("sliceButtonsDimmed", false);
         btn->setStyleSheet(stylesheet);
     };
 
@@ -1639,6 +1768,8 @@ void RxApplet::updateSliceButtons(const QList<SliceModel*>& slices, int activeSl
         btn->style()->unpolish(btn);
         btn->style()->polish(btn);
     }
+
+    refreshAllMutedDim();
 }
 
 void RxApplet::setSlice(SliceModel* slice)
@@ -1707,6 +1838,31 @@ void RxApplet::setRadioModel(RadioModel* radioModel)
     updateAntennaButtons();
 }
 
+void RxApplet::setKiwiSdrManager(KiwiSdrManager* manager)
+{
+    if (m_kiwiSdrManager) {
+        disconnect(m_kiwiSdrManager, &KiwiSdrManager::profilesChanged,
+                   this, &RxApplet::updateAntennaButtons);
+        disconnect(m_kiwiSdrManager, &KiwiSdrManager::sliceAssignmentChanged,
+                   this, nullptr);
+    }
+    m_kiwiSdrManager = manager;
+    if (m_kiwiSdrManager) {
+        connect(m_kiwiSdrManager, &KiwiSdrManager::profilesChanged,
+                this, &RxApplet::updateAntennaButtons);
+        connect(m_kiwiSdrManager, &KiwiSdrManager::sliceAssignmentChanged,
+                this, [this](int sliceId, const QString&) {
+            if (m_slice && m_slice->sliceId() == sliceId) {
+                updateAntennaButtons();
+                applySqlModeVisuals();
+                emit sqlModeChanged(static_cast<int>(m_sqlMode));
+                emit sqlAutoChanged(m_sqlMode == SqlMode::Auto);
+            }
+        });
+    }
+    updateAntennaButtons();
+}
+
 void RxApplet::setTransmitModel(TransmitModel* txModel)
 {
     if (m_txModel) m_txModel->disconnect(this);
@@ -1727,10 +1883,48 @@ void RxApplet::setTransmitModel(TransmitModel* txModel)
 QString RxApplet::antennaMenuLabel(const QString& token,
                                    const QStringList& options) const
 {
+    if (m_kiwiSdrManager) {
+        const QString profileId =
+            m_kiwiSdrManager->profileIdForVirtualAntennaToken(token);
+        if (!profileId.isEmpty()) {
+            return m_kiwiSdrManager->displayName(profileId);
+        }
+    }
     if (!m_radioModel)
         return token;
     return m_radioModel->antennaDisplayName(
         token, m_radioModel->antennaAliasNeedsDisambiguation(token, options));
+}
+
+QStringList RxApplet::rxAntennaOptions() const
+{
+    QStringList options;
+    auto append = [&options](const QString& token) {
+        if (!token.isEmpty() && !options.contains(token)) {
+            options.append(token);
+        }
+    };
+
+    if (m_slice) {
+        for (const QString& ant : m_slice->rxAntennaList()) {
+            append(ant);
+        }
+    }
+
+    for (const QString& ant : m_antList) {
+        append(ant);
+    }
+
+    if (m_radioModel) {
+        for (const QString& ant : m_radioModel->knownAntennaTokens()) {
+            append(ant);
+        }
+    }
+
+    if (m_slice) {
+        append(m_slice->rxAntenna());
+    }
+    return options;
 }
 
 QStringList RxApplet::txAntennaOptions() const
@@ -1762,9 +1956,23 @@ void RxApplet::updateAntennaButton(QPushButton* button, const QString& token, bo
     if (!button)
         return;
 
-    const QString shortLabel = m_radioModel
-        ? m_radioModel->antennaShortDisplayName(token, 6)
-        : token;
+    QString effectiveToken = token;
+    if (!tx && m_kiwiSdrManager && m_slice) {
+        const QString profileId =
+            m_kiwiSdrManager->assignedProfileForSlice(m_slice->sliceId());
+        if (!profileId.isEmpty()) {
+            effectiveToken = m_kiwiSdrManager->virtualAntennaToken(profileId);
+        }
+    }
+
+    const QString profileId = m_kiwiSdrManager
+        ? m_kiwiSdrManager->profileIdForVirtualAntennaToken(effectiveToken)
+        : QString();
+    const QString shortLabel = !profileId.isEmpty()
+        ? m_kiwiSdrManager->displayName(profileId)
+        : (m_radioModel
+            ? m_radioModel->antennaShortDisplayName(effectiveToken, 6)
+            : effectiveToken);
     const QFontMetrics fm(button->font());
     constexpr int kMinWidth = 30;
     constexpr int kMaxWidth = 58;
@@ -1773,12 +1981,17 @@ void RxApplet::updateAntennaButton(QPushButton* button, const QString& token, bo
     button->setText(text);
     button->setFixedWidth(qBound(kMinWidth, fm.horizontalAdvance(text) + kPad, kMaxWidth));
 
-    const QString full = m_radioModel
-        ? m_radioModel->antennaDisplayName(token, !m_radioModel->antennaAlias(token).isEmpty())
-        : token;
-    button->setToolTip(QStringLiteral("%1 antenna port: %2")
-                           .arg(tx ? QStringLiteral("Transmit") : QStringLiteral("Receive"),
-                                full));
+    const QString full = !profileId.isEmpty()
+        ? m_kiwiSdrManager->displayName(profileId)
+        : (m_radioModel
+            ? m_radioModel->antennaDisplayName(
+                  effectiveToken, !m_radioModel->antennaAlias(effectiveToken).isEmpty())
+            : effectiveToken);
+    button->setToolTip(!profileId.isEmpty()
+        ? QStringLiteral("Receive antenna: %1").arg(full)
+        : QStringLiteral("%1 antenna port: %2")
+              .arg(tx ? QStringLiteral("Transmit") : QStringLiteral("Receive"),
+                   full));
 }
 
 void RxApplet::updateAntennaButtons()
@@ -1787,6 +2000,21 @@ void RxApplet::updateAntennaButtons()
         return;
     updateAntennaButton(m_rxAntBtn, m_slice->rxAntenna(), false);
     updateAntennaButton(m_txAntBtn, m_slice->txAntenna(), true);
+}
+
+void RxApplet::refreshFilterWidth()
+{
+    if (!m_slice) return;
+    // Mirror VfoWidget::updateFilterLabel: show "AUTO" while the adaptive filter
+    // holds a confident live fit, otherwise the normal width readout. Keeps this
+    // label in sync with the VFO flag's (#794/#1225/#2197 two-readout drift)
+    // instead of animating a gliding number against the flag's "AUTO". (#3945)
+    if (m_slice->adaptiveFilterEnabled() && m_slice->adaptiveActive()) {
+        m_filterWidthLbl->setText(QStringLiteral("AUTO"));
+    } else {
+        m_filterWidthLbl->setText(formatFilterWidth(
+            m_slice->filterLow(), m_slice->filterHigh(), m_slice->mode()));
+    }
 }
 
 void RxApplet::connectSlice(SliceModel* s)
@@ -1837,6 +2065,8 @@ void RxApplet::connectSlice(SliceModel* s)
     connect(s, &SliceModel::rxAntennaChanged, this, [this](const QString& ant) {
         updateAntennaButton(m_rxAntBtn, ant, false);
     });
+    connect(s, &SliceModel::rxAntennaListChanged,
+            this, [this](const QStringList&) { updateAntennaButtons(); });
 
     // TX antenna
     updateAntennaButton(m_txAntBtn, s->txAntenna(), true);
@@ -1847,7 +2077,7 @@ void RxApplet::connectSlice(SliceModel* s)
             this, [this](const QStringList&) { updateAntennaButtons(); });
 
     // Filter width label
-    m_filterWidthLbl->setText(formatFilterWidth(s->filterLow(), s->filterHigh(), s->mode()));
+    refreshFilterWidth();
 
     // QSK
     {
@@ -1938,55 +2168,57 @@ void RxApplet::connectSlice(SliceModel* s)
     m_filterPassband->setMode(s->mode());
     connect(s, &SliceModel::filterChanged, this, [this](int lo, int hi) {
         updateFilterButtons();
-        m_filterWidthLbl->setText(formatFilterWidth(lo, hi, m_slice ? m_slice->mode() : QString()));
+        refreshFilterWidth();
         m_filterPassband->setFilter(lo, hi);
     });
     connect(s, &SliceModel::modeChanged, this, [this](const QString& mode) {
         m_filterPassband->setMode(mode);
-        if (m_slice)
-            m_filterWidthLbl->setText(formatFilterWidth(m_slice->filterLow(), m_slice->filterHigh(), mode));
+        refreshFilterWidth();
+    });
+    // Keep the width label switching between "AUTO" and the number as the
+    // adaptive filter engages/disengages, matching the VFO flag. (#3945 review)
+    connect(s, &SliceModel::adaptiveActiveChanged, this, [this](bool) {
+        refreshFilterWidth();
     });
 
     // AGC mode
     updateAgcCombo();
     connect(s, &SliceModel::agcModeChanged, this, [this](const QString&) {
         updateAgcCombo();
+        syncAgcSliderFromSlice();
+    });
+    connect(s, &SliceModel::externalReceiveAgcModeChanged,
+            this, [this](const QString&) {
+        updateAgcCombo();
+        syncAgcSliderFromSlice();
     });
 
     // AGC threshold / off level — slider switches based on AGC mode
-    {
-        QSignalBlocker b(m_agcTSlider);
-        if (s->agcMode() == "off") {
-            m_agcTSlider->setValue(s->agcOffLevel());
-            m_agcTSlider->setToolTip(QString("AGC Off Level: %1").arg(s->agcOffLevel()));
-        } else {
-            m_agcTSlider->setValue(s->agcThreshold());
-            m_agcTSlider->setToolTip(QString("AGC Threshold: %1").arg(s->agcThreshold()));
-        }
-    }
+    syncAgcSliderFromSlice();
     connect(s, &SliceModel::agcThresholdChanged, this, [this](int v) {
-        if (m_slice && m_slice->agcMode() != "off") {
-            QSignalBlocker b(m_agcTSlider);
-            m_agcTSlider->setValue(v);
-            m_agcTSlider->setToolTip(QString("AGC Threshold: %1").arg(v));
+        Q_UNUSED(v);
+        if (m_slice && m_slice->receiveAgcMode() != "off") {
+            syncAgcSliderFromSlice();
+        }
+    });
+    connect(s, &SliceModel::externalReceiveAgcThresholdChanged,
+            this, [this](int v) {
+        Q_UNUSED(v);
+        if (m_slice && m_slice->receiveAgcMode() != "off") {
+            syncAgcSliderFromSlice();
         }
     });
     connect(s, &SliceModel::agcOffLevelChanged, this, [this](int v) {
-        if (m_slice && m_slice->agcMode() == "off") {
-            QSignalBlocker b(m_agcTSlider);
-            m_agcTSlider->setValue(v);
-            m_agcTSlider->setToolTip(QString("AGC Off Level: %1").arg(v));
+        Q_UNUSED(v);
+        if (m_slice && m_slice->receiveAgcMode() == "off") {
+            syncAgcSliderFromSlice();
         }
     });
-    connect(s, &SliceModel::agcModeChanged, this, [this](const QString& mode) {
-        if (!m_slice) return;
-        QSignalBlocker b(m_agcTSlider);
-        if (mode == "off") {
-            m_agcTSlider->setValue(m_slice->agcOffLevel());
-            m_agcTSlider->setToolTip(QString("AGC Off Level: %1").arg(m_slice->agcOffLevel()));
-        } else {
-            m_agcTSlider->setValue(m_slice->agcThreshold());
-            m_agcTSlider->setToolTip(QString("AGC Threshold: %1").arg(m_slice->agcThreshold()));
+    connect(s, &SliceModel::externalReceiveAgcOffLevelChanged,
+            this, [this](int v) {
+        Q_UNUSED(v);
+        if (m_slice && m_slice->receiveAgcMode() == "off") {
+            syncAgcSliderFromSlice();
         }
     });
 
@@ -2013,25 +2245,65 @@ void RxApplet::connectSlice(SliceModel* s)
         m_panSlider->setValue(v);
     });
 
-    // Squelch — derive 3-way mode from the radio's squelch on/off state.
-    // Auto is client-side only and doesn't survive slice switches, so a
-    // freshly-selected slice always starts in Off or Manual.  The user can
-    // re-enter Auto on the new slice with one click if they want.
+    auto applySquelchState = [this](bool on, int level, bool externalReceive) {
+        // In Auto mode the slider represents the operator-chosen dB margin,
+        // NOT the algorithm-suggested threshold — skip the value update so
+        // the algorithm's tick-by-tick setSquelch echoes don't overwrite
+        // the user's margin choice.  The spectrum-side yellow SQL line
+        // still tracks `level` via MainWindow.
+        if (m_sqlMode != SqlMode::Auto) {
+            QSignalBlocker blocker(m_sqlSlider);
+            m_sqlSlider->setValue(level);
+            // Keep only the Flex manual-level cache in sync with radio-side
+            // squelch changes. Kiwi replacement SQL is independent and lives
+            // in the external receive state on the slice.
+            if (!externalReceive && m_sqlMode == SqlMode::Manual) {
+                setManualSqlLevelForCurrentSurface(level);
+            }
+        }
+        // Auto drives setSquelch every algorithm tick; don't demote out of
+        // Auto when the echo arrives with squelch-on.  Only flip the mode
+        // when the source reports squelch-off or when we were Off and
+        // squelch came on.
+        bool modeChanged = false;
+        if (!on && m_sqlMode != SqlMode::Off) {
+            setSqlMode(SqlMode::Off, /*propagateToRadio=*/false);
+            modeChanged = true;
+        } else if (on && m_sqlMode == SqlMode::Off && m_sqlBtn->isEnabled()) {
+            setSqlMode(SqlMode::Manual, /*propagateToRadio=*/false);
+            modeChanged = true;
+        }
+        if (!modeChanged) {
+            applySqlModeVisuals();
+        }
+        emit squelchStateChanged(on, level);
+    };
+
+    // Squelch — derive 3-way mode from the current receive surface's
+    // squelch on/off state. Auto is client-side only: Flex keeps the
+    // applet-wide Auto mode across active Flex slice switches, while Kiwi
+    // replacement receive keeps Auto as per-slice external receive state.
     {
         QSignalBlocker b1(m_sqlBtn), b2(m_sqlSlider);
-        // Do NOT overwrite m_sqlManualLevel from the slice here — the
-        // slice's squelchLevel may have been clobbered by Auto-mode
-        // algorithm pushes in the prior session, and we want to keep the
-        // user's persisted manual choice as the source of truth across
-        // launches.  The slider value is still visually set to the
-        // slice's current state below; applySqlModeVisuals (via the
-        // setSqlMode call) will overwrite that with m_sqlManualLevel
-        // when entering Manual.
-        m_sqlSlider->setValue(s->squelchLevel());
-        setSqlMode(s->squelchOn() ? SqlMode::Manual : SqlMode::Off,
-                   /*propagateToRadio=*/false);
+        // Do NOT overwrite the Flex manual cache from the slice here. Flex
+        // restores the persisted manual choice; Kiwi replacement receive
+        // reads its own external state through sqlManualLevel().
+        m_sqlSlider->setValue(s->receiveSquelchLevel());
+        SqlMode mode = s->receiveSquelchOn() ? SqlMode::Manual : SqlMode::Off;
+        if (s->externalReceiveReplacementActive()) {
+            if (s->externalReceiveAutoSquelchOn()) {
+                mode = SqlMode::Auto;
+            }
+        } else if (m_flexSqlMode == SqlMode::Auto) {
+            mode = SqlMode::Auto;
+        } else {
+            m_flexSqlMode = mode;
+        }
+        setSqlMode(mode, /*propagateToRadio=*/false);
     }
-    emit squelchStateChanged(s->squelchOn(), s->squelchLevel());
+    emit sqlModeChanged(static_cast<int>(m_sqlMode));
+    emit sqlAutoChanged(m_sqlMode == SqlMode::Auto);
+    emit squelchStateChanged(s->receiveSquelchOn(), s->receiveSquelchLevel());
     // AF gain → radio's per-slice audio_level
     {
         QSignalBlocker sb(m_afSlider);
@@ -2042,37 +2314,28 @@ void RxApplet::connectSlice(SliceModel* s)
         m_afSlider->setValue(static_cast<int>(g));
     });
 
-    connect(s, &SliceModel::squelchChanged, this, [this](bool on, int level) {
-        QSignalBlocker b1(m_sqlBtn), b2(m_sqlSlider);
-        // In Auto mode the slider represents the operator-chosen dB margin,
-        // NOT the algorithm-suggested threshold — skip the value update so
-        // the algorithm's tick-by-tick setSquelch echoes don't overwrite
-        // the user's margin choice.  The spectrum-side yellow SQL line
-        // still tracks `level` via setSquelchLine.
-        if (m_sqlMode != SqlMode::Auto) {
-            m_sqlSlider->setValue(level);
-            // Keep the Manual-level cache in sync with external squelch
-            // changes (TCI client, radio panel knob) so a later Manual
-            // re-entry restores the up-to-date value, not a stale one.
-            // Persist too so launch-time recall reflects the most recent
-            // manual threshold regardless of who set it.
-            if (m_sqlMode == SqlMode::Manual) {
-                m_sqlManualLevel = level;
-                auto& settings = AppSettings::instance();
-                settings.setValue("LastManualSquelchLevel",
-                                  QString::number(level));
-                settings.save();
-            }
+    connect(s, &SliceModel::squelchChanged, this, [this, applySquelchState](bool on, int level) {
+        if (m_slice && m_slice->externalReceiveReplacementActive()) {
+            return;
         }
-        // Auto drives setSquelch every algorithm tick; don't demote out of
-        // Auto when the echo arrives with squelch-on.  Only flip the mode
-        // when the radio reports squelch-off (operator hit it from somewhere
-        // else) or when we were Off and squelch came on (external SQL on).
-        if (!on && m_sqlMode != SqlMode::Off)
-            setSqlMode(SqlMode::Off, /*propagateToRadio=*/false);
-        else if (on && m_sqlMode == SqlMode::Off && m_sqlBtn->isEnabled())
-            setSqlMode(SqlMode::Manual, /*propagateToRadio=*/false);
-        emit squelchStateChanged(on, level);
+        applySquelchState(on, level, false);
+    });
+    connect(s, &SliceModel::externalReceiveSquelchChanged,
+            this, [this, applySquelchState](bool on, int level) {
+        if (!m_slice || !m_slice->externalReceiveReplacementActive()) {
+            return;
+        }
+        applySquelchState(on, level, true);
+    });
+    connect(s, &SliceModel::externalReceiveAutoSquelchChanged,
+            this, [this](bool on) {
+        if (!m_slice || !m_slice->externalReceiveReplacementActive()) {
+            return;
+        }
+        setSqlMode(on ? SqlMode::Auto
+                      : (m_slice->receiveSquelchOn() ? SqlMode::Manual
+                                                     : SqlMode::Off),
+                   /*propagateToRadio=*/false);
     });
 
     // DSP toggles removed — use VFO DSP tab or spectrum overlay
@@ -2177,15 +2440,12 @@ QString RxApplet::formatHz(int hz)
     return (hz >= 0 ? "+" : "") + QString::number(hz) + " Hz";
 }
 
-QString RxApplet::formatFilterWidth(int lo, int hi, const QString& mode)
+QString RxApplet::formatFilterWidth(int lo, int hi, const QString& /*mode*/)
 {
-    int w;
-    if (mode == "USB" || mode == "DIGU" || mode == "FDV" || mode == "FDVU" || mode == "NT")
-        w = hi;
-    else if (mode == "LSB" || mode == "DIGL" || mode == "FDVL")
-        w = std::abs(lo);
-    else
-        w = hi - lo;
+    // Bandwidth is the passband span (hi - lo) for every mode. The old
+    // per-mode branches returned the hi cut (USB) or |lo| (LSB), so the
+    // indicator showed the cut frequency instead of the bandwidth (#3659).
+    const int w = hi - lo;
     if (w <= 0) return "?";
     if (w >= 1000) return QString::number(w / 1000.0, 'f', 1) + "K";
     return QString::number(w);
@@ -2422,15 +2682,15 @@ void RxApplet::updateModeSettings(const QString& mode)
         // CW/CWL squelch is radio-managed — no client push, so no "save" either,
         // or the unpaired flag would fabricate a restore on the next mode change
         // (and most visibly across profile-load slice teardown — #3263).
-        if ((m_slice->squelchOn() || m_sqlMode == SqlMode::Auto)
+        if ((m_slice->receiveSquelchOn() || m_sqlMode == SqlMode::Auto)
             && (mode == "DIGU" || mode == "DIGL" || mode == "NT" || mode == "RTTY")) {
             m_savedSquelchOn = true;
-            m_slice->setSquelch(false, m_slice->squelchLevel());
+            m_slice->setSquelch(false, m_slice->receiveSquelchLevel());
             setSqlMode(SqlMode::Off, /*propagateToRadio=*/false);
         }
     } else if (!sqlDisabled && m_slice && m_savedSquelchOn) {
         m_savedSquelchOn = false;
-        m_slice->setSquelch(true, m_slice->squelchLevel());
+        m_slice->setSquelch(true, m_slice->receiveSquelchLevel());
         setSqlMode(SqlMode::Manual, /*propagateToRadio=*/false);
     }
 
@@ -2616,7 +2876,7 @@ void RxApplet::syncStepFromSlice(int stepHz, const QVector<int>& stepList)
 
 void RxApplet::updateAgcCombo()
 {
-    const QString cur = m_slice ? m_slice->agcMode() : "";
+    const QString cur = m_slice ? m_slice->receiveAgcMode() : "";
     QSignalBlocker sb(m_agcCombo);
     for (int i = 0; i < m_agcCombo->count(); ++i) {
         if (m_agcCombo->itemData(i).toString() == cur) {
@@ -2624,6 +2884,42 @@ void RxApplet::updateAgcCombo()
             break;
         }
     }
+}
+
+int RxApplet::agcThresholdMinimum() const
+{
+    return m_slice && m_slice->externalReceiveReplacementActive()
+        ? KiwiSdrProtocol::kAgcThresholdMinDb
+        : 0;
+}
+
+int RxApplet::agcThresholdMaximum() const
+{
+    return m_slice && m_slice->externalReceiveReplacementActive()
+        ? KiwiSdrProtocol::kAgcThresholdMaxDb
+        : 100;
+}
+
+void RxApplet::syncAgcSliderFromSlice()
+{
+    if (!m_slice || !m_agcTSlider) {
+        return;
+    }
+
+    const bool agcOff = m_slice->receiveAgcMode() == QStringLiteral("off");
+    const int minimum = agcOff ? 0 : agcThresholdMinimum();
+    const int maximum = agcOff ? 100 : agcThresholdMaximum();
+    const int value = std::clamp(
+        agcOff ? m_slice->receiveAgcOffLevel()
+               : m_slice->receiveAgcThreshold(),
+        minimum, maximum);
+
+    QSignalBlocker b(m_agcTSlider);
+    m_agcTSlider->setRange(minimum, maximum);
+    m_agcTSlider->setValue(value);
+    m_agcTSlider->setToolTip(agcOff
+        ? QStringLiteral("AGC Off Level: %1 dB").arg(value)
+        : QStringLiteral("AGC Threshold: %1 dB").arg(value));
 }
 
 void RxApplet::updateOffsetDirButtons()
@@ -2759,7 +3055,15 @@ void RxApplet::updateFreqLabel()
         return;
 
     if (m_slice->isLockedFeedbackActive()) {
+        m_accessibleFrequencyTimer.stop();
         m_freqLabel->setText(QStringLiteral("LOCKED"));
+        if (QAccessible::isActive()
+            && m_lastAccessibleFrequencyText != QStringLiteral("LOCKED")) {
+            m_lastAccessibleFrequencyText = QStringLiteral("LOCKED");
+            QAccessibleValueChangeEvent event(m_freqLabel,
+                                              QStringLiteral("LOCKED"));
+            QAccessible::updateAccessibility(&event);
+        }
         return;
     }
 
@@ -2767,75 +3071,53 @@ void RxApplet::updateFreqLabel()
     int mhzPart  = static_cast<int>(hz / 1000000);
     int khzPart  = static_cast<int>((hz / 1000) % 1000);
     int hzPart   = static_cast<int>(hz % 1000);
-    m_freqLabel->setText(QString("%1.%2.%3")
+    const QString freqText = QString("%1.%2.%3")
         .arg(mhzPart)
         .arg(khzPart, 3, 10, QChar('0'))
-        .arg(hzPart, 3, 10, QChar('0')));
+        .arg(hzPart, 3, 10, QChar('0'));
+    m_freqLabel->setText(freqText);
+    scheduleFrequencyAnnouncement(freqText);
+}
+
+void RxApplet::scheduleFrequencyAnnouncement(const QString& text)
+{
+    if (!QAccessible::isActive()) {
+        return;
+    }
+    m_pendingAccessibleFrequencyText = text;
+    m_accessibleFrequencyTimer.start(300);
 }
 
 void RxApplet::refreshAllMutedDim()
 {
-    if (!m_radioModel) {
-        setSliceButtonsDimmed(false);
-        return;
-    }
-    const auto slices = m_radioModel->slices();
-    // RadioModel::slices() returns only owned slices (foreign clients are
-    // pruned on client_handle).  The dim should reflect whether every one
-    // of the user's own slices is muted — empty list means "no slices to
-    // indicate state for", treat as not-all-muted.
-    if (slices.isEmpty()) {
-        setSliceButtonsDimmed(false);
-        return;
-    }
-    bool anyUnmuted = false;
-    for (const SliceModel* s : slices) {
-        if (s && !s->audioMute()) { anyUnmuted = true; break; }
-    }
-    setSliceButtonsDimmed(!anyUnmuted);
+    // The slice tabs are identity and selection controls. Older RX Controls
+    // code greyed the entire row when all owned slices were muted, but that
+    // masked the active slice and made the buttons read as disabled. Keep the
+    // slice colours stable; mute state is shown by the speaker button.
+    setSliceButtonsDimmed(false);
 }
 
 void RxApplet::setSliceButtonsDimmed(bool dim)
 {
-    // QGraphicsOpacityEffect doesn't always compose cleanly with QSS-
-    // styled widgets on Linux X11 (the effect is silently dropped on some
-    // configurations).  Swap the stylesheet directly instead so the dim
-    // is guaranteed to render.  Each slice button's QSS carries a per-
-    // slice color baked in by setMaxSlices, so cache that original on
-    // first-dim and restore it on un-dim.
+    Q_UNUSED(dim);
     for (QToolButton* btn : m_sliceBtns) {
-        if (!btn) continue;
-        const QVariant cached = btn->property("originalStyleSheet");
-        if (cached.isNull())
-            btn->setProperty("originalStyleSheet", btn->styleSheet());
-        if (dim) {
-            // Uniform dark gray, no per-slice color — visually
-            // distinct from the foreign-slot grey and the empty-slot
-            // look so the operator can tell at a glance: "all my
-            // receivers are muted."
-            btn->setStyleSheet(
-                "QToolButton { background: #15181c; color: #383d44; "
-                "border: 1px solid #2a2e34; border-radius: 3px; "
-                "font-weight: bold; font-size: 10px; padding: 0; }"
-                "QToolButton:checked { background: #25292f; color: #4a5058; "
-                "border: 1px solid #383d44; }");
-        } else {
-            btn->setStyleSheet(cached.toString());
+        if (!btn) {
+            continue;
+        }
+        btn->setProperty("sliceButtonsDimmed", false);
+        const QVariant normal = btn->property("normalStyleSheet");
+        if (normal.isValid()) {
+            btn->setStyleSheet(normal.toString());
         }
     }
-    // Slice badge (shown on single-slice radios) — same uniform dim.
     if (m_sliceBadge) {
         const QVariant cached = m_sliceBadge->property("originalStyleSheet");
-        if (cached.isNull())
+        if (cached.isNull()) {
             m_sliceBadge->setProperty("originalStyleSheet",
                                        m_sliceBadge->styleSheet());
-        if (dim) {
-            m_sliceBadge->setStyleSheet(
-                "QLabel { background: #25292f; color: #4a5058; "
-                "border-radius: 3px; font-weight: bold; font-size: 11px; }");
-        } else {
-            m_sliceBadge->setStyleSheet(cached.toString());
         }
+        m_sliceBadge->setStyleSheet(
+            m_sliceBadge->property("originalStyleSheet").toString());
     }
 }
 

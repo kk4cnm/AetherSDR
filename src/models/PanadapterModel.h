@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QMap>
+#include <QVariantMap>
 #include <QString>
 #include <QStringList>
 
@@ -24,10 +25,29 @@ public:
     void setWaterfallId(const QString& id);
     QString clientHandle() const { return m_clientHandle; }
     void setClientHandle(const QString& h);
+    // #3977: true when this pan belongs to the given connection handle. The
+    // radio reassigns client_handle when another session reclaims the pan;
+    // callers gate outbound pan-set commands on this so a superseded session
+    // stops adjusting the new owner's display. Fails OPEN on unknown owner —
+    // safe only for gating our own commands.
+    bool ownedByClient(quint32 handle) const;
+    // Parsed owner (0 = radio never told us). Fail-CLOSED source for
+    // eviction evidence: only pans whose confirmed owner is us may count
+    // foreign writes against another client (#3977).
+    quint32 ownerHandle() const { return m_ownerHandle; }
 
     // Display state
     double centerMhz() const { return m_centerMhz; }
     double bandwidthMhz() const { return m_bandwidthMhz; }
+    // Normalized setter driven by the backend (aetherd RFC 2.3). A negative
+    // value means "leave unchanged" (the radio may report one without the
+    // other). Emits infoChanged when either actually changes.
+    void setCenterBandwidth(double centerMhz, double bandwidthMhz);
+    // Flex-specific WNB extension applied from the backend's namespaced
+    // extensionStatus("flex","panWnb",…). Applies only the keys present;
+    // emits wnbChanged/wnbStateChanged when anything changes. (aetherd RFC 2.3
+    // extension template — the decode lives in FlexBackend, not here.)
+    void applyWnbExtension(const QVariantMap& fields);
     float minDbm() const { return m_minDbm; }
     float maxDbm() const { return m_maxDbm; }
     QString rxAntenna() const { return m_rxAntenna; }
@@ -45,6 +65,14 @@ public:
     bool loopB() const { return m_loopB; }
     int fps() const { return m_fps; }
     int waterfallLineDuration() const { return m_waterfallLineDuration; }
+    int fftYPixels() const { return m_fftYPixels; }
+    bool setFftYPixels(int yPixels) {
+        if (m_fftYPixels == yPixels) {
+            return false;
+        }
+        m_fftYPixels = yPixels;
+        return true;
+    }
     QString preamp() const { return m_preamp; }
     void setPreamp(const QString& pre) {
         // Preamp is internal state only — no UI listeners. Do not emit
@@ -87,6 +115,7 @@ private:
     QString     m_panId;
     QString     m_waterfallId;
     QString     m_clientHandle;
+    quint32     m_ownerHandle{0};   // parsed m_clientHandle; 0 = unknown (#3977)
     double      m_centerMhz{14.1};
     double      m_bandwidthMhz{0.2};
     float       m_minDbm{-130.0f};
@@ -105,6 +134,7 @@ private:
     int         m_wnbLevel{50};
     int         m_fps{-1};
     int         m_waterfallLineDuration{-1};
+    int         m_fftYPixels{-1};
     QString     m_preamp;
     int         m_daxiqChannel{0};
     bool        m_resized{false};

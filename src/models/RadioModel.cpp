@@ -2,17 +2,22 @@
 #include "AntennaAliasStore.h"
 #include "BandSettings.h"
 #include "core/CommandParser.h"
+#include "core/backends/flex/FlexBackend.h"   // aetherd RFC 2.2 radio-facing seam
 #include "core/AppSettings.h"
 #include "core/CwTrace.h"
 #include "core/LogManager.h"
+#include "core/MemoryFieldValues.h"
 #include "core/PerfTelemetry.h"
 #include "core/StreamStatus.h"
 #include "core/UdpRegistrationPolicy.h"
+#include "ProfileLoadCommand.h"
 #include "RadioStatusOwnership.h"
 #include "SliceRecreatePolicy.h"
+#include "TransmitInhibitPolicy.h"
 #include <QCoreApplication>
 #include <QDebug>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QDateTime>
@@ -26,7 +31,7 @@ namespace AetherSDR {
 
 namespace {
 
-constexpr int kMinUsablePanYpixels = 100;
+constexpr int kDefaultPanDimensionThreshold = 100;
 constexpr int kSessionRestorePruneDelayMs = 5000;
 constexpr int kWaterfallLineDurationMinMs = 1;
 constexpr int kWaterfallLineDurationMaxMs = 100;
@@ -80,6 +85,36 @@ bool statusFlagSet(const QMap<QString, QString>& kvs, const QString& key)
     const QString value = kvs.value(key).trimmed();
     return value == QStringLiteral("1")
         || value.compare(QStringLiteral("true"), Qt::CaseInsensitive) == 0;
+}
+
+bool isProfileOwnedRadioStateWrite(const QString& command)
+{
+    const QString trimmed = command.trimmed();
+    const QStringList tokens = trimmed.simplified().split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    if (tokens.size() >= 5
+        && tokens[0] == QStringLiteral("display")
+        && tokens[1] == QStringLiteral("pan")
+        && tokens[2] == QStringLiteral("set")) {
+        bool hasPixelDimension = false;
+        for (int i = 4; i < tokens.size(); ++i) {
+            const QString key = tokens[i].section(QLatin1Char('='), 0, 0);
+            if (key != QStringLiteral("xpixels") && key != QStringLiteral("ypixels")) {
+                return true;
+            }
+            hasPixelDimension = true;
+        }
+        // xpixels/ypixels are allowed past this low-level guard because
+        // MainWindow queues them during a profile load and flushes them after
+        // the radio accepts the profile. Do not bypass
+        // MainWindow::requestPanDimensionsForRadio(); early dimension writes
+        // can cause the radio to save a partial GUIClient slice layout.
+        return !hasPixelDimension;
+    }
+
+    return trimmed.startsWith(QStringLiteral("slice set "))
+        || trimmed.startsWith(QStringLiteral("display pan set "))
+        || trimmed.startsWith(QStringLiteral("display panafall set "))
+        || trimmed.startsWith(QStringLiteral("display waterfall set "));
 }
 
 void appendUniqueAntennaToken(QStringList& tokens, const QString& token)
@@ -358,23 +393,99 @@ QJsonObject clientInfoToJson(quint32 handle,
 RadioModel::RadioModel(QObject* parent)
     : QObject(parent)
 {
-    // PanadapterStream runs on its own network thread (#502)
-    m_networkThread = new QThread(this);
-    m_networkThread->setObjectName("PanadapterStream");
-    m_panStream = new PanadapterStream;  // no parent — will be moved to thread
-    m_panStream->moveToThread(m_networkThread);
-    connect(m_networkThread, &QThread::started, m_panStream, &PanadapterStream::init);
-    m_networkThread->start();
+    // aetherd RFC step 2.2b: the radio-facing seam owns the wire objects. The
+    // FlexBackend creates the RadioConnection and PanadapterStream on their
+    // worker threads (in the load-bearing #502 order — panStream first) and
+    // tears them down. RadioModel keeps non-owning pointers, obtained here, so
+    // all the signal wiring and command/WAN orchestration below is byte-for-byte
+    // as before — the move is ownership-only.
+    //
+    // Note: the threads now start here (as the ctor's first statement) rather
+    // than adjacent to their signal wiring below. Safe because RadioConnection::
+    // init()/PanadapterStream::init() only allocate sockets/timers and neither
+    // auto-connects nor emits — so there is no lost-signal window before our
+    // statusReceived/etc. connections are made. Keep that true if init() grows.
+    {
+        auto flex = std::make_unique<FlexBackend>();
+        flex->setCommandSink([this](const QString& cmd){ sendCommand(cmd); });
+        // Slice verbs route through the TX-inhibit-guarded slice sink (§6), so
+        // moving slice encode behind the seam keeps TX safety above it.
+        flex->setSliceCommandSink([this](const QString& cmd){
+            sendSliceCommand(nullptr, cmd);   // guard looks up the slice from cmd
+        });
+        flex->setModelProvider([this]{ return m_model; });
+        m_connection = flex->connection();   // non-owning; the backend owns it
+        m_panStream  = flex->panStream();    // non-owning; the backend owns it
+        m_flexBackend = flex.get();          // transitional alias (2.3)
+        m_backend = std::move(flex);
+    }
 
-    // RadioConnection runs on its own worker thread (#502) so TCP I/O
-    // (including ping RTT measurement) is never blocked by paintEvent.
-    m_connThread = new QThread(this);
-    m_connThread->setObjectName("RadioConnection");
-    m_connection = new RadioConnection;  // no parent — will be moved to thread
-    m_connection->moveToThread(m_connThread);
-    connect(m_connThread, &QThread::started, m_connection, &RadioConnection::init);
-    m_connThread->start();
+    // aetherd RFC 2.3: the first converted touchpoint. The backend decodes the
+    // universal pan center/bandwidth from Flex status and emits this normalized
+    // signal; RadioModel drives the addressed PanadapterModel. (Template for the
+    // remaining universal fields and the other mixed models.)
+    connect(m_backend.get(), &IRadioBackend::panCenterBandwidthChanged, this,
+            [this](const QString& panId, double centerMhz, double bandwidthMhz) {
+        auto* pan = m_panadapters.value(panId, nullptr);
+        if (!pan) pan = activePanadapter();
+        if (!pan) return;
+        pan->setCenterBandwidth(centerMhz, bandwidthMhz);
+        // Legacy signal MainWindow still consumes (unchanged behavior).
+        emit panadapterInfoChanged(pan->centerMhz(), pan->bandwidthMhz());
+    });
 
+    // aetherd RFC 2.3 extension template: Flex-specific pan fields (WNB) ride
+    // the namespaced extensionStatus channel; RadioModel routes them to the
+    // addressed PanadapterModel. Other namespaces/kinds are ignored here.
+    connect(m_backend.get(), &IRadioBackend::extensionStatus, this,
+            [this](const QString& ns, const QString& kind, const QVariantMap& fields) {
+        if (ns != QLatin1String("flex") || kind != QLatin1String("panWnb")) {
+            return;
+        }
+        auto* pan = m_panadapters.value(fields.value("panId").toString(), nullptr);
+        if (!pan) pan = activePanadapter();
+        if (pan) pan->applyWnbExtension(fields);
+    });
+
+    // Centralized DAX RX channel ownership (#3305): PanadapterStream decides
+    // WHEN a dax_rx stream must exist (refcounted acquire/release from the
+    // bridge/TCI/RADE); RadioModel is the command plane that makes it so.
+    connect(m_panStream, &PanadapterStream::daxStreamCreateNeeded,
+            this, [this](int ch) {
+        if (!isConnected()) {
+            // Dropped create (connect gap): tell the manager so the latch
+            // clears and its retry cadence re-fires — otherwise the channel
+            // wedges with createPending stuck true (the #3669 wedge class).
+            m_panStream->notifyDaxCreateFailed(ch);
+            return;
+        }
+        sendCmd(QString("stream create type=dax_rx dax_channel=%1").arg(ch),
+                [this, ch](int code, const QString& body) {
+            if (code != 0) {
+                qCWarning(lcDax) << "RadioModel: dax_rx stream create for channel"
+                                 << ch << "failed, code" << Qt::hex << code << body;
+                m_panStream->notifyDaxCreateFailed(ch);
+                return;
+            }
+            // Success needs no action here. The #1439 legacy client-
+            // registration nudge is decided in handleDaxRxStreamRegistry, when
+            // the registration status has definitively told us whether the
+            // radio auto-bound the stream (slice=<letter>) — deciding here
+            // would race that status: on WAN/SmartLink (and any firmware that
+            // binds after the create reply) the binding isn't known yet, so a
+            // reply-first ordering would fire a same-value `slice set dax=`
+            // re-assert and blip audio, the very thing the gate avoids (#4017).
+        });
+    });
+    connect(m_panStream, &PanadapterStream::daxStreamRemoveNeeded,
+            this, [this](quint32 streamId, int ch) {
+        Q_UNUSED(ch);
+        if (!isConnected()) return;
+        sendCommand(QString("stream remove 0x%1").arg(streamId, 0, 16));
+    });
+
+    // RadioConnection (created + owned by the backend above, on its own worker
+    // thread #502 so TCP I/O never blocks paintEvent) — wire its signals to us.
     // Signals from RadioConnection auto-queue to main thread (#502)
     connect(m_connection, &RadioConnection::statusReceived,
             this, &RadioModel::onStatusReceived);
@@ -406,8 +517,12 @@ RadioModel::RadioModel(QObject* parent)
 
     // Forward tuner commands to the radio — route through tune inhibit check
     connect(&m_tunerModel, &TunerModel::commandReady, this, [this](const QString& cmd){
-        if (cmd.startsWith("tgxl autotune"))
+        if (cmd.startsWith("tgxl autotune")) {
+            if (transmitStartBlockedByInhibit(QStringLiteral("tgxl-autotune"))) {
+                return;
+            }
             applyTuneInhibit();
+        }
         sendCmd(cmd);
     });
 
@@ -423,9 +538,11 @@ RadioModel::RadioModel(QObject* parent)
     connect(&m_transmitModel, &TransmitModel::pttBlocked,
             this, [this](const QString& message) {
         m_pendingTransmitPreflightSource = TransmitModel::PttSource::Mox;
+        const QString panId = txSlice() ? txSlice()->panId() : QString();
         emitInterlockNotification(
             message,
-            QStringLiteral("local-ptt:%1").arg(message));
+            QStringLiteral("local-ptt:%1:%2").arg(panId, message),
+            panId);
     });
 
     // Forward transmit model commands to the radio
@@ -454,6 +571,12 @@ RadioModel::RadioModel(QObject* parent)
         if (match.hasMatch()) {
             const bool tx = (match.captured(1) == "1");
             if (tx) {
+                if (transmitStartBlockedByInhibit(QStringLiteral("xmit"))) {
+                    m_pendingTransmitPreflightSource =
+                        TransmitModel::PttSource::Mox;
+                    m_txRequested = false;
+                    return;
+                }
                 armInterlockNotification(m_pendingTransmitPreflightSource);
                 m_pendingTransmitPreflightSource = TransmitModel::PttSource::Mox;
             }
@@ -464,6 +587,9 @@ RadioModel::RadioModel(QObject* parent)
             }
         }
         if (cmd == "transmit tune 1" || cmd == "atu start") {
+            if (transmitStartBlockedByInhibit(QStringLiteral("tune-start"))) {
+                return;
+            }
             armInterlockNotification(m_pendingTransmitPreflightSource);
             m_pendingTransmitPreflightSource = TransmitModel::PttSource::Mox;
             applyTuneInhibit();
@@ -546,44 +672,25 @@ RadioModel::RadioModel(QObject* parent)
 
 RadioModel::~RadioModel()
 {
-    // Disconnect all signals BEFORE member destruction to prevent
-    // use-after-free (ASAN). (#502)
+    // Disconnect RadioModel's own connections to the wire objects BEFORE they
+    // are torn down, to prevent use-after-free (ASAN). (#502) The objects are
+    // still alive here — the backend owns them and destroys them next.
     QObject::disconnect(m_connection, nullptr, this, nullptr);
     QObject::disconnect(m_panStream, nullptr, this, nullptr);
 
-    // Stop connection thread (#502)
-    if (m_connection && m_connThread && m_connThread->isRunning()) {
-        RadioConnection* connection = m_connection;
-        QMetaObject::invokeMethod(connection, &RadioConnection::disconnectFromRadio,
-                                  Qt::BlockingQueuedConnection);
-        connection->deleteLater();
-        m_connThread->quit();
-        m_connThread->wait(3000);
-    } else {
-        delete m_connection;
-    }
-    if (m_connThread && m_connThread->isRunning()) {
-        m_connThread->quit();
-        m_connThread->wait(3000);
-    }
+    // Destroy the backend, which owns the RadioConnection + PanadapterStream and
+    // their worker threads: ~FlexBackend runs the exact #502 teardown ordering
+    // (BlockingQueued disconnect/stop → deleteLater → thread quit/wait) that
+    // used to live here. (aetherd 2.2b)
+    m_backend.reset();
     m_connection = nullptr;
-
-    // Stop network thread (#502)
-    if (m_panStream && m_networkThread && m_networkThread->isRunning()) {
-        PanadapterStream* panStream = m_panStream;
-        QMetaObject::invokeMethod(panStream, &PanadapterStream::stop,
-                                  Qt::BlockingQueuedConnection);
-        panStream->deleteLater();
-        m_networkThread->quit();
-        m_networkThread->wait(3000);
-    } else {
-        delete m_panStream;
-    }
-    if (m_networkThread && m_networkThread->isRunning()) {
-        m_networkThread->quit();
-        m_networkThread->wait(3000);
-    }
     m_panStream = nullptr;
+    // The transitional alias points into the just-destroyed backend — null it so
+    // the many `if (m_flexBackend)` guards (decode calls in handlePanadapterStatus,
+    // the slice modeChangeRequested lambda) fail closed instead of dereferencing a
+    // dangling pointer. handlePanadapterStatus is also reachable via the WAN
+    // statusReceived connection, so this isn't purely theoretical. (#4063 review)
+    m_flexBackend = nullptr;
 }
 
 bool RadioModel::isConnected() const
@@ -593,23 +700,21 @@ bool RadioModel::isConnected() const
 
 int RadioModel::maxSlicesForModel(const QString& model)
 {
-    const QString normalized = model.toUpper();
-    // FlexRadio lists slice capacity as independent receivers per model family.
-    if (normalized.contains("6700"))
-        return 8;
-    if (normalized.contains("6600") || normalized.contains("6500")
-            || normalized.contains("8600") || normalized.contains("AU-520"))
-        return 4;
-    if (normalized.contains("6300") || normalized.contains("6400")
-            || normalized.contains("8400") || normalized.contains("AU-510"))
-        return 2;
-    return 4;
+    // Slice capacity per model comes from the FlexLib-sourced ModelCapabilities
+    // table (SliceList size, Principle I) — the single source of model truth,
+    // shared with maxPanadapters(), diversity, and extended-DSP gating.  This is
+    // only the pre-connection estimate; the radio's live "slices=N" status
+    // overrides m_maxSlices once connected.
+    return capabilitiesFor(model).maxSlices;
 }
 
 SliceModel* RadioModel::slice(int id) const
 {
-    for (auto* s : m_slices)
-        if (s->sliceId() == id) return s;
+    for (SliceModel* s : m_slices) {
+        if (s && s->sliceId() == id) {
+            return s;
+        }
+    }
     return nullptr;
 }
 
@@ -771,17 +876,147 @@ SliceModel* RadioModel::txSlice() const
     return nullptr;
 }
 
+void RadioModel::setPanTransmitInhibited(const QString& panId,
+                                         bool inhibited,
+                                         const QString& reason)
+{
+    const QString trimmedPanId = panId.trimmed();
+    if (trimmedPanId.isEmpty()) {
+        return;
+    }
+
+    if (!inhibited) {
+        m_panTransmitInhibitReasons.remove(trimmedPanId);
+        return;
+    }
+
+    const QString trimmedReason = reason.trimmed().isEmpty()
+        ? QStringLiteral("Transmit is disabled because this panadapter is displaying receive-only data.")
+        : reason.trimmed();
+    if (m_panTransmitInhibitReasons.value(trimmedPanId) == trimmedReason) {
+        return;
+    }
+    m_panTransmitInhibitReasons.insert(trimmedPanId, trimmedReason);
+    enforceTransmitInhibitForPan(trimmedPanId);
+}
+
+bool RadioModel::panTransmitInhibited(const QString& panId) const
+{
+    return m_panTransmitInhibitReasons.contains(panId.trimmed());
+}
+
+QString RadioModel::panTransmitInhibitReason(const QString& panId) const
+{
+    return m_panTransmitInhibitReasons.value(panId.trimmed());
+}
+
+QString RadioModel::transmitInhibitMessageForSlice(const SliceModel* slice) const
+{
+    if (!slice) {
+        return QString();
+    }
+    return panTransmitInhibitReason(slice->panId()).trimmed();
+}
+
+QString RadioModel::transmitInhibitMessageForTxSlice() const
+{
+    return transmitInhibitMessageForSlice(txSlice());
+}
+
+void RadioModel::enforceTransmitInhibitForPan(const QString& panId)
+{
+    if (!panTransmitInhibited(panId)) {
+        return;
+    }
+
+    for (SliceModel* slice : m_slices) {
+        if (slice && slice->panId() == panId
+            && sliceMayBelongToUs(slice->sliceId())) {
+            enforceTransmitInhibitForSlice(slice);
+        }
+    }
+}
+
+void RadioModel::enforceTransmitInhibitForSlice(SliceModel* slice)
+{
+    if (!slice || !slice->isTxSlice()
+        || !sliceMayBelongToUs(slice->sliceId())) {
+        return;
+    }
+
+    const QString message = transmitInhibitMessageForSlice(slice);
+    if (message.isEmpty()) {
+        return;
+    }
+
+    emitInterlockNotification(
+        message,
+        QStringLiteral("pan-tx-inhibit:%1").arg(slice->panId()),
+        slice->panId());
+    sendCmd(QStringLiteral("slice set %1 tx=0").arg(slice->sliceId()));
+}
+
+bool RadioModel::transmitStartBlockedByInhibit(const QString& key)
+{
+    SliceModel* target = txSlice();
+    const QString message = transmitInhibitMessageForSlice(target);
+    if (message.isEmpty()) {
+        return false;
+    }
+
+    const QString panId = target ? target->panId() : QString();
+    emitInterlockNotification(
+        message,
+        QStringLiteral("pan-tx-inhibit:%1:%2").arg(panId, key),
+        panId);
+    m_transmitModel.setTransmitting(false);
+    if (m_txAudioGate) {
+        m_txAudioGate = false;
+        emit txAudioGateChanged(false);
+    }
+    return true;
+}
+
+void RadioModel::sendSliceCommand(SliceModel* slice, const QString& cmd)
+{
+    const TransmitInhibitPolicy::SliceTxCommand txCommand =
+        TransmitInhibitPolicy::parseSliceTxCommand(cmd);
+    if (txCommand.valid && txCommand.txEnabled) {
+        SliceModel* target = slice && slice->sliceId() == txCommand.sliceId
+            ? slice
+            : this->slice(txCommand.sliceId);
+        const QString message = transmitInhibitMessageForSlice(target);
+        if (!message.isEmpty()) {
+            emitInterlockNotification(
+                message,
+                QStringLiteral("pan-tx-inhibit:%1").arg(target->panId()),
+                target->panId());
+            return;
+        }
+    }
+
+    sendCmd(cmd);
+}
+
 QString RadioModel::localPttInterlockMessage(TransmitModel::PttSource source) const
 {
-    // CAT/DAX PTT callers acknowledge the request before the asynchronous
-    // model path runs, so local preflight must not silently eat their PTT.
-    // Let the radio be authoritative and report any resulting interlock.
-    if (source == TransmitModel::PttSource::Dax)
-        return QString();
-
     auto* s = txSlice();
-    if (!s)
+    if (const QString message = transmitInhibitMessageForSlice(s);
+        !message.isEmpty()) {
+        return message;
+    }
+
+    // CAT/DAX PTT callers acknowledge the request before the asynchronous
+    // model path runs, so legacy local voice-mode preflight must not silently
+    // eat their PTT. Pan-level receive-only TX inhibits above still apply.
+    // Otherwise let the radio be authoritative and report any interlock.
+    if (source == TransmitModel::PttSource::Dax) {
+        return QString();
+    }
+
+    if (!s) {
         return QStringLiteral("No transmit slice is assigned.");
+    }
 
     const QString mode = s->mode().toUpper();
     const bool nonVoiceSource = (source == TransmitModel::PttSource::Tune
@@ -914,7 +1149,9 @@ bool RadioModel::interlockNotificationArmed() const
     return QDateTime::currentMSecsSinceEpoch() <= m_interlockNotificationArmedUntilMs;
 }
 
-void RadioModel::emitInterlockNotification(const QString& message, const QString& key)
+void RadioModel::emitInterlockNotification(const QString& message,
+                                           const QString& key,
+                                           const QString& panId)
 {
     const QString trimmed = message.trimmed();
     if (trimmed.isEmpty())
@@ -929,7 +1166,7 @@ void RadioModel::emitInterlockNotification(const QString& message, const QString
 
     m_lastInterlockNotificationKey = effectiveKey;
     m_lastInterlockNotificationMs = now;
-    emit interlockNotificationRequested(trimmed);
+    emit interlockNotificationRequested(trimmed, effectiveKey, panId.trimmed());
 }
 
 // ─── Actions ──────────────────────────────────────────────────────────────────
@@ -1260,9 +1497,11 @@ void RadioModel::setTransmit(bool tx, TransmitModel::PttSource source)
     if (tx) {
         const QString message = localPttInterlockMessage(source);
         if (!message.isEmpty()) {
+            const QString panId = txSlice() ? txSlice()->panId() : QString();
             emitInterlockNotification(
                 message,
-                QStringLiteral("local-ptt:%1").arg(message));
+                QStringLiteral("local-ptt:%1:%2").arg(panId, message),
+                panId);
             m_transmitModel.setTransmitting(false);
             return;
         }
@@ -1651,8 +1890,24 @@ void RadioModel::createPanadapter()
 
 void RadioModel::removePanadapter(const QString& panId)
 {
-    qCDebug(lcProtocol) << "RadioModel::removePanadapter:" << panId;
-    sendCmd(QString("display pan close %1").arg(panId));
+    // A panafall (display panafall create) allocates BOTH a panadapter stream
+    // and a waterfall stream, and the radio does NOT free the waterfall when
+    // only the panadapter is removed. So the FlexLib-correct teardown is the
+    // pair Panadapter.Close() + Waterfall.Close() — "display pan remove" AND
+    // "display panafall remove" (FlexLib v4.2.18). Sending only the first (or
+    // the bogus "display pan close", which is not a command at all) leaves the
+    // waterfall stream alive on the radio. (#3843)
+    //
+    // Capture the waterfall id BEFORE sending: the "display pan <id> removed"
+    // echo deletes the PanadapterModel in onStatusReceived, so reading it
+    // afterwards would race the teardown.
+    const PanadapterModel* pan = m_panadapters.value(panId, nullptr);
+    const QString wfId = pan ? pan->waterfallId() : QString();
+    qCDebug(lcProtocol) << "RadioModel::removePanadapter:" << panId
+                        << "waterfall:" << (wfId.isEmpty() ? QStringLiteral("(none)") : wfId);
+    sendCommand(QStringLiteral("display pan remove ") + panId);
+    if (!wfId.isEmpty())
+        sendCommand(QStringLiteral("display panafall remove ") + wfId);
     // Radio will send "display pan <id> removed" → handled in onStatusReceived
 }
 
@@ -1666,6 +1921,49 @@ PanadapterModel* RadioModel::activePanadapter() const
 PanadapterModel* RadioModel::panadapter(const QString& panId) const
 {
     return m_panadapters.value(panId, nullptr);
+}
+
+DisplayInventory::Report RadioModel::displayInventoryReport() const
+{
+    DisplayInventory::Inputs in;
+    in.ourHandle = clientHandle();
+    for (auto it = m_radioDisplayPans.cbegin(); it != m_radioDisplayPans.cend(); ++it)
+        in.radioPans.push_back({it.key(), it.value().clientHandle});
+    for (auto it = m_radioDisplayWaterfalls.cbegin();
+         it != m_radioDisplayWaterfalls.cend(); ++it)
+        in.radioWaterfalls.push_back({it.key(), it.value().clientHandle,
+                                      it.value().parentPanId});
+    // Owned sets — normalize the waterfall id so it compares equal to the
+    // 0x-prefixed inventory keys regardless of hex case (#3856 review).
+    // Include m_stalePanadapters: during the reconnect reclaim window our own
+    // pans live there (not yet moved to m_panadapters), and the radio re-dumps
+    // their status — without this they'd transiently report as orphan.
+    const auto addOwned = [&in](const QMap<QString, PanadapterModel*>& m) {
+        for (auto it = m.cbegin(); it != m.cend(); ++it) {
+            in.ownedPanIds.insert(normalizePanadapterId(it.key()));
+            if (it.value() && !it.value()->waterfallId().isEmpty())
+                in.ownedWaterfallIds.insert(normalizePanadapterId(it.value()->waterfallId()));
+        }
+    };
+    addOwned(m_panadapters);
+    addOwned(m_stalePanadapters);
+    return DisplayInventory::classify(in);
+}
+
+bool RadioModel::resyncDisplayInventory()
+{
+    if (!isConnected()) return false;
+    // Re-subscribing to the pan domain makes the radio re-send the status of
+    // every currently-allocated panadapter + waterfall. Those replies flow
+    // through the same `display pan`/`display panafall` status parser that
+    // maintains m_radioDisplayPans/Waterfalls, so the Layer-B inventory
+    // refreshes to the radio's authoritative current set — the only way to
+    // observe a resource-level lingering waterfall that no longer emits UDP
+    // (#3856). We intentionally do NOT clear the maps first: a re-dump can
+    // only re-add/confirm objects, so a no-op on firmware that doesn't re-dump
+    // leaves the inventory intact rather than wiping it.
+    sendCmd("sub pan all");
+    return true;
 }
 
 double RadioModel::panCenterMhz() const
@@ -1775,12 +2073,27 @@ void RadioModel::setWaterfallBlackLevel(int level)
 
 void RadioModel::setWaterfallAutoBlack(bool on)
 {
-    Q_UNUSED(on);
-    // Auto-black is handled client-side. Always keep radio's auto_black off
-    // because its algorithm targets SmartSDR's rendering, not ours.
+    m_wfAutoBlackOn = on;
+    applyWaterfallAutoBlack();
+}
+
+void RadioModel::setWaterfallAutoBlackSource(bool radioSide)
+{
+    m_wfAutoBlackRadioSide = radioSide;
+    applyWaterfallAutoBlack();
+}
+
+void RadioModel::applyWaterfallAutoBlack()
+{
+    // The radio only needs to compute and embed its per-tile auto-black level
+    // when the user has selected radio-side auto-black AND auto-black is on.
+    // Otherwise the client renders the floor from its own estimate, so keep
+    // auto_black=0 (radio-authoritative when, and only when, the user asks).
     if (activeWfId().isEmpty()) return;
+    const int v = (m_wfAutoBlackOn && m_wfAutoBlackRadioSide) ? 1 : 0;
     sendCmd(
-        QString("display panafall set %1 auto_black=0").arg(activeWfId()));
+        QString("display panafall set %1 auto_black=%2")
+            .arg(activeWfId()).arg(v));
 }
 
 void RadioModel::setWaterfallLineDuration(int ms)
@@ -1849,6 +2162,12 @@ void RadioModel::onConnected()
 void RadioModel::stageSessionModelsForReconnect()
 {
     ++m_sessionModelGeneration;
+    // The PREVIOUS session's handle, captured when that session registered
+    // (m_ownSessionHandle). clientHandle() is useless here: by stage time the
+    // connection has already assigned (or zeroed) the NEW session's handle,
+    // so capturing it would make the reclaim-eviction guard dead code. (#3977)
+    m_staleSessionOwnHandle = m_ownSessionHandle;
+    m_ownSessionHandle = 0;
 
     for (SliceModel* slice : m_slices) {
         if (slice) {
@@ -1869,6 +2188,7 @@ void RadioModel::stageSessionModelsForReconnect()
     m_ownedSliceIds.clear();
     m_foreignSliceOwners.clear();
     m_pendingPanStatuses.clear();
+    m_panTransmitInhibitReasons.clear();
     m_activePanId.clear();
 
     if (!m_staleSlices.isEmpty() || !m_stalePanadapters.isEmpty()) {
@@ -2140,11 +2460,12 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
             qCDebug(lcProtocol) << "RadioModel: saved GUIClientID:" << body.trimmed();
         }
 
-        QString station = AppSettings::instance().value("StationName", "").toString();
-        if (station.isEmpty()) {
-            station = QSysInfo::machineHostName();
-        }
-        sendCmd(QString("client station %1").arg(station));
+        // #3977: remember THIS session's handle for the next reconnect's
+        // reclaim-eviction guard. Captured here (reply time) because the
+        // handle is guaranteed assigned once any command round-trips.
+        m_ownSessionHandle = clientHandle();
+
+        sendCmd(QString("client station %1").arg(ourStationName()));
         sendCmd("client set send_reduced_bw_dax=1");
         // Set network MTU for VITA-49 packets (matches FlexLib behavior)
         int mtu = AppSettings::instance().value("NetworkMtu", "1450").toInt();
@@ -2308,7 +2629,12 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
                             const QString key = kv.left(eq).trimmed();
                             const QString val = kv.mid(eq + 1).trimmed()
                                 .remove('\\').remove('"');
-                            if (key == "callsign")        m_callsign = val;
+                            if (key == "callsign") {
+                                if (val != m_callsign) {
+                                    m_callsign = val;
+                                    emit callsignChanged(m_callsign);
+                                }
+                            }
                             else if (key == "name")        m_nickname = val;
                             else if (key == "region")      m_region = val;
                             else if (key == "options")     m_radioOptions = val;
@@ -2385,7 +2711,7 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
 
                         for (auto* s : m_slices) {
                             for (const QString& cmd : s->drainPendingCommands())
-                                sendCmd(cmd);
+                                sendSliceCommand(s, cmd);
                         }
 
                         // Create remote_audio_rx if PC Audio is enabled. Defer briefly so
@@ -2433,8 +2759,8 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
                             });
                     });
             });
-            // Request global profile list
-            sendCmd("profile global info");
+            // Request profile lists/current selections using FlexLib's info command.
+            refreshProfiles();
             sendCmd("sub tnf all");
             sendCmd("sub memories all");
             // Additional subscriptions (matches SmartSDR connection sequence)
@@ -2637,7 +2963,14 @@ void RadioModel::onDisconnected()
     QMetaObject::invokeMethod(m_panStream, &PanadapterStream::stop,
                               Qt::BlockingQueuedConnection);
     m_panStream->clearRegisteredStreams();
+    // The radio sends no per-stream "removed" on a hard disconnect, so reset
+    // the DAX-IQ stream state + destroy pipes here too (panStream IQ
+    // registrations are cleared just above); otherwise stale `exists` makes
+    // restoreEnabledChannels() skip persisted channels on reconnect. (#3522)
+    m_daxIqModel.handleDisconnect();
     m_pendingPanStatuses.clear();
+    m_radioDisplayPans.clear();           // #3856 Layer B — radio re-dumps on reconnect
+    m_radioDisplayWaterfalls.clear();
 
     m_tnfModel.clear();
     m_flexWaveformModel.clear();
@@ -2647,9 +2980,20 @@ void RadioModel::onDisconnected()
     }
     m_clientStations.clear();
     m_clientInfoMap.clear();
+    // #3977: handles are radio-boot-scoped and recycled across connections —
+    // strikes and eviction marks must not outlive the connection they were
+    // observed on, or a recycled handle inherits them (instant eviction of an
+    // innocent client / permanent immunity for a real zombie).
+    m_foreignPanWrites.clear();
+    m_evictedPredecessorHandles.clear();
+    m_evictionsInFlight.clear();
     m_announcedClientConnections.clear();
     m_startupClientConnections.clear();
     m_clientConnectionNoticeTimer.invalidate();
+    // The radio reaps all our streams on TCP disconnect; drop the DAX channel
+    // ownership table without emitting removals (#3305). Consumers re-acquire
+    // on their reconnect re-arm paths.
+    m_panStream->resetDaxChannelsForDisconnect();
     emit otherClientsChanged(0, {});
     emit connectionStateChanged(false);
     m_forcedDisconnectInProgress = false;
@@ -2703,6 +3047,8 @@ void RadioModel::startNetworkMonitor()
     m_maxPingRtt = 0;
     m_pingMissCount = 0;
     m_pingDisconnectTriggered = false;
+    m_lastMultiFlexClientConnectMs = 0;
+    m_multiFlexPingGraceUntilMs = 0;
     m_pendingThrottleLift = false;
     // Safety: ensure MainWindow's m_adaptiveThrottleActive is cleared even if
     // the connectionStateChanged(false) path was somehow skipped.  Pans are not
@@ -2733,8 +3079,38 @@ void RadioModel::startNetworkMonitor()
                                       ? PING_MISS_DISCONNECT_POOR
                                       : PING_MISS_DISCONNECT;
         if (m_pingMissCount >= missThreshold) {
-            if (m_pingDisconnectTriggered)
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            if (now < m_multiFlexPingGraceUntilMs) {
+                qCDebug(lcProtocol) << "RadioModel: deferring ping disconnect during Multi-Flex client-connect grace"
+                                    << "misses:" << m_pingMissCount
+                                    << "remaining_ms:" << (m_multiFlexPingGraceUntilMs - now);
+                sendCmd("ping");
                 return;
+            }
+
+            // A new Multi-Flex GUI can briefly starve TCP ping replies while
+            // the radio replays status and stream ownership. If that burst
+            // overlaps the missed-ping window, grant one short grace period
+            // before treating the TCP control path as dead.
+            const qint64 recentClientConnectWindowMs =
+                static_cast<qint64>(missThreshold + 1) * m_pingTimer.interval();
+            const bool recentMultiFlexClientConnect =
+                m_lastMultiFlexClientConnectMs > 0
+                && now >= m_lastMultiFlexClientConnectMs
+                && now - m_lastMultiFlexClientConnectMs <= recentClientConnectWindowMs;
+            if (recentMultiFlexClientConnect) {
+                m_multiFlexPingGraceUntilMs = now + MULTIFLEX_CLIENT_CONNECT_PING_GRACE_MS;
+                qCDebug(lcProtocol) << "RadioModel: deferring ping disconnect after recent Multi-Flex client connect"
+                                    << "misses:" << m_pingMissCount
+                                    << "since_client_connect_ms:" << (now - m_lastMultiFlexClientConnectMs)
+                                    << "grace_ms:" << MULTIFLEX_CLIENT_CONNECT_PING_GRACE_MS;
+                sendCmd("ping");
+                return;
+            }
+
+            if (m_pingDisconnectTriggered) {
+                return;
+            }
 
             m_pingDisconnectTriggered = true;
             m_pingTimer.stop();
@@ -2947,6 +3323,7 @@ int RadioModel::adaptiveWfMsForCap(int fpsCap) const
 void RadioModel::sendAdaptiveCapToPan(const QString& panId, int fpsCap)
 {
     if (panId.isEmpty() || fpsCap <= 0) return;
+    if (profileLoadRadioStateWritesHeld()) return;
     auto* pan = m_panadapters.value(panId, nullptr);
     if (!pan) return;
     sendCommand(QString("display pan set %1 fps=%2").arg(panId).arg(fpsCap));
@@ -3128,18 +3505,25 @@ void RadioModel::handleMemoryStatus(int index, const QMap<QString, QString>& kvs
     auto& m = m_memories[index];
     m.index = index;
 
+    // Decode the protocol space-encoding (0x7f -> ' ') for free-text fields,
+    // then strip any NUL/control bytes so corrupt values from the radio (or a
+    // previously corrupted memory) never reach the UI, CSV export, or a re-send.
+    auto decodeText = [](const QString& v) {
+        return AetherSDR::MemoryFields::sanitizeText(QString(v).replace('\x7f', ' '));
+    };
+
     for (auto it = kvs.begin(); it != kvs.end(); ++it) {
         const QString& k = it.key();
         const QString& v = it.value();
-        if      (k == "group")           m.group = QString(v).replace('\x7f', ' ');
-        else if (k == "owner")           m.owner = QString(v).replace('\x7f', ' ');
+        if      (k == "group")           m.group = decodeText(v);
+        else if (k == "owner")           m.owner = decodeText(v);
         else if (k == "freq")            m.freq = v.toDouble();
-        else if (k == "name")            m.name = QString(v).replace('\x7f', ' ');
-        else if (k == "mode")            m.mode = v;
+        else if (k == "name")            m.name = decodeText(v);
+        else if (k == "mode")            m.mode = AetherSDR::MemoryFields::sanitizeText(v);
         else if (k == "step")            m.step = v.toInt();
-        else if (k == "repeater")        m.offsetDir = v;
+        else if (k == "repeater")        m.offsetDir = AetherSDR::MemoryFields::sanitizeText(v);
         else if (k == "repeater_offset") m.repeaterOffset = v.toDouble();
-        else if (k == "tone_mode")       m.toneMode = v;
+        else if (k == "tone_mode")       m.toneMode = AetherSDR::MemoryFields::sanitizeText(v);
         else if (k == "tone_value")      m.toneValue = v.toDouble();
         else if (k == "squelch")         m.squelch = (v == "1");
         else if (k == "squelch_level")   m.squelchLevel = v.toInt();
@@ -3198,6 +3582,15 @@ void RadioModel::onMessageReceived(const ParsedMessage& msg)
     // status line here and parse it ourselves.
     if (msg.type != MessageType::Status) return;
 
+    // #3977: attribute display-pan writes to their originating client via the
+    // S<handle>| source prefix (msg.handle; 0 = the radio itself). A foreign
+    // session repeatedly adjusting OUR pan's dBm range is the #3951 zombie
+    // signature — detect, log, and (opt-in) evict. Originator semantics were
+    // observed live on fw 4.2.18 (FLEX-8400M); FlexLib never parses this
+    // token, and 4.1.x is unverified — which is one reason eviction defaults
+    // off (see staleSessionEvictionEnabled()).
+    noteForeignPanWriteIfAny(msg.object, msg.kvs, msg.handle);
+
     // Raw line: "S<handle>|meter 7.src=SLC#7.num=0#7.nam=LEVEL#..."
     const QString& raw = msg.raw;
     const int pipe = raw.indexOf('|');
@@ -3241,6 +3634,22 @@ void RadioModel::onMessageReceived(const ParsedMessage& msg)
 
 void RadioModel::sendCommand(const QString& cmd)
 {
+    // #3977: last-line ownership gate for pan writes. Every UI path that
+    // adjusts a pan (auto-floor, band restore, center/bandwidth/zoom/fps)
+    // funnels through here; when the radio has told us another client owns
+    // the pan, drop the write instead of stomping the rightful owner — the
+    // #3951 signature. Fails open when ownership is unknown.
+    if (cmd.startsWith(QLatin1String("display pan set "))) {
+        const QString panId =
+            normalizePanadapterId(cmd.mid(16).section(QLatin1Char(' '), 0, 0));
+        if (auto* pan = m_panadapters.value(panId, nullptr);
+            pan && !pan->ownedByClient(clientHandle())) {
+            qCWarning(lcProtocol).noquote()
+                << "RadioModel: dropping pan-set for foreign-owned pan"
+                << panId << "(owner 0x" + pan->clientHandle() + ") —" << cmd;
+            return;
+        }
+    }
     qCDebug(lcProtocol) << "RadioModel::sendCommand:" << cmd
              << "connected:" << isConnected() << "wan:" << (m_wanConn != nullptr);
     this->sendCmd(cmd);
@@ -3272,12 +3681,8 @@ void RadioModel::requestFileDownloadPort(const QString& downloadKind, ResponseCa
 void RadioModel::refreshProfiles()
 {
     sendCmd(QStringLiteral("profile global info"));
-    sendCmd(QStringLiteral("profile global list"));
-    sendCmd(QStringLiteral("profile global current"));
-    sendCmd(QStringLiteral("profile tx list"));
-    sendCmd(QStringLiteral("profile tx current"));
-    sendCmd(QStringLiteral("profile mic list"));
-    sendCmd(QStringLiteral("profile mic current"));
+    sendCmd(QStringLiteral("profile tx info"));
+    sendCmd(QStringLiteral("profile mic info"));
 }
 
 bool RadioModel::isProfileTransferBlocked() const
@@ -3533,6 +3938,65 @@ quint32 RadioModel::sendCmd(const QString& command, ResponseCallback cb)
         perf.recordPanCenterCommand();
     }
 
+    const ProfileLoadCommand profileLoad = parseProfileLoadCommand(command);
+    if (profileLoad.valid) {
+        const bool topologyProfile = profileLoadMayRebuildRadioTopology(profileLoad.type);
+        if (topologyProfile) {
+            m_profileLoadRadioStateWriteHoldUntilMs =
+                std::max(m_profileLoadRadioStateWriteHoldUntilMs,
+                         QDateTime::currentMSecsSinceEpoch() + kProfileLoadStateWriteHoldMs);
+        }
+        emit profileLoadStarted(profileLoad.type, profileLoad.name);
+
+        ResponseCallback originalCallback = std::move(cb);
+        cb = [this, profileLoad, topologyProfile, originalCallback = std::move(originalCallback)]
+             (int code, const QString& body) mutable {
+            if (originalCallback) {
+                originalCallback(code, body);
+            }
+
+            if (code != 0) {
+                qCWarning(lcProtocol).noquote()
+                    << "RadioModel: profile load rejected"
+                    << QStringLiteral("type=%1").arg(profileLoad.type)
+                    << QStringLiteral("name=%1").arg(profileLoad.name)
+                    << QStringLiteral("code=%1").arg(hexCode(code))
+                    << QStringLiteral("body=%1").arg(body);
+                return;
+            }
+
+            qCInfo(lcProtocol).noquote()
+                << "RadioModel: profile load accepted"
+                << QStringLiteral("type=%1").arg(profileLoad.type)
+                << QStringLiteral("name=%1").arg(profileLoad.name);
+            if (topologyProfile) {
+                m_profileLoadRadioStateWriteHoldUntilMs =
+                    std::max(m_profileLoadRadioStateWriteHoldUntilMs,
+                             QDateTime::currentMSecsSinceEpoch() + kProfileLoadStateWriteHoldMs);
+                scheduleRxAudioStreamEnsure(QStringLiteral("profile-load:%1").arg(profileLoad.type));
+            }
+            QTimer::singleShot(750, this, [this]() {
+                if (isConnected()) {
+                    refreshProfiles();
+                }
+            });
+            emit profileLoadCompleted(profileLoad.type, profileLoad.name);
+        };
+    }
+
+    if (!profileLoad.valid
+        && profileLoadRadioStateWritesHeld()
+        && isProfileOwnedRadioStateWrite(command)) {
+        qCDebug(lcProtocol).noquote()
+            << "RadioModel: suppressing profile-load radio-state write"
+            << command;
+        if (cb) {
+            cb(kProfileLoadSuppressedCommandCode,
+               QStringLiteral("suppressed during profile load"));
+        }
+        return 0;
+    }
+
     if (m_wanConn)
         return m_wanConn->sendCommand(command, std::move(cb));
 
@@ -3571,6 +4035,25 @@ PanadapterModel* RadioModel::ensureOwnedPanadapter(const QString& panId)
         pan = it.value();
         m_stalePanadapters.erase(it);
         reclaimed = true;
+        // #3977: the stale pan still records the handle of the session we are
+        // superseding. If that connection is somehow still alive radio-side
+        // (half-open TCP, zombie process), its auto-floor tracker will keep
+        // adjusting THIS pan's dBm range under us (#3951) — evict it the way
+        // SmartSDR evicts a predecessor on takeover (observed on fw 4.2.18,
+        // where the radio also self-heals duplicate client_ids on its own).
+        // Only evict when the staged pan still records OUR OWN pre-reconnect
+        // handle (captured at registration, consumed at stage time). If
+        // status parsing reassigned the pan to another client before we went
+        // down, that client is the pan's live rightful owner — evicting it
+        // would start an eviction ping-pong between two healthy sessions
+        // sharing a client_id.
+        const quint32 oldHandle = pan->ownerHandle();
+        if (oldHandle != 0 && oldHandle != clientHandle()
+            && oldHandle == m_staleSessionOwnHandle) {
+            evictStaleSession(oldHandle,
+                              QStringLiteral("predecessor recorded on reclaimed "
+                                             "pan %1").arg(normalizedPanId));
+        }
     } else {
         pan = new PanadapterModel(normalizedPanId, this);
     }
@@ -3640,6 +4123,141 @@ PanadapterModel* RadioModel::ensureOwnedPanadapter(const QString& panId)
 }
 
 quint32 RadioModel::ourClientHandle() const { return clientHandle(); }
+
+QString RadioModel::ourStationName() const
+{
+    QString station = AppSettings::instance().value("StationName", "").toString();
+    if (station.isEmpty()) {
+        station = QSysInfo::machineHostName();
+    }
+    return station;
+}
+
+bool RadioModel::staleSessionEvictionEnabled() const
+{
+    // #3977: force-disconnecting another radio client is opt-in — detection
+    // and forensics always run, the disconnect does not. Feature-owned nested
+    // config per Principle V. fw 4.2+ self-heals duplicate-client_id zombies
+    // (observed on 4.2.18); the client-side eviction targets older firmware
+    // (the #3951 reporter's 8600 runs 4.1.3) where the S<handle> originator
+    // semantics below are unverified — hence off by default.
+    const QString json = AppSettings::instance()
+                             .value(QStringLiteral("StaleSessionDefense"), QString())
+                             .toString();
+    const QJsonObject obj = QJsonDocument::fromJson(json.toUtf8()).object();
+    return obj.value(QStringLiteral("EvictionEnabled")).toBool(false);
+}
+
+void RadioModel::evictStaleSession(quint32 handle, const QString& reason)
+{
+    if (handle == 0 || handle == clientHandle()) {
+        return;
+    }
+    if (m_evictedPredecessorHandles.contains(handle)
+        || m_evictionsInFlight.contains(handle)) {
+        return;
+    }
+    m_evictionsInFlight.insert(handle);
+    qCWarning(lcProtocol).noquote()
+        << "RadioModel: evicting stale session" << hexId(handle) << "—" << reason;
+    sendCmd(QStringLiteral("client disconnect 0x%1").arg(handle, 0, 16),
+            [this, handle](int code, const QString& body) {
+        m_evictionsInFlight.remove(handle);
+        if (code == 0) {
+            m_evictedPredecessorHandles.insert(handle);
+        } else {
+            // Not marked evicted: a refused disconnect must stay retryable,
+            // and `get clients` reporting evicted=true for a live zombie
+            // would defeat the forensics this exists for. (#3977)
+            qCWarning(lcProtocol) << "RadioModel: client disconnect refused for"
+                                  << Qt::hex << handle << "code" << code
+                                  << "body:" << body;
+        }
+    });
+}
+
+void RadioModel::noteForeignPanWriteIfAny(const QString& object,
+                                          const QMap<QString, QString>& kvs,
+                                          quint32 sourceHandle)
+{
+    if (sourceHandle == 0 || sourceHandle == clientHandle()) {
+        return;  // radio-originated or our own echo
+    }
+    if (!object.startsWith(QLatin1String("display pan "))) {
+        return;
+    }
+    if (!kvs.contains(QStringLiteral("min_dbm"))
+        && !kvs.contains(QStringLiteral("max_dbm"))) {
+        return;
+    }
+
+    const QString panId =
+        normalizePanadapterId(object.mid(12).section(QLatin1Char(' '), 0, 0));
+    auto* pan = m_panadapters.value(panId, nullptr);
+    // Fail CLOSED for evidence: only writes to a pan whose radio-confirmed
+    // (or claim-time) owner is us count against another client. The fail-open
+    // ownedByClient() would let writes to a not-yet-attributed pan frame a
+    // legitimate peer. Note applyPanStatus re-stamps the pan when the radio
+    // reassigns it, so a rightful new owner's echoes stop counting the moment
+    // the radio broadcasts the transfer — that ordering is what prevents two
+    // healthy sessions from evicting each other. (#3977)
+    if (!pan || pan->ownerHandle() == 0 || pan->ownerHandle() != clientHandle()) {
+        return;
+    }
+
+    auto& rec = m_foreignPanWrites[sourceHandle];
+    rec.count++;
+    rec.panId = panId;
+    rec.lastMs = QDateTime::currentMSecsSinceEpoch();
+    if (rec.count == 1 || rec.count % 25 == 0) {
+        qCWarning(lcProtocol).noquote()
+            << "RadioModel: foreign client" << hexId(sourceHandle)
+            << "is adjusting OUR pan" << panId << "dBm range —"
+            << rec.count << "writes so far (#3977)";
+    }
+
+    // Evidence-based eviction (#3951): three strikes AND the offender is
+    // provably a stale instance of us (same program + station). Anything
+    // else — SmartSDR, a differently-named station, a non-GUI client absent
+    // from the roster — is the user's business; we log and leave it alone.
+    constexpr int kEvictAfterForeignWrites = 3;
+    if (rec.count < kEvictAfterForeignWrites
+        || m_evictedPredecessorHandles.contains(sourceHandle)) {
+        return;
+    }
+    // Identity must be radio-authoritative on BOTH sides: compare against the
+    // station the radio reports for OUR handle, not our local settings (the
+    // registered station can differ from the persisted preference).
+    const ClientInfo info = m_clientInfoMap.value(sourceHandle);
+    const QString ourStation = m_clientInfoMap.value(clientHandle()).station;
+    if (info.program != QLatin1String("AetherSDR")
+        || ourStation.isEmpty() || info.station != ourStation) {
+        return;
+    }
+    if (!staleSessionEvictionEnabled()) {
+        if (rec.count == kEvictAfterForeignWrites) {
+            qCWarning(lcProtocol).noquote()
+                << "RadioModel: stale AetherSDR session" << hexId(sourceHandle)
+                << "(station" << info.station << ") reached" << rec.count
+                << "foreign dBm writes to our pan" << panId
+                << "— would evict, but eviction is disabled"
+                << "(StaleSessionDefense.EvictionEnabled) (#3977/#3951)";
+        }
+        return;
+    }
+    evictStaleSession(sourceHandle,
+                      QStringLiteral("%1 foreign dBm writes to our pan %2 "
+                                     "(station %3) (#3977/#3951)")
+                          .arg(rec.count).arg(panId, info.station));
+}
+
+bool RadioModel::sliceMayBelongToUs(int sliceId) const
+{
+    if (m_foreignSliceOwners.contains(sliceId)) {
+        return false;
+    }
+    return m_ownedSliceIds.isEmpty() || m_ownedSliceIds.contains(sliceId);
+}
 
 void RadioModel::emitOtherClientsChanged()
 {
@@ -3847,6 +4465,58 @@ void RadioModel::traceDaxStreamStatus(const QString& object,
         << QStringLiteral("keys=%1").arg(kvs.keys().join(QLatin1Char(',')));
 }
 
+// Single registration path for dax_rx streams (#3305): every consumer used to
+// run its own statusReceived hook (bridge / TCI / RADE) with subtly different
+// filtering — RADE's had no client_handle check at all, so an external DAX
+// app's broadcast stream status could shadow the channel and suppress our own
+// `stream create` (state-machines.md §7.2: stream statuses go to ALL clients).
+void RadioModel::handleDaxRxStreamRegistry(const QString& object,
+                                           const QMap<QString, QString>& kvs)
+{
+    const auto stream = parseStreamObject(object, QStringLiteral("stream"));
+    if (!stream.valid) return;
+    if (streamStatusRemoved(stream, kvs)) {
+        // The removed form carries no type= (state-machines.md §7.6) — route
+        // by id; a non-dax_rx id is a harmless no-op in the registry.
+        m_panStream->unregisterDaxStream(stream.streamId);
+        return;
+    }
+    if (kvs.value(QStringLiteral("type")) != QStringLiteral("dax_rx")) return;
+    if (!streamStatusBelongsToUs(kvs, ourClientHandle())) {
+        qCDebug(lcDax).noquote()
+            << "RadioModel: ignoring foreign DAX RX stream"
+            << QStringLiteral("stream=%1").arg(hexId(stream.streamId))
+            << QStringLiteral("owner=%1").arg(kvs.value(QStringLiteral("client_handle")));
+        return;
+    }
+    const int ch = kvs.value(QStringLiteral("dax_channel")).toInt();
+    if (ch >= 1 && ch <= 4) {
+        m_panStream->registerDaxStream(stream.streamId, ch);
+        // #1439 client-registration re-assert — LEGACY FALLBACK ONLY, decided
+        // here (not in the create reply) because this status is the moment the
+        // stream↔slice binding is definitively known: a non-empty slice=<letter>
+        // means the radio already auto-bound them (modern firmware, ≥4.2.18) and
+        // no nudge is needed. Only when it did NOT auto-bind AND a slice carries
+        // this channel do we re-assert `slice set dax=`. Deciding here is
+        // race-free across transports (the create reply can precede this status
+        // on WAN/SmartLink); tied to a stream we own and initiated, never a
+        // status echo, so it cannot oscillate (#4009/#3305).
+        const bool autoBound =
+            !kvs.value(QStringLiteral("slice")).trimmed().isEmpty();
+        if (!autoBound && isConnected()) {
+            for (auto* s : slices()) {
+                if (s && s->daxChannel() == ch) {
+                    qCInfo(lcDax) << "RadioModel: dax_rx ch" << ch
+                                  << "not auto-bound — sending #1439 nudge";
+                    sendCommand(QString("slice set %1 dax=%2")
+                                    .arg(s->sliceId()).arg(ch));
+                    break;
+                }
+            }
+        }
+    }
+}
+
 void RadioModel::onStatusReceived(const QString& object,
                                   const QMap<QString, QString>& kvs)
 {
@@ -3855,6 +4525,7 @@ void RadioModel::onStatusReceived(const QString& object,
 
     handleRemoteAudioRxStreamStatus(object, kvs);
     traceDaxStreamStatus(object, kvs);
+    handleDaxRxStreamRegistry(object, kvs);
 
     if (object == "radio") {
         handleRadioStatus(kvs);
@@ -3913,6 +4584,15 @@ void RadioModel::onStatusReceived(const QString& object,
                 client.source = source;
                 client.localPtt = ptt;
                 m_clientInfoMap[handle] = client;
+                if (handle != clientHandle()) {
+                    m_lastMultiFlexClientConnectMs = QDateTime::currentMSecsSinceEpoch();
+                    qCDebug(lcProtocol).noquote()
+                        << "RadioModel: noted Multi-Flex client connect for ping grace"
+                        << QStringLiteral("handle=%1").arg(hexId(handle))
+                        << QStringLiteral("program=%1").arg(program)
+                        << QStringLiteral("station=%1").arg(station)
+                        << QStringLiteral("source=%1").arg(source.isEmpty() ? QStringLiteral("direct") : source);
+                }
                 emitOtherClientsChanged();
                 if (!shouldSuppressClientConnectionNotice(handle))
                     announceClientConnection(handle, source, station, program);
@@ -4118,7 +4798,9 @@ void RadioModel::onStatusReceived(const QString& object,
             // Handle pan removal — "display pan 0x40000001 removed" arrives
             // with no '=' so the parser puts the whole string in 'object'
             if (kvs.contains("removed") || object.endsWith("removed")) {
+                m_radioDisplayPans.remove(normalizePanadapterId(panId));   // #3856 Layer B inventory
                 m_pendingPanStatuses.remove(panId);
+                m_panTransmitInhibitReasons.remove(panId);
                 auto* pan = m_panadapters.take(panId);
                 if (!pan) {
                     pan = m_stalePanadapters.take(panId);
@@ -4135,6 +4817,32 @@ void RadioModel::onStatusReceived(const QString& object,
                                                             : m_panadapters.firstKey();
                 }
                 return;
+            }
+
+            // #3856 Layer B: record into the radio-authoritative pan inventory
+            // (presence + owner), independent of whether we end up owning it —
+            // foreign and unclaimed pans are tracked too. Pruned on "removed".
+            {
+                const QString nPanId = normalizePanadapterId(panId);
+                auto& e = m_radioDisplayPans[nPanId];
+                if (kvs.contains(QStringLiteral("client_handle")))
+                    e.clientHandle = parseClientHandle(kvs.value(QStringLiteral("client_handle")));
+                // Capture the pan-side waterfall link and stamp it onto the
+                // waterfall entry's parentPanId. Some firmware conveys the
+                // pan↔waterfall link only here (the pan's `waterfall=` key) and
+                // omits `panadapter=` from the waterfall status — without this
+                // backfill the waterfall's parent stays unknown, so a leaked
+                // waterfall (parent pan removed) could never be flagged. Stamping
+                // the persistent waterfall entry means the link survives the
+                // pan's removal, which is exactly when the leak shows. (#3856)
+                const QString wf =
+                    normalizePanadapterId(kvs.value(QStringLiteral("waterfall")));
+                if (!wf.isEmpty()) {
+                    e.waterfallId = wf;
+                    auto wit = m_radioDisplayWaterfalls.find(wf);
+                    if (wit != m_radioDisplayWaterfalls.end() && wit->parentPanId.isEmpty())
+                        wit->parentPanId = nPanId;
+                }
             }
 
             // Preamp is shared antenna hardware — apply to ALL our pans
@@ -4183,6 +4891,7 @@ void RadioModel::onStatusReceived(const QString& object,
                     m_stalePanadapters.erase(it);
                 }
                 if (rejectedPan) {
+                    m_panTransmitInhibitReasons.remove(panId);
                     m_panStream->unregisterPanStream(rejectedPan->panStreamId());
                     m_panStream->unregisterWfStream(rejectedPan->wfStreamId());
                     qCDebug(lcProtocol) << "RadioModel: panadapter" << panId
@@ -4195,12 +4904,24 @@ void RadioModel::onStatusReceived(const QString& object,
                     }
                 } else if (m_panadapters.contains(panId)
                            && kvs.contains(QStringLiteral("client_handle"))) {
-                    // A pan we hold reporting a different owner means an
-                    // earlier claim was wrong — keep the pan (don't rip the
-                    // user's display down on a transient fragment) but make
-                    // the misclaim visible.
-                    qCWarning(lcProtocol) << "RadioModel: ignoring foreign owner status for claimed panadapter"
-                                          << panId << "owner=" << kvs.value(QStringLiteral("client_handle"));
+                    // A pan we hold reporting a different owner: the radio is
+                    // authoritative (Principle II). Keep the pan (don't rip
+                    // the user's display down on a transient fragment) but
+                    // adopt the radio's verdict on ownership — stamping the
+                    // new owner flips ownedByClient() false, which silences
+                    // every outbound pan-set gate AND stops the foreign-write
+                    // tally from counting the rightful owner's own echoes as
+                    // zombie evidence against it. (#3977)
+                    PanadapterModel* heldPan = m_panadapters.value(panId);
+                    const QString newOwner =
+                        kvs.value(QStringLiteral("client_handle"));
+                    if (heldPan->ownedByClient(clientHandle())) {
+                        qCWarning(lcProtocol)
+                            << "RadioModel: panadapter" << panId
+                            << "reassigned to client" << newOwner
+                            << "— going quiet on it (#3977)";
+                    }
+                    heldPan->setClientHandle(newOwner);
                 }
                 return;  // not our panadapter, ignore
             }
@@ -4215,9 +4936,53 @@ void RadioModel::onStatusReceived(const QString& object,
     // Only process status for OUR waterfall (matching client_handle).
     static const QRegularExpression wfRe(R"(^display waterfall\s+(0x[0-9A-Fa-f]+)$)");
     if (object.startsWith("display waterfall")) {
+        // #3856 Layer B: prune the radio-side waterfall inventory on removal.
+        // Removal arrives in two wire forms (mirroring the pan branch): bare
+        // "display waterfall 0x42… removed" (no '=', lands in `object`) and the
+        // kv form "display waterfall 0x42… removed=1" (lands in `kvs`). Handle
+        // both — the bare form won't match wfRe, and the kv form WOULD match
+        // wfRe and be mis-recorded as an add if not caught first.
+        if (kvs.contains(QStringLiteral("removed")) || object.endsWith(QLatin1String("removed"))) {
+            static const QRegularExpression wfRemovedRe(R"(^display waterfall\s+(0x[0-9A-Fa-f]+))");
+            const auto rm = wfRemovedRe.match(object);
+            if (rm.hasMatch()) {
+                const QString wfId = normalizePanadapterId(rm.captured(1));
+                m_radioDisplayWaterfalls.remove(wfId);
+                qCDebug(lcProtocol) << "RadioModel: waterfall removed (inventory)" << wfId;
+            }
+            return;
+        }
         const auto m = wfRe.match(object);
         if (m.hasMatch()) {
             const QString wfId = m.captured(1);
+            // #3856 Layer B: record into the radio-authoritative waterfall
+            // inventory (presence + owner + parent pan), before the ownership
+            // early-returns below — a leaked waterfall must be tracked even when
+            // it carries no client_handle and we don't own it. Normalize the key
+            // so it compares equal to owned/parent ids regardless of hex case.
+            {
+                const QString nWfId = normalizePanadapterId(wfId);
+                auto& e = m_radioDisplayWaterfalls[nWfId];
+                if (kvs.contains(QStringLiteral("client_handle")))
+                    e.clientHandle = parseClientHandle(kvs.value(QStringLiteral("client_handle")));
+                const QString parent =
+                    normalizePanadapterId(kvs.value(QStringLiteral("panadapter")));
+                if (!parent.isEmpty()) {
+                    e.parentPanId = parent;
+                } else if (e.parentPanId.isEmpty()) {
+                    // Firmware omitted `panadapter=` on the waterfall status:
+                    // backfill the parent from the pan that already reported this
+                    // waterfall via its `waterfall=` link (handles pan-status-
+                    // first ordering; the pan-status path covers the reverse). (#3856)
+                    for (auto pit = m_radioDisplayPans.cbegin();
+                         pit != m_radioDisplayPans.cend(); ++pit) {
+                        if (pit.value().waterfallId == nWfId) {
+                            e.parentPanId = pit.key();
+                            break;
+                        }
+                    }
+                }
+            }
             // Check if this waterfall belongs to one of our panadapters.
             // The waterfallId is set on PanadapterModel by the "display pan" status
             // message which contains "waterfall=0x42xxxxxx".
@@ -4546,14 +5311,15 @@ void RadioModel::onStatusReceived(const QString& object,
             // tune. SW source still requires m_txRequested so the optimistic
             // local-unkey behaviour from the TX_SYNC_FIX_REPORT is preserved
             // (a stale state=TRANSMITTING after setTransmit(false) on SW
-            // source still falls through to the force-off branch).
-            const bool hardwarePtt = (m_lastInterlockSource == "MIC"
-                                      || m_lastInterlockSource == "ACC"
-                                      || m_lastInterlockSource == "RCA");
-
-            if (!m_txOwnedByUs ||
-                (!m_txRequested && !m_cwKeyActive && !m_cwxActive
-                 && !m_transmitModel.isTuning() && !hardwarePtt)) {
+            // source still falls through to the force-off branch). VOX also
+            // keys the radio autonomously (no setTransmit()); when VOX is
+            // enabled and we own TX, treat it as an owned-TX path like
+            // hardware PTT so the SmartMtr TX meter and audio gate engage
+            // (#3861). See RadioStatusOwnership::interlockKeepsLocalTxOn.
+            if (!RadioStatusOwnership::interlockKeepsLocalTxOn(
+                    m_txOwnedByUs, m_txRequested, m_cwKeyActive, m_cwxActive,
+                    m_transmitModel.isTuning(), m_lastInterlockSource,
+                    m_transmitModel.voxEnable())) {
                 // Another client owns TX, or local unkey requested:
                 // force local TX/audio gate off through all interlock states.
                 m_transmitModel.setTransmitting(false);
@@ -4720,7 +5486,13 @@ void RadioModel::handleRadioStatus(const QMap<QString, QString>& kvs)
         }
         changed = true;
     }
-    if (kvs.contains("callsign")) { m_callsign = kvs["callsign"]; changed = true; }
+    if (kvs.contains("callsign")) {
+        if (kvs["callsign"] != m_callsign) {
+            m_callsign = kvs["callsign"];
+            emit callsignChanged(m_callsign);
+        }
+        changed = true;
+    }
     if (kvs.contains("nickname")) { m_nickname = kvs["nickname"]; changed = true; }
     if (kvs.contains("region"))   { m_region = kvs["region"]; changed = true; }
     if (kvs.contains("radio_options")) { m_radioOptions = kvs["radio_options"]; changed = true; }
@@ -4861,7 +5633,7 @@ void RadioModel::handleSliceStatus(int id,
             m_ownedSliceIds.insert(id);
             // If this slot was previously foreign (e.g. another client
             // released it and we just got assigned), drop the foreign mark.
-            if (m_foreignSliceOwners.remove(id) > 0) {
+            if (m_foreignSliceOwners.remove(id)) {
                 emit slotOccupancyChanged(id);
             }
             qCDebug(lcProtocol) << "RadioModel: slice" << id << "is ours (client_handle match)";
@@ -4910,7 +5682,7 @@ void RadioModel::handleSliceStatus(int id,
             emit sliceRemoved(id);
             stale->deleteLater();
             emit slotOccupancyChanged(id);
-        } else if (m_foreignSliceOwners.remove(id) > 0) {
+        } else if (m_foreignSliceOwners.remove(id)) {
             // Foreign client released their slot — clear the dim marker.
             emit slotOccupancyChanged(id);
         }
@@ -4941,8 +5713,17 @@ void RadioModel::handleSliceStatus(int id,
         } else {
             s = new SliceModel(id, this);
             // Forward slice commands to the radio
-            connect(s, &SliceModel::commandReady, this, [this](const QString& cmd){
-                sendCmd(cmd);
+            connect(s, &SliceModel::commandReady, this, [this, s](const QString& cmd){
+                sendSliceCommand(s, cmd);
+            });
+            // aetherd RFC 2.3 encode template: mode intent routes through the
+            // backend verb, whose output goes through the guarded slice sink.
+            // TODO(2.x): route via IRadioBackend once encode is backend-owned —
+            // today this no-ops on the wire for any non-Flex backend (m_flexBackend
+            // null) while still emitting modeChanged. Fine while Flex is the only
+            // backend. (#4063 review)
+            connect(s, &SliceModel::modeChangeRequested, this, [this, s](const QString& mode){
+                if (m_flexBackend) m_flexBackend->setSliceMode(s->sliceId(), mode);
             });
             connect(s, &SliceModel::txSliceChanged, this, [this](bool) {
                 m_meterModel.setActiveTxSlice(activeTxSliceNum());
@@ -4952,14 +5733,16 @@ void RadioModel::handleSliceStatus(int id,
         m_slices.append(s);
         s->applyStatus(kvs);  // populate frequency/mode before notifying UI
         m_meterModel.setActiveTxSlice(activeTxSliceNum());
+        enforceTransmitInhibitForSlice(s);
         if (!reclaimed) {
             emit sliceAdded(s);
-        } else if (s->isTxSlice()) {
+        } else if (s->isTxSlice()
+                   && transmitInhibitMessageForSlice(s).isEmpty()
+                   && QDateTime::currentMSecsSinceEpoch() >= m_profileLoadRadioStateWriteHoldUntilMs) {
             // Re-claim TX after a radio reboot (#145 semantics): the radio
-            // recreates the slice with tx=1 but tx_client_handle pointing at
-            // our dead pre-reboot handle (or 0). Fresh slices get this from
-            // MainWindow::onSliceAdded; reclaimed slices skip sliceAdded, so
-            // re-assert it here.
+            // recreates a stale slice model with tx=1 but tx_client_handle
+            // pointing at our dead pre-reboot handle (or 0). Fresh startup
+            // slices are left radio-owned so GUIClient restore can settle.
             sendCmd(QString("slice set %1 tx=1").arg(id));
         }
         emit slotOccupancyChanged(id);  // empty/foreign → ours
@@ -4968,6 +5751,7 @@ void RadioModel::handleSliceStatus(int id,
 
     s->applyStatus(kvs);
     m_meterModel.setActiveTxSlice(activeTxSliceNum());
+    enforceTransmitInhibitForSlice(s);
 
     // Aurora/AU-520: max_internal_pa_power in slice status reports the true
     // system power capability (e.g. 500W) while transmit status max_power_level
@@ -4982,7 +5766,7 @@ void RadioModel::handleSliceStatus(int id,
     // Send any queued commands (e.g. if GUI changed freq before status arrived)
     if (isConnected()) {
         for (const QString& cmd : s->drainPendingCommands())
-            sendCmd(cmd);
+            sendSliceCommand(s, cmd);
     }
 }
 
@@ -5073,6 +5857,7 @@ void RadioModel::handlePanadapterStatus(const QString& panId, const QMap<QString
 {
     // Delegate to the specific PanadapterModel, not just the active one
     auto* pan = m_panadapters.value(panId, nullptr);
+    const bool panMatchedById = pan != nullptr;
     if (!pan) pan = activePanadapter();  // fallback
     const float previousMinDbm = pan ? pan->minDbm() : 0.0f;
     const float previousMaxDbm = pan ? pan->maxDbm() : 0.0f;
@@ -5080,9 +5865,14 @@ void RadioModel::handlePanadapterStatus(const QString& panId, const QMap<QString
         pan->applyPanStatus(kvs);
     }
 
-    // Keep legacy signals for backward compat (MainWindow still uses these)
-    if (kvs.contains("center") || kvs.contains("bandwidth")) {
-        if (pan) emit panadapterInfoChanged(pan->centerMhz(), pan->bandwidthMhz());
+    // aetherd RFC 2.3: center/bandwidth decode moved to the backend. Driving it
+    // from this choke point (not a live statusReceived observer) means both live
+    // and deferred/replayed status flow through the converted path. The
+    // panCenterBandwidthChanged signal applies to the model + emits the legacy
+    // panadapterInfoChanged (in the ctor-wired handler above).
+    if (m_flexBackend) {
+        m_flexBackend->decodePanCenterBandwidth(panId, kvs);
+        m_flexBackend->decodePanExtensions(panId, kvs);
     }
     if (kvs.contains("min_dbm") || kvs.contains("max_dbm")) {
         const float minDbm = pan ? pan->minDbm() : kvs.value("min_dbm", "-130").toFloat();
@@ -5096,22 +5886,29 @@ void RadioModel::handlePanadapterStatus(const QString& panId, const QMap<QString
         }
         emit panadapterLevelChanged(minDbm, maxDbm);
     }
-    // Track ypixels from radio status — the radio encodes FFT bins as pixel
-    // Y positions (0..ypixels-1), so PanadapterStream needs this for dBm conversion.
-    // Also detect when the radio resets to default dimensions (e.g. after profile
-    // load) and re-request correct dimensions from MainWindow.
-    if (kvs.contains("y_pixels") && pan) {
-        int yPix = kvs["y_pixels"].toInt();
-        if (yPix > kMinUsablePanYpixels) {
+    // Track usable ypixels from radio status — the radio encodes FFT bins as
+    // pixel Y positions (0..ypixels-1), so PanadapterStream needs this for dBm
+    // conversion. Tiny default/reset values are handled below by re-pushing the
+    // real widget dimensions; do not feed them to the decoder or most FFT bins
+    // clamp into a flat floor until the next dimensions echo.
+    if (kvs.contains("y_pixels") && pan && panMatchedById) {
+        const int yPix = kvs["y_pixels"].toInt();
+        if (yPix > kDefaultPanDimensionThreshold) {
+            const bool scaleChanged = pan->setFftYPixels(yPix);
             m_panStream->setYPixels(pan->panStreamId(), yPix);
+            if (scaleChanged) {
+                emit panadapterFftScaleChanged(pan->panId(), yPix);
+            }
         }
     }
-    if ((kvs.contains("x_pixels") || kvs.contains("y_pixels")) && pan) {
-        int xPix = kvs.value("x_pixels", "0").toInt();
-        int yPix = kvs.value("y_pixels", "0").toInt();
+    if ((kvs.contains("x_pixels") || kvs.contains("y_pixels")) && pan && panMatchedById) {
+        const int xPix = kvs.value("x_pixels", "0").toInt();
+        const int yPix = kvs.value("y_pixels", "0").toInt();
         // Radio reset to defaults (profile load, reconnect) — re-push real dimensions
-        if ((xPix > 0 && xPix <= 100) || (yPix > 0 && yPix <= 100))
+        if ((xPix > 0 && xPix <= kDefaultPanDimensionThreshold)
+            || (yPix > 0 && yPix <= kDefaultPanDimensionThreshold)) {
             emit panDimensionsNeeded(pan->panId());
+        }
     }
     if (kvs.contains("ant_list")) {
         const QStringList ants = kvs["ant_list"].split(',', Qt::SkipEmptyParts);
@@ -5148,12 +5945,10 @@ void RadioModel::configurePan(const QString& panId)
     // Do NOT hardcode xpixels/ypixels here — MainWindow knows the real sizes.
     emit panDimensionsNeeded(targetPanId);
 
-    sendCmd(
-        QString("display pan set %1 min_dbm=-130 max_dbm=-40").arg(targetPanId),
-        [](int code, const QString&) {
-            if (code != 0)
-                qCWarning(lcProtocol) << "RadioModel: display pan set dbm failed, code" << Qt::hex << code;
-        });
+    // Do not push a default min_dbm/max_dbm here. configurePan() also runs for
+    // radio-restored pans on startup/profile recall, and the radio owns saved
+    // pan dBm ranges. New user-created pans can still be initialized by the
+    // createPanadapter() response path.
 }
 
 void RadioModel::configureWaterfall(const QString& waterfallId)
@@ -5161,7 +5956,12 @@ void RadioModel::configureWaterfall(const QString& waterfallId)
     const QString targetWaterfallId = RadioStatusOwnership::normalizedFlexId(waterfallId);
     if (targetWaterfallId.isEmpty()) return;
 
-    // Disable automatic black-level and set a fixed threshold.
+    // Initialize with radio auto-black OFF (the client renders the floor from
+    // its own estimate by default). The persisted auto-black on/off and
+    // client-vs-radio source are pushed moments later from the session layer
+    // via setWaterfallAutoBlack()/setWaterfallAutoBlackSource(), which raise
+    // auto_black=1 only when the user has selected radio-side. black_level is
+    // the manual fallback; color_gain is applied client-side via wfHighThresholdRaw.
     // FlexLib uses "display panafall set" addressed to the waterfall stream ID.
     const QString cmd = QString("display panafall set %1 auto_black=0 black_level=15 color_gain=50")
                             .arg(targetWaterfallId);
@@ -5184,6 +5984,11 @@ void RadioModel::configureWaterfall(const QString& waterfallId)
             qCDebug(lcProtocol) << "RadioModel: waterfall configured (auto_black=0 black_level=15 color_gain=50)";
         }
     });
+}
+
+bool RadioModel::profileLoadRadioStateWritesHeld() const
+{
+    return QDateTime::currentMSecsSinceEpoch() < m_profileLoadRadioStateWriteHoldUntilMs;
 }
 
 void RadioModel::ensureDefaultSlicePreferringRestoredPan()

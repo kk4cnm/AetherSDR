@@ -3,8 +3,17 @@
 #include "core/AudioEngine.h"
 #include "core/AppSettings.h"
 #include "core/DaxTxPolicy.h"
+#include "core/TxKeyingMarker.h"
 #include "core/LogManager.h"
+#include "core/MaidenheadLocator.h"
 #include "core/ThemeManager.h"
+#include "core/aprs/AprsBeacon.h"
+#include "core/aprs/AprsMessenger.h"
+#include "core/aprs/AprsPacket.h"
+#include "core/aprs/AprsSettings.h"
+#include "core/aprs/AprsStationList.h"
+#include "gui/AprsMessagesDialog.h"
+#include "gui/AprsSymbolIcons.h"
 #include "core/tnc/Ax25.h"
 #include "core/tnc/Ax25FrameFormatter.h"
 #include "core/tnc/HeardList.h"
@@ -27,18 +36,27 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QDir>
+#include <QDoubleValidator>
 #include <QFile>
 #include <QFileInfo>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
+#include <QHeaderView>
+#include <QHideEvent>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QList>
 #include <QMenu>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QResizeEvent>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QScrollBar>
@@ -46,6 +64,11 @@
 #include <QSizePolicy>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStyle>
+#include <QTableWidget>
+#include <QTimeZone>
+#include <QToolButton>
+#include <QUrl>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QTextCursor>
@@ -63,8 +86,8 @@ namespace AetherSDR {
 
 namespace {
 
-constexpr auto kPacketDecoderProfileSetting = "Ax25PacketDecoderProfile";
-constexpr auto kPacketDecoderDebugSetting = "Ax25PacketDecoderDiagnosticsDebug";
+constexpr auto kPacketDecoderProfileSetting  = "Ax25PacketDecoderProfile";
+constexpr auto kPacketDecoderDebugSetting    = "Ax25PacketDecoderDiagnosticsDebug";
 // TNC settings live as nested JSON under "AetherModemKissTnc" — see
 // TncSettings class in the header. Legacy flat-key migration in
 // TncSettings::migrateLegacy() is run from MainWindow at startup.
@@ -218,11 +241,12 @@ QPushButton:disabled {
     background: #0b1522;
 }
 QPushButton#TabButton {
-    border-radius: 6px;
+    border-radius: 5px;
     border: 1px solid transparent;
     background: transparent;
-    min-height: 40px;
-    font-size: 16px;
+    min-height: 20px;
+    padding: 4px 12px;
+    font-size: 13px;
 }
 QPushButton#TabButton:checked {
     color: #d4deea;
@@ -283,6 +307,43 @@ QLabel#ExperimentalBanner {
     padding: 8px 12px;
     font-size: 13px;
 }
+QTableWidget {
+    color: #c2ccdb;
+    background: #050b13;
+    alternate-background-color: #081220;
+    border: none;
+    gridline-color: #14202f;
+    font-family: "SF Mono", "Menlo", "Consolas", monospace;
+    font-size: 13px;
+    selection-background-color: #1b3650;
+}
+QTableWidget::item {
+    padding: 2px 10px;
+}
+QHeaderView::section {
+    color: #8d99ad;
+    background: #0d1825;
+    border: none;
+    border-bottom: 1px solid #233246;
+    padding: 5px 8px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QTableCornerButton::section {
+    background: #0d1825;
+    border: none;
+}
+QSpinBox {
+    color: #c4cedd;
+    background: #0b1625;
+    border: 1px solid #26374e;
+    border-radius: 5px;
+    padding: 6px 8px;
+}
+QPushButton#EnvelopeButton[hasUnread="true"] {
+    color: #80ed91;
+    border-color: #54c768;
+}
 )";
 
 QString profileSettingsValue(Ax25ModemProfile profile)
@@ -326,14 +387,6 @@ QPushButton* tabButton(const QString& text, bool active, QWidget* parent)
     button->setChecked(active);
     button->setEnabled(active);
     button->setFlat(true);
-    return button;
-}
-
-QPushButton* disabledActionButton(const QString& text, QWidget* parent)
-{
-    auto* button = new QPushButton(text, parent);
-    button->setEnabled(false);
-    button->setMinimumHeight(48);
     return button;
 }
 
@@ -499,16 +552,24 @@ void TncSettings::migrateLegacy()
 
 class PacketActivityWidget final : public QWidget {
 public:
+    // An EKG-style sweep trace, in the spirit of a hospital heart monitor:
+    // a cursor sweeps continuously across the strip and every decoded frame
+    // draws a sharp QRS-like spike in green. HDLC candidates that failed the
+    // FCS draw smaller amber bumps, and an open receive gate (signal above
+    // squelch) lifts and slightly agitates the baseline. The trail fades with
+    // age, so the strip reads as "the last few seconds of the channel" — at
+    // typical APRS rates of 1-3 packets/s each packet is an individually
+    // countable heartbeat, where the old per-second bar graph mushed them
+    // into near-identical columns.
     explicit PacketActivityWidget(QWidget* parent = nullptr)
         : QWidget(parent)
-        , m_levels(68)
     {
-        setMinimumHeight(56);
         setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
         setCursor(Qt::PointingHandCursor);
         updateToolTip();
-        for (int i = 0; i < m_levels.size(); ++i)
-            m_levels[i] = 6 + ((i * 7) % 8);
+        m_sweep.setInterval(kFrameMs);
+        connect(&m_sweep, &QTimer::timeout, this, [this] { advanceSweep(); });
+        resizeBuffers(220);
     }
 
     void setDebugEnabled(bool enabled)
@@ -525,37 +586,38 @@ public:
         m_clickHandler = std::move(handler);
     }
 
-    // Bar levels are pixel heights against the (taller) usable height; values
-    // are scaled so even one or two packets/sec produce a clearly visible spike
-    // rather than sitting on the floor.
+    // One accepted (FCS-good) frame: queue a QRS complex for the pen to draw
+    // as the cursor sweeps over the next ~quarter second.
     void recordFrame()
     {
-        m_cursor = (m_cursor + 9) % m_levels.size();
-        m_levels[m_cursor] = 46;
-        if (m_cursor + 3 < m_levels.size())
-            m_levels[m_cursor + 3] = 28;
-        update();
+        // P bump, Q dip, tall R, S undershoot, T recovery.
+        static constexpr float kQrs[] = {
+            0.10f, 0.16f, 0.10f, -0.10f, 0.55f, 1.00f, 0.45f,
+            -0.30f, -0.12f, 0.08f, 0.20f, 0.16f, 0.06f,
+        };
+        enqueue(kQrs, int(sizeof(kQrs) / sizeof(kQrs[0])), SampleKind::Decode);
+        wake();
     }
 
+    // Once-per-second channel health from the decoder diagnostics.
     void tick(int hdlcCandidates, int acceptedFrames, bool receiveGateOpen)
     {
-        if (m_levels.isEmpty())
-            return;
-
-        m_cursor = (m_cursor + 1) % m_levels.size();
-        int level = receiveGateOpen ? 16 : 6;
-        if (hdlcCandidates > 0)
-            level = std::max(level, 16 + std::min(28, hdlcCandidates * 5));
-        if (acceptedFrames > 0)
-            level = 46;
-        m_levels[m_cursor] = level;
-        update();
+        m_gateOpen = receiveGateOpen;
+        m_lastTick.restart();
+        // Accepted frames already spiked via recordFrame(); what's left here
+        // is candidates that never passed the FCS — the "almost" bumps.
+        static constexpr float kBump[] = { 0.12f, 0.30f, 0.45f, 0.30f, 0.12f };
+        const int failed = qMin(3, qMax(0, hdlcCandidates - acceptedFrames));
+        for (int i = 0; i < failed; ++i)
+            enqueue(kBump, int(sizeof(kBump) / sizeof(kBump[0])), SampleKind::Candidate);
+        wake();
     }
 
     void reset()
     {
-        for (int i = 0; i < m_levels.size(); ++i)
-            m_levels[i] = 6 + ((i * 5) % 7);
+        m_pending.clear();
+        std::fill(m_values.begin(), m_values.end(), 0.0f);
+        std::fill(m_kinds.begin(), m_kinds.end(), quint8(SampleKind::Idle));
         m_cursor = 0;
         update();
     }
@@ -571,48 +633,164 @@ protected:
         QWidget::mousePressEvent(event);
     }
 
+    void resizeEvent(QResizeEvent* event) override
+    {
+        QWidget::resizeEvent(event);
+        resizeBuffers(width());
+    }
+
+    void hideEvent(QHideEvent* event) override
+    {
+        m_sweep.stop();
+        QWidget::hideEvent(event);
+    }
+
     void paintEvent(QPaintEvent*) override
     {
         QPainter painter(this);
-        painter.setRenderHint(QPainter::Antialiasing, false);
-        painter.fillRect(rect(), QColor(0, 0, 0, 0));
+        const QRectF frame = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
 
-        const int count = m_levels.size();
-        if (count <= 0)
+        // Scope bed: near-black panel with a faint phosphor baseline.
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(QPen(QColor(0x23, 0x32, 0x46), 1));
+        painter.setBrush(QColor(0x03, 0x08, 0x0e));
+        painter.drawRoundedRect(frame, 4, 4);
+
+        const int n = m_values.size();
+        if (n < 8)
             return;
+        const float base = height() - 6.0f;
+        const float usable = height() - 10.0f;
+        auto yFor = [&](float v) {
+            return qBound(2.0f, base - v * usable, float(height() - 2));
+        };
 
-        const int gap = 3;
-        const int barWidth = qMax(2, (width() - gap * (count - 1)) / count);
-        const int usableHeight = qMax(1, height() - 8);
-        const int base = height() - 4;
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(m_debugEnabled ? QColor(210, 164, 72) : QColor(95, 206, 102));
-
-        for (int i = 0; i < count; ++i) {
-            const int level = qBound(2, m_levels[i], usableHeight);
-            const int x = i * (barWidth + gap);
-            painter.drawRect(QRect(x, base - level, barWidth, level));
-            if (m_levels[i] > 5)
-                --m_levels[i];
+        painter.setClipRect(frame);
+        // The trace, oldest-to-newest behind the cursor, alpha fading with
+        // age like phosphor afterglow. A short blank gap rides ahead of the
+        // cursor, as on a real monitor.
+        constexpr int kGapPx = 12;
+        for (int age = n - kGapPx; age >= 1; --age) {
+            const int i1 = (m_cursor - age + 1 + n) % n;
+            const int i0 = (i1 - 1 + n) % n;
+            const float fade = 1.0f - float(age) / float(n);
+            const int alpha = int(40 + 215 * fade * fade);
+            QColor color;
+            switch (SampleKind(m_kinds[i1])) {
+            case SampleKind::Decode:    color = QColor(0x80, 0xed, 0x91); break;
+            case SampleKind::Candidate: color = QColor(0xd2, 0xa4, 0x48); break;
+            case SampleKind::Idle:
+            default:
+                color = m_gateOpen ? QColor(0x4d, 0x86, 0xa8)
+                                   : QColor(0x35, 0x4a, 0x63);
+                break;
+            }
+            color.setAlpha(alpha);
+            painter.setPen(QPen(color, SampleKind(m_kinds[i1]) == SampleKind::Idle
+                                    ? 1.0 : 1.6));
+            painter.drawLine(QPointF(i0, yFor(m_values[i0])),
+                             QPointF(i1, yFor(m_values[i1])));
         }
+
+        // Cursor head: a bright dot with a soft glow.
+        const QPointF head(m_cursor, yFor(m_values[m_cursor]));
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(0x80, 0xed, 0x91, 70));
+        painter.drawEllipse(head, 4.0, 4.0);
+        painter.setBrush(QColor(0xd6, 0xff, 0xdd));
+        painter.drawEllipse(head, 1.6, 1.6);
+        painter.setClipping(false);
 
         if (m_debugEnabled) {
             painter.setBrush(Qt::NoBrush);
             painter.setPen(QPen(QColor(210, 164, 72), 1));
-            painter.drawRect(rect().adjusted(0, 0, -1, -1));
+            painter.drawRoundedRect(frame, 4, 4);
         }
     }
 
 private:
+    enum class SampleKind : quint8 { Idle = 0, Candidate = 1, Decode = 2 };
+
+    static constexpr int kFrameMs = 33;     // ~30 fps sweep animation
+    static constexpr int kPxPerFrame = 2;   // ~60 px/s; a 220 px strip ≈ 3.6 s
+
+    void resizeBuffers(int w)
+    {
+        const int n = qBound(60, w, 2000);
+        if (n == m_values.size())
+            return;
+        m_values = QVector<float>(n, 0.0f);
+        m_kinds = QVector<quint8>(n, quint8(SampleKind::Idle));
+        m_cursor = qMin(m_cursor, n - 1);
+    }
+
+    void enqueue(const float* shape, int count, SampleKind kind)
+    {
+        // Bound the backlog so a burst can't lag the pen seconds behind
+        // real time; newest data wins, matching the TX queue philosophy.
+        if (m_pending.size() > 96)
+            m_pending.clear();
+        for (int i = 0; i < count; ++i)
+            m_pending.append({ shape[i], quint8(kind) });
+    }
+
+    void wake()
+    {
+        if (!m_sweep.isActive() && isVisible())
+            m_sweep.start();
+    }
+
+    void advanceSweep()
+    {
+        const int n = m_values.size();
+        if (n <= 0)
+            return;
+        for (int step = 0; step < kPxPerFrame; ++step) {
+            m_cursor = (m_cursor + 1) % n;
+            if (!m_pending.isEmpty()) {
+                const PendingSample s = m_pending.takeFirst();
+                m_values[m_cursor] = s.value;
+                m_kinds[m_cursor] = s.kind;
+            } else {
+                // Idle pen: flat when squelched, a restless 1-2 px shimmer
+                // while the receive gate is open ("there is RF here").
+                const float wiggle = m_gateOpen
+                    ? 0.05f + 0.04f * float((m_cursor * 7) % 3)
+                    : 0.0f;
+                m_values[m_cursor] = wiggle;
+                m_kinds[m_cursor] = quint8(SampleKind::Idle);
+            }
+        }
+        // Freeze the trace (and stop repainting) once the modem stops
+        // delivering diagnostics and the backlog has drained.
+        if (m_pending.isEmpty() && m_lastTick.isValid()
+            && m_lastTick.elapsed() > 3000)
+            m_sweep.stop();
+        update();
+    }
+
     void updateToolTip()
     {
         setToolTip(m_debugEnabled
-            ? QStringLiteral("Packet diagnostics debug is on. Click to turn it off.")
-            : QStringLiteral("Packet diagnostics debug is off. Click to turn it on."));
+            ? QStringLiteral("Packet activity debug is on: raw decode log, AX.25 TX "
+                             "row and diagnostics are shown. Click to turn it off.")
+            : QStringLiteral("Each green heartbeat is a decoded packet; amber bumps "
+                             "are frames that failed the FCS. Click to show the raw "
+                             "decode log, AX.25 TX row and diagnostics."));
     }
 
-    QVector<int> m_levels;
+    struct PendingSample {
+        float value;
+        quint8 kind;
+    };
+
+    QVector<float> m_values;
+    QVector<quint8> m_kinds;
+    QList<PendingSample> m_pending;
+    QTimer m_sweep;
+    QElapsedTimer m_lastTick;
     int m_cursor{0};
+    bool m_gateOpen{false};
     bool m_debugEnabled{false};
     std::function<void()> m_clickHandler;
 };
@@ -638,16 +816,25 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     m_heard = new HeardList(this);
     m_terminal = new TncTerminal(this);
     m_pms = new PmsMailbox(this);
+    m_aprsStations = new AprsStationList(this);
+    m_aprsMessenger = new AprsMessenger(this);
+    m_aprsBeacon = new AprsBeacon(this);
 
     // The TNC store lives next to the app settings (heard log + session logs).
     const QString tncDir =
         QFileInfo(AppSettings::instance().filePath()).absolutePath()
         + QStringLiteral("/tnc");
     m_heard->setPersistencePath(tncDir + QStringLiteral("/heard.json"));
+    m_aprsStations->setPersistencePath(tncDir + QStringLiteral("/aprs-stations.json"));
+    m_aprsMessenger->setPersistencePath(tncDir + QStringLiteral("/aprs-messages.json"));
     m_terminal->setHeardList(m_heard);
     m_terminal->setLogDirectory(tncDir + QStringLiteral("/logs"));
     m_heartbeatTimer = new QTimer(this);
     m_heartbeatTimer->setInterval(1000);
+    // Free-running (not gated on the modem): updateHeartbeat() also ticks the
+    // APRS station-table ages, which must stay honest while the modem is off.
+    // The modem-health portion of the heartbeat early-outs when disabled.
+    m_heartbeatTimer->start();
     m_txPaceTimer = new QTimer(this);
     m_txPaceTimer->setInterval(kTxChunkMs);
     bodyWidget()->setStyleSheet(QString::fromLatin1(kAetherModemStyle));
@@ -659,7 +846,7 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     auto* tabs = new QHBoxLayout(tabsFrame);
     tabs->setContentsMargins(0, 0, 0, 0);
     tabs->setSpacing(0);
-    m_ax25Tab = tabButton(QStringLiteral("AX.25"), true, tabsFrame);
+    m_ax25Tab = tabButton(QStringLiteral("APRS"), true, tabsFrame);
     m_kissTab = tabButton(QStringLiteral("KISS TNC"), false, tabsFrame);
     m_terminalTab = tabButton(QStringLiteral("Terminal"), false, tabsFrame);
     m_mailboxTab = tabButton(QStringLiteral("Mailbox"), false, tabsFrame);
@@ -685,8 +872,9 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     connect(m_tabStack, &QStackedWidget::currentChanged,
             this, &Ax25HfPacketDecodeDialog::updateTabChrome);
 
-    // AX.25 page: modem config + transmit. The log and status row below the
-    // stack are shared by both tabs.
+    // APRS page: modem config, beacon/messaging controls, and the station
+    // table. The raw decode log and status row below the stack are shared by
+    // all tabs.
     auto* ax25Page = new QWidget(m_tabStack);
     auto* ax25PageLayout = new QVBoxLayout(ax25Page);
     ax25PageLayout->setContentsMargins(0, 0, 0, 0);
@@ -695,13 +883,13 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
 
     auto* controlsFrame = panel(QStringLiteral("ControlsFrame"), ax25Page);
     auto* controls = new QHBoxLayout(controlsFrame);
-    controls->setContentsMargins(16, 14, 16, 14);
+    controls->setContentsMargins(16, 10, 16, 10);
     controls->setSpacing(20);
 
     auto* baudCell = panel(QStringLiteral("ControlCell"), controlsFrame);
     auto* baudLayout = new QVBoxLayout(baudCell);
     baudLayout->setContentsMargins(0, 0, 20, 0);
-    baudLayout->setSpacing(12);
+    baudLayout->setSpacing(8);
     baudLayout->addWidget(sectionLabel(QStringLiteral("BAUD RATE"), baudCell));
     auto* baudButtons = new QHBoxLayout;
     baudButtons->setSpacing(34);
@@ -716,11 +904,20 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     auto* modemCell = panel(QStringLiteral("ControlCell"), controlsFrame);
     auto* modemLayout = new QVBoxLayout(modemCell);
     modemLayout->setContentsMargins(0, 0, 20, 0);
-    modemLayout->setSpacing(12);
+    modemLayout->setSpacing(8);
     modemLayout->addWidget(sectionLabel(QStringLiteral("MODEM"), modemCell));
+    auto* modemChecks = new QHBoxLayout;
+    modemChecks->setSpacing(20);
     m_enableDecode = new QCheckBox(QStringLiteral("Enable Modem"), modemCell);
-    modemLayout->addWidget(m_enableDecode);
-    controls->addWidget(modemCell, 1);
+    modemChecks->addWidget(m_enableDecode);
+    m_modemAutostart = new QCheckBox(QStringLiteral("Autostart at launch"), modemCell);
+    m_modemAutostart->setToolTip(QStringLiteral(
+        "Enable the modem automatically when AetherSDR starts."));
+    m_modemAutostart->setChecked(AprsSettings::modemAutostart());
+    modemChecks->addWidget(m_modemAutostart);
+    modemChecks->addStretch(1);
+    modemLayout->addLayout(modemChecks);
+    controls->addWidget(modemCell, 2);
     controls->addStretch(2);
 
     m_captureButton = new QPushButton(QStringLiteral("Capture 3m"), controlsFrame);
@@ -733,6 +930,7 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     ax25PageLayout->addWidget(controlsFrame);
 
     auto* txFrame = panel(QStringLiteral("ControlsFrame"), ax25Page);
+    m_txFrame = txFrame;
     auto* txLayout = new QHBoxLayout(txFrame);
     txLayout->setContentsMargins(16, 12, 16, 12);
     txLayout->setSpacing(12);
@@ -742,10 +940,14 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     m_txText->setPlaceholderText(QStringLiteral("hello world  or  N0CALL-1>APRS,WIDE1-1:hello world"));
     txLayout->addWidget(m_txText, 1);
     m_txButton = new QPushButton(QStringLiteral("Transmit"), txFrame);
+    markTxKeying(m_txButton);   // transmits an AX.25 packet → keys TX (#3646)
     m_txButton->setMinimumHeight(42);
     txLayout->addWidget(m_txButton);
+
+    // APRS client controls (beacon, messaging, station table) — the raw
+    // UI-frame transmit row rides along at the bottom of the page.
+    buildAprsUi(ax25Page, ax25PageLayout);
     ax25PageLayout->addWidget(txFrame);
-    ax25PageLayout->addStretch(1);
 
     // KISS TNC page (built lazily into the same stack).
     m_tabStack->addWidget(buildKissTncPage());
@@ -767,33 +969,6 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     m_log->setPlaceholderText(QStringLiteral("Decoded AX.25 UI frames will appear here."));
     logLayout->addWidget(m_log);
     root->addWidget(logFrame, 1);
-
-    auto* actionRowFrame = new QWidget(bodyWidget());
-    m_actionRowFrame = actionRowFrame;
-    auto* actionRow = new QHBoxLayout(actionRowFrame);
-    actionRow->setContentsMargins(0, 0, 0, 0);
-    actionRow->setSpacing(8);
-    actionRow->addWidget(disabledActionButton(QStringLiteral("Send SMS"), actionRowFrame), 1);
-    actionRow->addWidget(disabledActionButton(QStringLiteral("Send APRS Msg..."), actionRowFrame), 1);
-    auto* positionFrame = panel(QStringLiteral("ActionFrame"), actionRowFrame);
-    auto* positionLayout = new QHBoxLayout(positionFrame);
-    positionLayout->setContentsMargins(18, 8, 18, 8);
-    positionLayout->setSpacing(12);
-    auto* positionButton = new QPushButton(QStringLiteral("Send APRS Position"), positionFrame);
-    positionButton->setEnabled(false);
-    positionButton->setFlat(true);
-    positionLayout->addWidget(positionButton, 1);
-    auto* intervalLabel = new QLabel(QStringLiteral("Interval:"), positionFrame);
-    intervalLabel->setObjectName(QStringLiteral("StatusValue"));
-    positionLayout->addWidget(intervalLabel);
-    auto* interval = new QComboBox(positionFrame);
-    interval->addItems({QStringLiteral("5 min"), QStringLiteral("10 min"), QStringLiteral("30 min")});
-    interval->setEnabled(false);
-    positionLayout->addWidget(interval);
-    actionRow->addWidget(positionFrame, 2);
-    actionRow->addWidget(disabledActionButton(QStringLiteral("Connect BBS"), actionRowFrame), 1);
-    root->addWidget(actionRowFrame);
-    actionRowFrame->setVisible(false);
 
     // Slim status bar: MODEM STATUS, GAIN STAGE and PACKET ACTIVITY inline in a
     // single thin strip rather than three tall stacked panels.
@@ -835,7 +1010,9 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     m_packetActivity = new PacketActivityWidget(statusBar);
     m_packetActivity->setMinimumHeight(18);
     m_packetActivity->setMaximumHeight(20);
-    m_packetActivity->setMinimumWidth(180);
+    // The EKG sweep is the main at-a-glance channel indicator now that the
+    // raw log hides behind the debug toggle — give it a wide strip.
+    m_packetActivity->setMinimumWidth(300);
     m_packetActivity->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
     m_packetActivity->setClickHandler([this] {
         setDiagnosticsDebugEnabled(!m_diagnosticsDebugEnabled, true);
@@ -862,6 +1039,9 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
     });
     connect(m_enableDecode, &QCheckBox::toggled,
             this, &Ax25HfPacketDecodeDialog::setDecodeEnabled);
+    connect(m_modemAutostart, &QCheckBox::toggled, this, [](bool on) {
+        AprsSettings::setModemAutostart(on);
+    });
     connect(m_clearButton, &QPushButton::clicked, this, [this] {
         m_log->clear();
         m_frameCount = 0;
@@ -888,6 +1068,10 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
             this, &Ax25HfPacketDecodeDialog::paceTransmitAudio);
     connect(m_shim, &AetherAx25LibmodemShim::frameDecoded,
             this, &Ax25HfPacketDecodeDialog::appendFrame);
+#ifdef HAVE_MQTT
+    connect(m_shim, &AetherAx25LibmodemShim::frameDecoded,
+            this, &Ax25HfPacketDecodeDialog::publishFrameMqtt);
+#endif
     // RX -> KISS clients: forward every decoded frame to connected hosts.
     connect(m_shim, &AetherAx25LibmodemShim::frameDecoded, this,
             [this](const Ax25DecodedFrame& frame) {
@@ -903,10 +1087,17 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
             [this](const Ax25DecodedFrame& frame) {
         if (frame.ax25FrameNoFcs.isEmpty())
             return;
-        // Record into the shared heard log once (drives MHEARD + quick-connect).
-        if (m_heard) {
-            if (auto decoded = ax25::Frame::decode(frame.ax25FrameNoFcs))
+        // Record into the shared heard log once (drives MHEARD + quick-connect),
+        // then through the APRS parser into the station roster + messenger.
+        if (auto decoded = ax25::Frame::decode(frame.ax25FrameNoFcs)) {
+            if (m_heard)
                 m_heard->record(*decoded);
+            if (auto packet = aprs::parseFrame(*decoded)) {
+                if (m_aprsStations)
+                    m_aprsStations->record(*packet);
+                if (m_aprsMessenger)
+                    m_aprsMessenger->onPacket(*packet);
+            }
         }
         if (m_pms)
             m_pms->onAirFrame(frame.ax25FrameNoFcs);
@@ -996,6 +1187,36 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
         applyPmsConfigFromUi(true);
     });
 
+    // APRS client wiring: beacon + messenger share the one-at-a-time modem
+    // keying/pacing path with the KISS server, PMS, and terminal.
+    auto enqueueAprsTx = [this](const QByteArray& raw) {
+        if (raw.isEmpty() || !m_audio || !m_radio)
+            return;
+        if (m_enableDecode && !m_enableDecode->isChecked()) {
+            appendSystemLine(QStringLiteral("Enabling the modem for APRS transmit."));
+            m_enableDecode->setChecked(true);
+        }
+        m_kissTxQueue.enqueue(raw);
+        maybeStartNextKissTx();
+    };
+    connect(m_aprsBeacon, &AprsBeacon::transmitFrame, this, enqueueAprsTx);
+    connect(m_aprsMessenger, &AprsMessenger::transmitFrame, this, enqueueAprsTx);
+    connect(m_aprsBeacon, &AprsBeacon::activity,
+            this, &Ax25HfPacketDecodeDialog::appendSystemLine);
+    connect(m_aprsMessenger, &AprsMessenger::activity,
+            this, &Ax25HfPacketDecodeDialog::appendSystemLine);
+    connect(m_aprsMessenger, &AprsMessenger::unreadCountChanged,
+            this, [this](int) { updateAprsEnvelopeButton(); });
+    connect(m_aprsStations, &AprsStationList::changed,
+            this, &Ax25HfPacketDecodeDialog::refreshAprsStationTable);
+    if (m_radio) {
+        connect(m_radio, &RadioModel::gpsStatusChanged, this,
+                [this](const QString&, int, int, const QString&, const QString&,
+                       const QString&, const QString&, const QString&) {
+            handleGpsUpdate();
+        });
+    }
+
     // TNC Terminal wiring.
     connect(m_terminal, &TncTerminal::transmitFrame, this, [this](const QByteArray& raw) {
         if (raw.isEmpty() || !m_audio || !m_radio)
@@ -1060,6 +1281,24 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
         m_terminalLogEnable->setChecked(true); // fires the toggled handler
     refreshTerminalStatus();
     refreshTerminalHeardCombo();
+
+    // Restore APRS client state. Config is pushed into the beacon/messenger
+    // without persisting (it just came FROM settings); the beacon enable
+    // checkbox fires its toggled handler, which arms the interval timer but
+    // never transmits by itself — the first on-air beacon needs the operator
+    // (Beacon Now) or the timer.
+    applyAprsConfigFromUi(false);
+    if (AprsSettings::beaconEnabled() && m_aprsBeaconEnable)
+        m_aprsBeaconEnable->setChecked(true);
+    handleGpsUpdate();
+    refreshAprsStationTable();
+    updateAprsEnvelopeButton();
+
+    // Modem autostart: fires the toggled handler, which starts the RX tap.
+    // MainWindow constructs this dialog (hidden) at app launch when the
+    // setting is on, same as the KISS TNC start-on-startup path.
+    if (AprsSettings::modemAutostart() && m_enableDecode)
+        m_enableDecode->setChecked(true);
 
     // No control button may be the dialog's default button — otherwise pressing
     // Return in a text field would trigger it (Connect, Transmit, ...). Combined
@@ -1130,7 +1369,6 @@ void Ax25HfPacketDecodeDialog::setAttachedSlice(SliceModel* slice)
 
 void Ax25HfPacketDecodeDialog::setModemProfile(Ax25ModemProfile profile, bool persist)
 {
-    // Tone polarity is always Normal for the supported HF DIGU / VHF FM paths.
     m_shimConfig = ax25DemodConfigForProfile(profile, Ax25TonePolarity::Normal);
     QMetaObject::invokeMethod(m_shim, [shim = m_shim, cfg = m_shimConfig]() {
         shim->configure(cfg);
@@ -1162,7 +1400,6 @@ void Ax25HfPacketDecodeDialog::setDecodeEnabled(bool enabled)
             m_audio->setTncRxTapEnabled(true);
         appendSystemLine(QStringLiteral(
             "Modem enabled. RX tap requested; waiting for 24 kHz PC RX audio."));
-        m_heartbeatTimer->start();
     } else {
         if (m_captureActive)
             finishAudioCapture(false);
@@ -1173,7 +1410,6 @@ void Ax25HfPacketDecodeDialog::setDecodeEnabled(bool enabled)
         m_lastDiagnosticsUtc = {};
         m_lastActivityHdlc = 0;
         m_lastActivityAccepted = 0;
-        m_heartbeatTimer->stop();
         appendSystemLine(QStringLiteral("Modem disabled. RX tap stopped."));
     }
     refreshStatus();
@@ -1385,6 +1621,7 @@ void Ax25HfPacketDecodeDialog::handleMqttMessage(const QString& topic, const QBy
     startTransmit(QString::fromUtf8(payload).trimmed());
 }
 #endif
+
 
 void Ax25HfPacketDecodeDialog::beginTransmitWhenReady()
 {
@@ -1632,9 +1869,6 @@ void Ax25HfPacketDecodeDialog::appendFrame(const Ax25DecodedFrame& frame)
     m_log->verticalScrollBar()->setValue(m_log->verticalScrollBar()->maximum());
     if (m_packetActivity)
         m_packetActivity->recordFrame();
-#ifdef HAVE_MQTT
-    publishFrameMqtt(frame);
-#endif
     refreshStatus();
 }
 
@@ -1655,6 +1889,11 @@ void Ax25HfPacketDecodeDialog::updateDiagnostics(const Ax25DecoderDiagnostics& d
 
 void Ax25HfPacketDecodeDialog::updateHeartbeat()
 {
+    // Station-table ages tick whether or not the modem is running — the
+    // roster persists across sessions and "how stale is this row" should
+    // stay honest while the modem is idle.
+    refreshAprsStationAges();
+
     if (!m_enableDecode || !m_enableDecode->isChecked())
         return;
 
@@ -1813,6 +2052,15 @@ void Ax25HfPacketDecodeDialog::setDiagnosticsDebugEnabled(bool enabled, bool per
             ? QStringLiteral("PACKET ACTIVITY DEBUG")
             : QStringLiteral("PACKET ACTIVITY"));
     }
+    // The raw decode log, raw AX.25 TX row, and the capture/clear-log
+    // buttons on the APRS tab are all diagnostics chrome — they follow the
+    // debug flag. Refresh so they appear/disappear immediately.
+    if (m_captureButton)
+        m_captureButton->setVisible(enabled);
+    if (m_clearButton)
+        m_clearButton->setVisible(enabled);
+    if (m_tabStack)
+        updateTabChrome(m_tabStack->currentIndex());
 
     if (persist) {
         AppSettings::instance().setValue(kPacketDecoderDebugSetting, enabled);
@@ -2361,6 +2609,7 @@ QWidget* Ax25HfPacketDecodeDialog::buildTerminalPage()
     m_terminalInput->installEventFilter(this); // Up/Down command history
     inputRow->addWidget(m_terminalInput, 1);
     m_terminalSendButton = new QPushButton(QStringLiteral("Send"), inputFrame);
+    markTxKeying(m_terminalSendButton);   // sends a packet → keys TX; "Send" matches no keyword (#3646 review)
     m_terminalSendButton->setMinimumHeight(36);
     inputRow->addWidget(m_terminalSendButton);
     layout->addWidget(inputFrame);
@@ -2544,19 +2793,834 @@ void Ax25HfPacketDecodeDialog::refreshTerminalStatus()
 void Ax25HfPacketDecodeDialog::updateTabChrome(int index)
 {
     // The Terminal tab (stack index 2) wants the whole window: hide the shared
-    // decode-log panel and the placeholder action row, and give the tab stack the
-    // vertical stretch so the transcript fills the viewport. Other tabs keep the
-    // log panel below their controls.
+    // decode-log panel and give the tab stack the vertical stretch so the
+    // transcript fills the viewport. On the APRS tab (index 0) the raw decode
+    // log and the raw AX.25 TX row are debug chrome — shown only while Packet
+    // Activity Debug is on (click the activity trace to toggle), so the
+    // station table gets the full viewport in normal operation. Other tabs
+    // keep the log panel below their controls.
     const bool terminal = (index == 2);
+    const bool aprs = (index == 0);
+    const bool logVisible = !terminal && (!aprs || m_diagnosticsDebugEnabled);
     if (m_logFrame)
-        m_logFrame->setVisible(!terminal);
-    if (m_actionRowFrame)
-        m_actionRowFrame->setVisible(!terminal);
+        m_logFrame->setVisible(logVisible);
+    if (m_txFrame)
+        m_txFrame->setVisible(m_diagnosticsDebugEnabled);
     if (auto* root = qobject_cast<QVBoxLayout*>(bodyWidget()->layout())) {
-        root->setStretchFactor(m_tabStack, terminal ? 1 : 0);
+        root->setStretchFactor(m_tabStack, !logVisible ? 1 : (aprs ? 3 : 0));
         if (m_logFrame)
-            root->setStretchFactor(m_logFrame, terminal ? 0 : 1);
+            root->setStretchFactor(m_logFrame, logVisible ? 1 : 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// APRS client (APRS tab)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Compact "how long ago" for the station table: "42s", "5m", "3h 12m", "2d".
+QString aprsAgeText(const QDateTime& utc)
+{
+    if (!utc.isValid())
+        return QStringLiteral("—");
+    const qint64 secs = qMax<qint64>(0, utc.secsTo(QDateTime::currentDateTimeUtc()));
+    if (secs < 60)
+        return QStringLiteral("%1s").arg(secs);
+    if (secs < 3600)
+        return QStringLiteral("%1m").arg(secs / 60);
+    if (secs < 86400)
+        return QStringLiteral("%1h %2m").arg(secs / 3600).arg((secs % 3600) / 60);
+    return QStringLiteral("%1d").arg(secs / 86400);
+}
+
+// Station-table column order. TIME is the operator's wall clock (local),
+// AGE keeps ticking so staleness is visible without doing date math.
+enum AprsColumn {
+    kColTime = 0,
+    kColCall,
+    kColSymbol,
+    kColAge,
+    kColPackets,
+    kColGrid,
+    kColDist,
+    kColCrsSpd,
+    kColText,
+    kColCount,
+};
+
+// Item data roles for the station table. Qt::UserRole carries the payload
+// the rest of the dialog reads (callsign / lastHeard msecs); the rest are
+// internal to sorting, age-fading, and icon refresh.
+constexpr int kAprsSortRole = Qt::UserRole + 1; // numeric sort key (double)
+constexpr int kAprsFadeRole = Qt::UserRole + 2; // last applied fade step
+constexpr int kAprsSymRole = Qt::UserRole + 3;  // "S:<table><code>" or "W:<n>"
+
+// QTableWidgetItem sorts by display text; give numeric columns (time, age,
+// packets, distance, speed) a real sort key instead.
+class AprsSortItem final : public QTableWidgetItem {
+public:
+    using QTableWidgetItem::QTableWidgetItem;
+    bool operator<(const QTableWidgetItem& other) const override
+    {
+        const QVariant a = data(kAprsSortRole);
+        const QVariant b = other.data(kAprsSortRole);
+        if (a.isValid() && b.isValid())
+            return a.toDouble() < b.toDouble();
+        return QTableWidgetItem::operator<(other);
+    }
+};
+
+// Age-fade: rows at full brightness for 5 minutes, then a linear fade down
+// to 50% at 30 minutes, where they stay. Active stations pop; the roster's
+// overnight tail recedes without disappearing.
+constexpr qint64 kAprsFadeStartSecs = 5 * 60;
+constexpr qint64 kAprsFadeEndSecs = 30 * 60;
+
+void applyAprsRowFade(QTableWidget* table, int row)
+{
+    auto* ageItem = table->item(row, kColAge);
+    if (!ageItem)
+        return;
+    const qint64 secs =
+        (QDateTime::currentMSecsSinceEpoch()
+         - ageItem->data(Qt::UserRole).toLongLong()) / 1000;
+    qreal opacity = 1.0;
+    if (secs >= kAprsFadeEndSecs) {
+        opacity = 0.5;
+    } else if (secs > kAprsFadeStartSecs) {
+        opacity = 1.0 - 0.5 * qreal(secs - kAprsFadeStartSecs)
+                            / qreal(kAprsFadeEndSecs - kAprsFadeStartSecs);
+    }
+    // Quantize to 5% steps so the per-second tick only repaints rows whose
+    // fade bucket actually changed.
+    const int step = qRound(opacity * 20.0);
+    if (ageItem->data(kAprsFadeRole).toInt() == step)
+        return;
+    ageItem->setData(kAprsFadeRole, step);
+
+    QColor text(0xc2, 0xcc, 0xdb);
+    text.setAlphaF(step / 20.0);
+    for (int col = 0; col < kColCount; ++col) {
+        if (auto* item = table->item(row, col))
+            item->setForeground(text);
+    }
+    if (auto* sym = table->item(row, kColSymbol)) {
+        const QString spec = sym->data(kAprsSymRole).toString();
+        QColor stroke(0xae, 0xb9, 0xcc);
+        stroke.setAlphaF(step / 20.0);
+        if (spec.startsWith(QLatin1String("W:"))) {
+            sym->setIcon(aprsicons::weatherIcon(spec.mid(2).toInt(), stroke));
+        } else if (spec.startsWith(QLatin1String("S:")) && spec.size() == 4) {
+            sym->setIcon(aprsicons::symbolIcon(spec.at(2).toLatin1(),
+                                               spec.at(3).toLatin1(), stroke));
+        }
+    }
+}
+
+// The on-air-common symbols offered for our own beacon; data() carries the
+// two-character table+code pair.
+struct AprsSymbolChoice { const char* pair; const char* name; };
+constexpr AprsSymbolChoice kAprsSymbolChoices[] = {
+    { "/-",  "Home" },
+    { "/y",  "Yagi at QTH" },
+    { "/>",  "Car" },
+    { "/j",  "Jeep" },
+    { "/k",  "Truck" },
+    { "/u",  "Truck (18-wheeler)" },
+    { "/v",  "Van" },
+    { "/R",  "RV" },
+    { "/<",  "Motorcycle" },
+    { "/b",  "Bicycle" },
+    { "/[",  "Jogger" },
+    { "/s",  "Power boat" },
+    { "/Y",  "Sailboat" },
+    { "/'",  "Small aircraft" },
+    { "/O",  "Balloon" },
+    { "/r",  "Repeater" },
+    { "/_",  "Weather station" },
+};
+
+} // namespace
+
+void Ax25HfPacketDecodeDialog::buildAprsUi(QWidget* page, QVBoxLayout* pageLayout)
+{
+    // ── Station + beacon configuration ────────────────────────────────────
+    auto* configFrame = panel(QStringLiteral("ControlsFrame"), page);
+    auto* config = new QGridLayout(configFrame);
+    config->setContentsMargins(16, 12, 16, 12);
+    config->setHorizontalSpacing(12);
+    config->setVerticalSpacing(8);
+
+    config->addWidget(sectionLabel(QStringLiteral("MY CALLSIGN"), configFrame), 0, 0);
+    m_aprsMyCall = new QLineEdit(configFrame);
+    m_aprsMyCall->setPlaceholderText(QStringLiteral("N0CALL-9"));
+    m_aprsMyCall->setMaximumWidth(140);
+    m_aprsMyCall->setText(AprsSettings::myCall());
+    config->addWidget(m_aprsMyCall, 1, 0);
+
+    config->addWidget(sectionLabel(QStringLiteral("SYMBOL"), configFrame), 0, 1);
+    m_aprsSymbol = new QComboBox(configFrame);
+    m_aprsSymbol->setIconSize(QSize(16, 16));
+    for (const AprsSymbolChoice& choice : kAprsSymbolChoices) {
+        m_aprsSymbol->addItem(aprsicons::symbolIcon(choice.pair[0], choice.pair[1]),
+                              QString::fromLatin1(choice.name),
+                              QString::fromLatin1(choice.pair));
+    }
+    const int symbolIndex = m_aprsSymbol->findData(AprsSettings::symbol());
+    m_aprsSymbol->setCurrentIndex(qMax(0, symbolIndex));
+    config->addWidget(m_aprsSymbol, 1, 1);
+
+    config->addWidget(sectionLabel(QStringLiteral("PATH"), configFrame), 0, 2);
+    m_aprsPath = new QLineEdit(configFrame);
+    m_aprsPath->setMaximumWidth(180);
+    m_aprsPath->setText(AprsSettings::path());
+    m_aprsPath->setToolTip(QStringLiteral(
+        "Digipeater path for beacons and messages (comma-separated, e.g. WIDE1-1,WIDE2-1)."));
+    config->addWidget(m_aprsPath, 1, 2);
+
+    config->addWidget(sectionLabel(QStringLiteral("BEACON"), configFrame), 0, 3, 1, 4);
+    m_aprsBeaconEnable = new QCheckBox(QStringLiteral("Every"), configFrame);
+    config->addWidget(m_aprsBeaconEnable, 1, 3);
+    m_aprsBeaconInterval = new QSpinBox(configFrame);
+    m_aprsBeaconInterval->setRange(1, 24 * 60);
+    m_aprsBeaconInterval->setSuffix(QStringLiteral(" min"));
+    m_aprsBeaconInterval->setValue(AprsSettings::beaconIntervalMinutes());
+    config->addWidget(m_aprsBeaconInterval, 1, 4);
+    m_aprsBeaconText = new QLineEdit(configFrame);
+    m_aprsBeaconText->setPlaceholderText(QStringLiteral("Beacon status text"));
+    m_aprsBeaconText->setText(AprsSettings::beaconText());
+    config->addWidget(m_aprsBeaconText, 1, 5);
+    m_aprsBeaconNow = new QPushButton(QStringLiteral("Beacon Now"), configFrame);
+    markTxKeying(m_aprsBeaconNow);   // transmits an APRS beacon → keys TX (#3646)
+    config->addWidget(m_aprsBeaconNow, 1, 6);
+    config->setColumnStretch(5, 1);
+
+    // Position source row: GPS readout plus the manual fallback fields.
+    auto* posRow = new QHBoxLayout;
+    posRow->setSpacing(10);
+    posRow->addWidget(sectionLabel(QStringLiteral("POSITION"), configFrame));
+    m_aprsPositionValue = new QLabel(configFrame);
+    m_aprsPositionValue->setObjectName(QStringLiteral("StatusValue"));
+    posRow->addWidget(m_aprsPositionValue, 1);
+    posRow->addWidget(sectionLabel(QStringLiteral("GRID"), configFrame));
+    m_aprsManualGrid = new QLineEdit(configFrame);
+    m_aprsManualGrid->setPlaceholderText(QStringLiteral("JN48Qm"));
+    m_aprsManualGrid->setMaximumWidth(90);
+    m_aprsManualGrid->setToolTip(
+        QStringLiteral("Maidenhead grid locator — fills the LAT/LON fields"));
+    posRow->addWidget(m_aprsManualGrid);
+    posRow->addWidget(sectionLabel(QStringLiteral("MANUAL LAT"), configFrame));
+    m_aprsManualLat = new QLineEdit(configFrame);
+    m_aprsManualLat->setPlaceholderText(QStringLiteral("48.2700"));
+    m_aprsManualLat->setMaximumWidth(110);
+    m_aprsManualLat->setValidator(
+        new QDoubleValidator(-90.0, 90.0, 6, m_aprsManualLat));
+    m_aprsManualLat->setText(AprsSettings::manualLat());
+    posRow->addWidget(m_aprsManualLat);
+    posRow->addWidget(sectionLabel(QStringLiteral("LON"), configFrame));
+    m_aprsManualLon = new QLineEdit(configFrame);
+    m_aprsManualLon->setPlaceholderText(QStringLiteral("-116.5600"));
+    m_aprsManualLon->setMaximumWidth(110);
+    m_aprsManualLon->setValidator(
+        new QDoubleValidator(-180.0, 180.0, 6, m_aprsManualLon));
+    m_aprsManualLon->setText(AprsSettings::manualLon());
+    posRow->addWidget(m_aprsManualLon);
+
+    // Lat/lon is the persisted source of truth; derive the grid box from it on
+    // open so it round-trips instead of showing blank. Nothing extra is stored.
+    {
+        bool initLatOk = false, initLonOk = false;
+        const double initLat = m_aprsManualLat->text().toDouble(&initLatOk);
+        const double initLon = m_aprsManualLon->text().toDouble(&initLonOk);
+        if (initLatOk && initLonOk)
+            m_aprsManualGrid->setText(MaidenheadLocator::toMaidenhead(initLat, initLon));
+    }
+
+    config->addLayout(posRow, 2, 0, 1, 7);
+    pageLayout->addWidget(configFrame);
+
+    // ── Messaging row ──────────────────────────────────────────────────────
+    auto* msgFrame = panel(QStringLiteral("ControlsFrame"), page);
+    auto* msgLayout = new QHBoxLayout(msgFrame);
+    msgLayout->setContentsMargins(16, 12, 16, 12);
+    msgLayout->setSpacing(12);
+    msgLayout->addWidget(sectionLabel(QStringLiteral("MESSAGE"), msgFrame));
+    m_aprsMsgTo = new QLineEdit(msgFrame);
+    m_aprsMsgTo->setPlaceholderText(QStringLiteral("To (N0CALL-7)"));
+    m_aprsMsgTo->setMaximumWidth(150);
+    msgLayout->addWidget(m_aprsMsgTo);
+
+    // Message-services picker (#3569): a caret button next to the To field that
+    // addresses well-known APRS gateways (SMS, email, Winlink, weather) and
+    // seeds the matching command template, so operators don't have to memorize
+    // callsigns and syntax. The ISS/satellite entry is routing-only — it shows a
+    // path hint rather than mutating the To field or the TX path, which is more
+    // surprising to undo (see the issue's "path coupling" note). The body must
+    // NOT be uppercased anywhere on the send path: EMAIL-2 addresses and SMSGTE
+    // aliases are case-sensitive (sendAprsMessageFromUi only uppercases the
+    // addressee).
+    struct AprsServiceEntry {
+        const char* section;    // category header; empty reuses the prior one
+        const char* label;      // menu item text
+        const char* objectName; // stable id for the agent automation bridge (#3646)
+        const char* addressee;  // To callsign; empty = routing-only (hint only)
+        const char* body;       // seed for the message field; cursor lands at end
+        const char* hint;       // one-line "what this does" + char limit
+    };
+    // objectName scheme is the full word "aprsService…" (not an "aprsSvc…"
+    // abbreviation) on purpose: the agent automation bridge's TX-safety guard
+    // (#3646) does an unanchored substring match for the CW-keying token "cwx",
+    // and "aprsSvc" + "Wx…" spells "…svcWX…" → a false "cwx" hit that would block
+    // the (RX-only) weather entry. The spelled-out prefix avoids that collision.
+    static const AprsServiceEntry kAprsServices[] = {
+        {"SMS", "SMS — text an SMS to a phone", "aprsServiceSms",
+         "SMS", "@",
+         "SMS (NA7Q gateway): \"@<10-digit-number> <message>\" (~67 chars). Replies "
+         "return as APRS. Make an alias with \"#alias #add <name> <number>\"."},
+        {"Email", "EMAIL-2 — send an email", "aprsServiceEmail2",
+         "EMAIL-2", "",
+         "EMAIL-2: \"<email@address> <message>\" (~67 chars). Send your own address "
+         "once to register; \"get\" to EMAIL-2 retrieves held replies (~24h)."},
+        {"Winlink", "WLNK-1 — APRSLink help (?)", "aprsServiceWlnkHelp",
+         "WLNK-1", "?",
+         "WLNK-1 APRSLink: send \"?\" for the command list (L, R#, SP, SMS, …)."},
+        {"", "WLNK-1 — one-line email/SMS", "aprsServiceWlnkSms",
+         "WLNK-1", "SMS ",
+         "WLNK-1: \"SMS <email-or-callsign> <message>\" sends a one-line message "
+         "over the Winlink radio-email bridge."},
+        {"Weather", "WXBOT — forecast / METAR", "aprsServiceWxbot",
+         "WXBOT", "",
+         "WXBOT: \"Boston,MA\", \"KJFK\" (ICAO→METAR), a Maidenhead grid, or blank "
+         "for your last-heard position. Comma required for City,ST."},
+        {"Satellite / ISS", "ISS / ARISS digipeater — path hint", "aprsServiceIss",
+         "", "",
+         "ISS/ARISS digi (145.825 MHz): set TX PATH to \"ARISS\" (RS0ISS), not "
+         "WIDE1-1,WIDE2-1. Keep messages ≤~60 chars; best on passes >30°."},
+    };
+
+    auto* serviceMenu = new QMenu(msgFrame);
+    QString lastSection;
+    for (const AprsServiceEntry& e : kAprsServices) {
+        const QString section = QString::fromLatin1(e.section);
+        if (!section.isEmpty() && section != lastSection) {
+            serviceMenu->addSection(section);
+            lastSection = section;
+        }
+        QAction* act = serviceMenu->addAction(QString::fromLatin1(e.label));
+        act->setObjectName(QString::fromLatin1(e.objectName));
+        act->setToolTip(QString::fromLatin1(e.hint));
+        const QString addressee = QString::fromLatin1(e.addressee);
+        const QString body = QString::fromLatin1(e.body);
+        const QString hint = QString::fromLatin1(e.hint);
+        connect(act, &QAction::triggered, this,
+                [this, addressee, body, hint] { seedAprsService(addressee, body, hint); });
+    }
+
+    m_aprsServiceButton = new QToolButton(msgFrame);
+    m_aprsServiceButton->setObjectName(QStringLiteral("AprsServiceMenuButton"));
+    m_aprsServiceButton->setAccessibleName(QStringLiteral("APRS message services"));
+    m_aprsServiceButton->setText(QStringLiteral("▾"));
+    m_aprsServiceButton->setToolTip(QStringLiteral(
+        "Address a common APRS service: SMS, email, Winlink, weather, ISS"));
+    m_aprsServiceButton->setMenu(serviceMenu);
+    m_aprsServiceButton->setPopupMode(QToolButton::InstantPopup);
+    // A human mouse press opens the menu via Qt's built-in InstantPopup path.
+    // We deliberately do NOT wire clicked()→open for the agent automation bridge
+    // (#3646): a synthetic click arrives inside the bridge's socket-read callback,
+    // and showing the menu's native popup window from there re-enters the macOS
+    // GUI stack and segfaults intermittently (QMenu::popup → QCocoaWindow::
+    // setVisible → QWindow::geometry). Driving this dropdown is a documented
+    // bridge gap; the menu actions still carry stable objectNames so the bridge
+    // can verify the seeded fields structurally.
+    msgLayout->addWidget(m_aprsServiceButton);
+
+    m_aprsMsgText = new QLineEdit(msgFrame);
+    m_aprsMsgText->setPlaceholderText(
+        QStringLiteral("Message text (sent with ack request, retries until acked)"));
+    msgLayout->addWidget(m_aprsMsgText, 1);
+    m_aprsMsgSend = new QPushButton(QStringLiteral("Send APRS Msg"), msgFrame);
+    markTxKeying(m_aprsMsgSend);   // transmits an APRS message → keys TX (#3646)
+    m_aprsMsgSend->setMinimumHeight(42);
+    msgLayout->addWidget(m_aprsMsgSend);
+    m_aprsEnvelope = new QPushButton(QStringLiteral("✉"), msgFrame);
+    m_aprsEnvelope->setObjectName(QStringLiteral("EnvelopeButton"));
+    m_aprsEnvelope->setMinimumHeight(42);
+    m_aprsEnvelope->setToolTip(QStringLiteral("View APRS messages"));
+    msgLayout->addWidget(m_aprsEnvelope);
+    pageLayout->addWidget(msgFrame);
+
+    // ── Station table ──────────────────────────────────────────────────────
+    auto* tableFrame = panel(QStringLiteral("LogFrame"), page);
+    auto* tableLayout = new QVBoxLayout(tableFrame);
+    tableLayout->setContentsMargins(8, 6, 8, 6);
+    tableLayout->setSpacing(0);
+    m_aprsTable = new QTableWidget(tableFrame);
+    m_aprsTable->setColumnCount(kColCount);
+    m_aprsTable->setHorizontalHeaderLabels({
+        QStringLiteral("TIME"), QStringLiteral("STATION"),
+        QStringLiteral("SYMBOL"), QStringLiteral("AGE"),
+        QStringLiteral("PKTS"), QStringLiteral("GRID"),
+        QStringLiteral("DIST"), QStringLiteral("CRS/SPD"),
+        QStringLiteral("STATUS / COMMENT"),
+    });
+    m_aprsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_aprsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_aprsTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_aprsTable->verticalHeader()->setVisible(false);
+    m_aprsTable->verticalHeader()->setDefaultSectionSize(24);
+    m_aprsTable->setAlternatingRowColors(true);
+    m_aprsTable->setIconSize(QSize(16, 16));
+    m_aprsTable->setShowGrid(false);
+    m_aprsTable->setWordWrap(false);
+    m_aprsTable->horizontalHeader()->setSectionResizeMode(kColText, QHeaderView::Stretch);
+    m_aprsTable->setMinimumHeight(160);
+    // Sortable headers; default order is most-recently-heard first. The
+    // rebuild re-applies whatever column/order the operator last clicked.
+    m_aprsTable->setSortingEnabled(true);
+    m_aprsTable->horizontalHeader()->setSortIndicator(kColTime, Qt::DescendingOrder);
+    m_aprsTable->horizontalHeader()->setSortIndicatorShown(true);
+    m_aprsTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    tableLayout->addWidget(m_aprsTable);
+    pageLayout->addWidget(tableFrame, 1);
+
+    // ── Control wiring ─────────────────────────────────────────────────────
+    connect(m_aprsMyCall, &QLineEdit::editingFinished,
+            this, [this] { applyAprsConfigFromUi(true); });
+    connect(m_aprsSymbol, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this](int) { applyAprsConfigFromUi(true); });
+    connect(m_aprsPath, &QLineEdit::editingFinished,
+            this, [this] { applyAprsConfigFromUi(true); });
+    connect(m_aprsBeaconEnable, &QCheckBox::toggled,
+            this, [this](bool) { applyAprsConfigFromUi(true); });
+    connect(m_aprsBeaconInterval, qOverload<int>(&QSpinBox::valueChanged),
+            this, [this](int) { applyAprsConfigFromUi(true); });
+    connect(m_aprsBeaconText, &QLineEdit::editingFinished,
+            this, [this] { applyAprsConfigFromUi(true); });
+    connect(m_aprsManualGrid, &QLineEdit::editingFinished,
+            this, [this] {
+        const QString grid = m_aprsManualGrid->text().trimmed();
+        if (grid.isEmpty())
+            return;
+        double lat = 0.0, lon = 0.0;
+        if (!MaidenheadLocator::toLatLon(grid, lat, lon)) {
+            m_aprsManualGrid->setStyleSheet(
+                QStringLiteral("QLineEdit { color: #c04040; }"));
+            return;
+        }
+        m_aprsManualGrid->setStyleSheet(QString());
+        m_aprsManualLat->setText(QString::number(lat, 'f', 4));
+        m_aprsManualLon->setText(QString::number(lon, 'f', 4));
+        applyAprsConfigFromUi(true);
+    });
+    connect(m_aprsManualLat, &QLineEdit::editingFinished,
+            this, [this] { applyAprsConfigFromUi(true); });
+    connect(m_aprsManualLon, &QLineEdit::editingFinished,
+            this, [this] { applyAprsConfigFromUi(true); });
+    connect(m_aprsBeaconNow, &QPushButton::clicked, this, [this] {
+        applyAprsConfigFromUi(false); // pick up anything typed but not committed
+        m_aprsBeacon->sendNow();
+    });
+    connect(m_aprsMsgSend, &QPushButton::clicked,
+            this, &Ax25HfPacketDecodeDialog::sendAprsMessageFromUi);
+    connect(m_aprsMsgText, &QLineEdit::returnPressed,
+            this, &Ax25HfPacketDecodeDialog::sendAprsMessageFromUi);
+    connect(m_aprsEnvelope, &QPushButton::clicked,
+            this, &Ax25HfPacketDecodeDialog::openAprsMessagesDialog);
+    connect(m_aprsTable, &QTableWidget::customContextMenuRequested,
+            this, &Ax25HfPacketDecodeDialog::handleAprsStationMenu);
+    connect(m_aprsTable, &QTableWidget::cellDoubleClicked,
+            this, [this](int row, int) {
+        if (auto* item = m_aprsTable->item(row, kColCall)) {
+            m_aprsMsgTo->setText(item->data(Qt::UserRole).toString());
+            m_aprsMsgText->setFocus();
+        }
+    });
+}
+
+void Ax25HfPacketDecodeDialog::applyAprsConfigFromUi(bool persist)
+{
+    const QString call = m_aprsMyCall->text().trimmed().toUpper();
+    const auto myAddr = ax25::Address::parse(call);
+    const ax25::Address addr = myAddr.value_or(ax25::Address{});
+    m_aprsMessenger->setMyAddress(addr);
+    m_aprsBeacon->setMyAddress(addr);
+
+    QString symbol = m_aprsSymbol->currentData().toString();
+    if (symbol.size() != 2)
+        symbol = QStringLiteral("/-");
+    m_aprsBeacon->setSymbol(symbol.at(0).toLatin1(), symbol.at(1).toLatin1());
+
+    QVector<ax25::Address> path;
+    const QStringList hops =
+        m_aprsPath->text().split(QLatin1Char(','), Qt::SkipEmptyParts);
+    for (const QString& hop : hops) {
+        if (path.size() >= 8)
+            break;
+        if (const auto a = ax25::Address::parse(hop.trimmed().toUpper()))
+            path.append(*a);
+    }
+    m_aprsBeacon->setPath(path);
+    m_aprsMessenger->setPath(path);
+
+    m_aprsBeacon->setStatusText(m_aprsBeaconText->text());
+    m_aprsBeacon->setIntervalMinutes(m_aprsBeaconInterval->value());
+    m_aprsBeacon->setEnabled(m_aprsBeaconEnable->isChecked());
+
+    bool latOk = false, lonOk = false;
+    const double manualLat = m_aprsManualLat->text().toDouble(&latOk);
+    const double manualLon = m_aprsManualLon->text().toDouble(&lonOk);
+    const bool manualValid = latOk && lonOk
+        && manualLat >= -90.0 && manualLat <= 90.0
+        && manualLon >= -180.0 && manualLon <= 180.0
+        && (manualLat != 0.0 || manualLon != 0.0);
+    m_aprsBeacon->setManualPosition(manualLat, manualLon, manualValid);
+
+    if (persist) {
+        AprsSettings::setMyCall(call);
+        AprsSettings::setSymbol(symbol);
+        AprsSettings::setPath(m_aprsPath->text());
+        AprsSettings::setBeaconEnabled(m_aprsBeaconEnable->isChecked());
+        AprsSettings::setBeaconIntervalMinutes(m_aprsBeaconInterval->value());
+        AprsSettings::setBeaconText(m_aprsBeaconText->text());
+        AprsSettings::setManualPosition(m_aprsManualLat->text(),
+                                        m_aprsManualLon->text());
+    }
+    refreshAprsPositionLabel();
+    refreshAprsStationTable(); // distance column tracks our own position
+}
+
+void Ax25HfPacketDecodeDialog::handleGpsUpdate()
+{
+    if (!m_radio || !m_aprsBeacon)
+        return;
+    // The GPSDO reports "N 33 33.484" (hemisphere, degrees, decimal
+    // minutes), not decimal degrees; parseGpsCoordinate accepts both forms.
+    double lat = 0.0, lon = 0.0;
+    const bool latOk = aprs::parseGpsCoordinate(m_radio->gpsLat(), lat);
+    const bool lonOk = aprs::parseGpsCoordinate(m_radio->gpsLon(), lon);
+    // "Fine Lock" / "Coarse Lock" mean the fix is real; "Present" /
+    // "Not Present" mean no usable position.
+    const bool locked =
+        m_radio->gpsStatus().contains(QStringLiteral("Lock"), Qt::CaseInsensitive);
+    const bool valid = latOk && lonOk && locked && (lat != 0.0 || lon != 0.0);
+    m_aprsBeacon->setGpsPosition(lat, lon, valid);
+    refreshAprsPositionLabel();
+}
+
+void Ax25HfPacketDecodeDialog::refreshAprsPositionLabel()
+{
+    if (!m_aprsPositionValue)
+        return;
+    double lat = 0.0, lon = 0.0;
+    if (m_aprsBeacon->currentPosition(lat, lon)) {
+        m_aprsPositionValue->setText(QStringLiteral("%1  %2  %3, %4")
+            .arg(m_aprsBeacon->usingGps() ? QStringLiteral("GPS")
+                                          : QStringLiteral("Manual"),
+                 aprs::gridSquare(lat, lon),
+                 QString::number(lat, 'f', 4),
+                 QString::number(lon, 'f', 4)));
+    } else {
+        m_aprsPositionValue->setText(QStringLiteral(
+            "none — no GPS lock; enter a manual Lat/Lon to beacon"));
+    }
+}
+
+void Ax25HfPacketDecodeDialog::refreshAprsStationTable()
+{
+    if (!m_aprsTable || !m_aprsStations)
+        return;
+
+    QString selectedCall;
+    if (const auto* current = m_aprsTable->item(m_aprsTable->currentRow(), kColCall))
+        selectedCall = current->data(Qt::UserRole).toString();
+
+    double myLat = 0.0, myLon = 0.0;
+    const bool haveMyPos =
+        m_aprsBeacon && m_aprsBeacon->currentPosition(myLat, myLon);
+
+    const QVector<AprsStationList::Station> stations = m_aprsStations->stations();
+    m_aprsTable->setUpdatesEnabled(false);
+    // Populating with sorting live makes rows re-sort mid-insert; pause it
+    // and re-apply the operator's chosen column/order at the end.
+    const int sortColumn = m_aprsTable->horizontalHeader()->sortIndicatorSection();
+    const Qt::SortOrder sortOrder = m_aprsTable->horizontalHeader()->sortIndicatorOrder();
+    m_aprsTable->setSortingEnabled(false);
+    m_aprsTable->setRowCount(stations.size());
+    for (int i = 0; i < stations.size(); ++i) {
+        const AprsStationList::Station& s = stations.at(i);
+        auto set = [&](int col, const QString& text) {
+            auto* item = new AprsSortItem(text);
+            m_aprsTable->setItem(i, col, item);
+            return item;
+        };
+        const double heardMs = double(s.lastHeard.toMSecsSinceEpoch());
+        auto* timeItem = set(kColTime,
+            s.lastHeard.toLocalTime().toString(QStringLiteral("MM/dd HH:mm:ss")));
+        timeItem->setData(kAprsSortRole, heardMs);
+        set(kColCall, s.call)->setData(Qt::UserRole, s.call);
+
+        QTableWidgetItem* symItem = nullptr;
+        if (s.isWeather) {
+            static const char* kWxNames[] = {
+                "Weather", "Weather (rain)", "Weather (windy)" };
+            const int cond = qBound(0, s.wxCondition, 2);
+            symItem = set(kColSymbol, QString::fromLatin1(kWxNames[cond]));
+            symItem->setIcon(aprsicons::weatherIcon(cond));
+            symItem->setData(kAprsSymRole, QStringLiteral("W:%1").arg(cond));
+        } else if (s.hasPosition) {
+            symItem = set(kColSymbol,
+                          aprs::symbolDescription(s.symbolTable, s.symbolCode));
+            symItem->setIcon(aprsicons::symbolIcon(s.symbolTable, s.symbolCode));
+            symItem->setData(kAprsSymRole,
+                             QStringLiteral("S:%1%2")
+                                 .arg(QLatin1Char(s.symbolTable))
+                                 .arg(QLatin1Char(s.symbolCode)));
+        } else {
+            set(kColSymbol, aprs::packetTypeName(s.lastType));
+        }
+
+        auto* ageItem = set(kColAge, aprsAgeText(s.lastHeard));
+        ageItem->setData(Qt::UserRole, s.lastHeard.toMSecsSinceEpoch());
+        ageItem->setData(kAprsSortRole, -heardMs); // ascending age = newest first
+        set(kColPackets, QString::number(s.packets))
+            ->setData(kAprsSortRole, double(s.packets));
+        set(kColGrid, s.hasPosition ? aprs::gridSquare(s.latitude, s.longitude)
+                                    : QString());
+        QString dist;
+        double distKey = 1e12; // unknown distances sort to the bottom
+        if (s.hasPosition && haveMyPos) {
+            const double miles =
+                aprs::distanceMiles(myLat, myLon, s.latitude, s.longitude);
+            dist = QStringLiteral("%1 mi %2°")
+                .arg(miles, 0, 'f', 1)
+                .arg(qRound(aprs::bearingDeg(myLat, myLon,
+                                             s.latitude, s.longitude)));
+            distKey = miles;
+        }
+        set(kColDist, dist)->setData(kAprsSortRole, distKey);
+        QString crsSpd;
+        double speedKey = -1.0;
+        if (s.speedKnots >= 0.0) {
+            const double mph = s.speedKnots * 1.15078;
+            crsSpd = QStringLiteral("%1 mph").arg(qRound(mph));
+            if (s.courseDeg >= 0.0)
+                crsSpd += QStringLiteral(" %1°").arg(qRound(s.courseDeg));
+            speedKey = mph;
+        }
+        set(kColCrsSpd, crsSpd)->setData(kAprsSortRole, speedKey);
+        QString text = !s.comment.isEmpty() ? s.comment : s.status;
+        if (!s.comment.isEmpty() && !s.status.isEmpty())
+            text = s.comment + QStringLiteral("  |  ") + s.status;
+        set(kColText, text);
+    }
+    m_aprsTable->setSortingEnabled(true);
+    m_aprsTable->sortItems(sortColumn, sortOrder);
+    m_aprsTable->resizeColumnsToContents();
+    // resizeColumnsToContents() packs columns shoulder-to-shoulder; pad each
+    // one so the table breathes. The last column stretches regardless.
+    for (int col = 0; col < kColText; ++col)
+        m_aprsTable->setColumnWidth(col, m_aprsTable->columnWidth(col) + 18);
+    m_aprsTable->horizontalHeader()->setSectionResizeMode(kColText, QHeaderView::Stretch);
+    for (int row = 0; row < m_aprsTable->rowCount(); ++row) {
+        applyAprsRowFade(m_aprsTable, row);
+        if (!selectedCall.isEmpty()) {
+            const auto* callItem = m_aprsTable->item(row, kColCall);
+            if (callItem && callItem->data(Qt::UserRole).toString() == selectedCall)
+                m_aprsTable->selectRow(row);
+        }
+    }
+    m_aprsTable->setUpdatesEnabled(true);
+}
+
+void Ax25HfPacketDecodeDialog::refreshAprsStationAges()
+{
+    if (!m_aprsTable)
+        return;
+    for (int row = 0; row < m_aprsTable->rowCount(); ++row) {
+        if (auto* item = m_aprsTable->item(row, kColAge)) {
+            // QTimeZone::utc() rather than the Qt 6.5+ QTimeZone::UTC constant —
+            // the Linux CI image builds against an older Qt 6.
+            const QDateTime lastHeard = QDateTime::fromMSecsSinceEpoch(
+                item->data(Qt::UserRole).toLongLong(), QTimeZone::utc());
+            item->setText(aprsAgeText(lastHeard));
+        }
+        applyAprsRowFade(m_aprsTable, row);
+    }
+}
+
+void Ax25HfPacketDecodeDialog::handleAprsStationMenu(const QPoint& pos)
+{
+    QMenu menu(m_aprsTable);
+
+    // Station-specific actions only when the click landed on a row; the
+    // roster-wide actions below are available from anywhere in the table.
+    QString call;
+    if (auto* hit = m_aprsTable->itemAt(pos)) {
+        if (const auto* callItem = m_aprsTable->item(hit->row(), kColCall))
+            call = callItem->data(Qt::UserRole).toString();
+    }
+    if (!call.isEmpty()) {
+        menu.addAction(QStringLiteral("Send Message to %1...").arg(call),
+                       this, [this, call] {
+            m_aprsMsgTo->setText(call);
+            m_aprsMsgText->setFocus();
+        });
+        menu.addAction(QStringLiteral("Station Info..."), this, [this, call] {
+            showAprsStationInfo(call);
+        });
+        menu.addAction(QStringLiteral("View on aprs.fi"), this, [call] {
+            QDesktopServices::openUrl(
+                QUrl(QStringLiteral("https://aprs.fi/info/a/%1").arg(call)));
+        });
+        menu.addSeparator();
+    }
+    QAction* clearAll =
+        menu.addAction(QStringLiteral("Clear All Stations..."), this, [this] {
+        const int count = m_aprsStations->size();
+        const auto answer = QMessageBox::question(
+            this, QStringLiteral("Clear APRS Stations"),
+            QStringLiteral("Remove all %1 heard station%2? "
+                           "This also clears the saved roster on disk.")
+                .arg(count)
+                .arg(count == 1 ? QString() : QStringLiteral("s")));
+        if (answer == QMessageBox::Yes)
+            m_aprsStations->clear();
+    });
+    clearAll->setEnabled(m_aprsStations && m_aprsStations->size() > 0);
+
+    menu.exec(m_aprsTable->viewport()->mapToGlobal(pos));
+}
+
+void Ax25HfPacketDecodeDialog::showAprsStationInfo(const QString& call)
+{
+    const auto station = m_aprsStations->find(call);
+    if (!station)
+        return;
+    const AprsStationList::Station& s = *station;
+
+    QStringList lines;
+    auto add = [&lines](const QString& key, const QString& value) {
+        if (!value.isEmpty())
+            lines << QStringLiteral("%1  %2").arg(key.leftJustified(12), value);
+    };
+    add(QStringLiteral("First heard"),
+        s.firstHeard.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss 'UTC'")));
+    add(QStringLiteral("Last heard"),
+        QStringLiteral("%1  (%2 ago)")
+            .arg(s.lastHeard.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss 'UTC'")),
+                 aprsAgeText(s.lastHeard)));
+    add(QStringLiteral("Packets"), QString::number(s.packets));
+    add(QStringLiteral("Via"), s.via);
+    if (s.hasPosition) {
+        add(QStringLiteral("Position"),
+            QStringLiteral("%1, %2  (%3)")
+                .arg(QString::number(s.latitude, 'f', 4),
+                     QString::number(s.longitude, 'f', 4),
+                     aprs::gridSquare(s.latitude, s.longitude)));
+        add(QStringLiteral("Symbol"),
+            aprs::symbolDescription(s.symbolTable, s.symbolCode));
+        double myLat = 0.0, myLon = 0.0;
+        if (m_aprsBeacon && m_aprsBeacon->currentPosition(myLat, myLon)) {
+            add(QStringLiteral("Distance"),
+                QStringLiteral("%1 mi, bearing %2°")
+                    .arg(aprs::distanceMiles(myLat, myLon,
+                                             s.latitude, s.longitude),
+                         0, 'f', 1)
+                    .arg(qRound(aprs::bearingDeg(myLat, myLon,
+                                                 s.latitude, s.longitude))));
+        }
+        if (s.speedKnots >= 0.0) {
+            add(QStringLiteral("Speed"),
+                QStringLiteral("%1 mph").arg(qRound(s.speedKnots * 1.15078)));
+        }
+        if (s.courseDeg >= 0.0)
+            add(QStringLiteral("Course"),
+                QStringLiteral("%1°").arg(qRound(s.courseDeg)));
+        if (s.hasAltitude)
+            add(QStringLiteral("Altitude"),
+                QStringLiteral("%1 ft").arg(qRound(s.altitudeFeet)));
+    }
+    add(QStringLiteral("Status"), s.status);
+    add(QStringLiteral("Comment"), s.comment);
+    add(QStringLiteral("Last packet"), s.lastInfo);
+
+    QMessageBox box(this);
+    box.setWindowTitle(call);
+    box.setText(QStringLiteral("<pre>%1</pre>")
+                    .arg(lines.join(QLatin1Char('\n')).toHtmlEscaped()));
+    box.setTextFormat(Qt::RichText);
+    box.exec();
+}
+
+void Ax25HfPacketDecodeDialog::openAprsMessagesDialog()
+{
+    if (!m_aprsMessagesDialog) {
+        m_aprsMessagesDialog = new AprsMessagesDialog(m_aprsMessenger, this);
+        connect(m_aprsMessagesDialog, &AprsMessagesDialog::replyRequested,
+                this, [this](const QString& callsign) {
+            m_aprsMsgTo->setText(callsign);
+            raise();
+            activateWindow();
+            m_aprsMsgText->setFocus();
+        });
+    }
+    m_aprsMessagesDialog->show();
+    m_aprsMessagesDialog->raise();
+    m_aprsMessagesDialog->activateWindow();
+}
+
+void Ax25HfPacketDecodeDialog::sendAprsMessageFromUi()
+{
+    applyAprsConfigFromUi(false); // pick up a freshly typed MY CALLSIGN
+    if (!m_aprsMessenger->myAddress().isValid()) {
+        appendSystemLine(QStringLiteral(
+            "APRS message not sent: set MY CALLSIGN first."));
+        return;
+    }
+    const QString to = m_aprsMsgTo->text().trimmed().toUpper();
+    const QString text = m_aprsMsgText->text().trimmed();
+    if (to.isEmpty() || text.isEmpty())
+        return;
+    if (!m_aprsMessenger->sendMessage(to, text)) {
+        appendSystemLine(QStringLiteral(
+            "APRS message not sent: \"%1\" is not a valid callsign.").arg(to));
+        return;
+    }
+    m_aprsMsgText->clear();
+}
+
+void Ax25HfPacketDecodeDialog::seedAprsService(const QString& addressee,
+                                               const QString& body,
+                                               const QString& hint)
+{
+    // Routing-only entries (ISS/satellite) carry no addressee: leave the To and
+    // message fields untouched and just surface the hint, so we don't clobber
+    // whatever the operator was composing.
+    if (!addressee.isEmpty()) {
+        m_aprsMsgTo->setText(addressee);
+        m_aprsMsgText->setText(body);
+        m_aprsMsgText->setFocus();
+        m_aprsMsgText->setCursorPosition(body.length());
+    }
+    if (!hint.isEmpty())
+        appendSystemLine(hint);
+}
+
+void Ax25HfPacketDecodeDialog::updateAprsEnvelopeButton()
+{
+    if (!m_aprsEnvelope || !m_aprsMessenger)
+        return;
+    const int unread = m_aprsMessenger->unreadCount();
+    m_aprsEnvelope->setText(unread > 0
+        ? QStringLiteral("✉ %1").arg(unread)
+        : QStringLiteral("✉"));
+    m_aprsEnvelope->setToolTip(unread > 0
+        ? QStringLiteral("View APRS messages (%1 unread)").arg(unread)
+        : QStringLiteral("View APRS messages"));
+    m_aprsEnvelope->setProperty("hasUnread", unread > 0);
+    m_aprsEnvelope->style()->unpolish(m_aprsEnvelope);
+    m_aprsEnvelope->style()->polish(m_aprsEnvelope);
 }
 
 // ---------------------------------------------------------------------------

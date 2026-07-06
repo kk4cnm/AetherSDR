@@ -74,6 +74,12 @@ private slots:
     void onTuneSteps(int steps);
     void onButtonEvent(const QString& signature, int action);
     void onConnectionChanged(bool connected, const QString& name);
+#ifdef Q_OS_LINUX
+    // Dial present but its evdev node isn't accessible — offer to install the
+    // udev access rule via polkit.
+    void onAccessRequired(const QString& deviceName);
+    void onGrantAccessClicked();
+#endif
 
 private:
     struct Pill {
@@ -112,6 +118,9 @@ private:
     QLabel* m_lastEventLabel{nullptr};
     QPushButton* m_resetBtn{nullptr};
     QPushButton* m_closeBtn{nullptr};
+#ifdef Q_OS_LINUX
+    QPushButton* m_grantAccessBtn{nullptr};  // shown only on accessRequired
+#endif
 };
 
 } // namespace AetherSDR

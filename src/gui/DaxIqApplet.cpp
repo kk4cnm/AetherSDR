@@ -116,6 +116,10 @@ void DaxIqApplet::buildUI()
                 m_iqMeter[i]->setValue(0);
                 ss.setValue(QStringLiteral("DaxIqEnabled%1").arg(i + 1), "False");
             } else {
+                // Sync the model's desired rate to the combo before enabling, so a
+                // rate chosen while off (or restored from settings) is applied to the
+                // freshly-created stream instead of lost to the radio's 48k default.
+                emit iqRateChanged(i + 1, m_iqRateCombo[i]->currentData().toInt());
                 emit iqEnableRequested(i + 1);
                 m_iqEnable[i]->setText("On");
                 m_iqEnable[i]->setStyleSheet(kIqBtnOn);
@@ -165,23 +169,17 @@ void DaxIqApplet::setRadioModel(RadioModel* model)
         if (!connected) {
             return;
         }
-        QTimer::singleShot(1500, this, [this]() {
-            if (!m_model || !m_model->isConnected()) {
-                return;
-            }
-            auto& ss = AppSettings::instance();
-            for (int i = 0; i < kChannels; ++i) {
-                if (!m_iqEnable[i]) {
-                    continue;
-                }
-                if (ss.value(QStringLiteral("DaxIqEnabled%1").arg(i + 1), "False").toString() == "True") {
-                    emit iqEnableRequested(i + 1);
-                    m_iqEnable[i]->setText("On");
-                    m_iqEnable[i]->setStyleSheet(kIqBtnOn);
-                }
-            }
-        });
+        restoreEnabledChannels();
     });
+
+    // The radio can already be connected by the time this applet wires up the
+    // handler above: the connection completes asynchronously during the long
+    // startup constructor, often before setRadioModel() runs, so the initial
+    // connectionStateChanged(true) is emitted and missed -> persisted channels
+    // never restore. Cover that ordering explicitly.
+    if (model->isConnected()) {
+        restoreEnabledChannels();
+    }
 
     // Wire DAX IQ stream state changes → sync On/Off buttons
     connect(&model->daxIqModel(), &DaxIqModel::streamChanged, this, [this](int ch) {
@@ -192,18 +190,76 @@ void DaxIqApplet::setRadioModel(RadioModel* model)
         bool exists = m_model->daxIqModel().stream(ch).exists;
         m_iqEnable[idx]->setText(exists ? "On" : "Off");
         m_iqEnable[idx]->setStyleSheet(exists ? kIqBtnOn : kIqBtnOff);
-        if (!exists) {
+        // Zero the meter whenever the channel is not actively bound to a pan: it
+        // may be Off (exists==false) OR enabled-but-unbound (pan==0x0, e.g. the
+        // pan's daxiq_channel was moved to another IQ channel). No IQ data flows
+        // in either case, so the bar must drop to 0 instead of freezing.
+        const QString pan = exists ? m_model->daxIqModel().stream(ch).panId : QString();
+        const bool bound = exists && !pan.isEmpty()
+                           && pan != QStringLiteral("0x0") && pan != QStringLiteral("0");
+        if (!bound) {
+            m_iqMeterDb[idx] = -70.0f;
             m_iqMeter[idx]->setValue(0);
         }
 
-        // Sync rate combo from radio state
-        int rate = m_model->daxIqModel().stream(ch).sampleRate;
-        QSignalBlocker sb(m_iqRateCombo[idx]);
-        for (int i = 0; i < m_iqRateCombo[idx]->count(); ++i) {
-            if (m_iqRateCombo[idx]->itemData(i).toInt() == rate) {
-                m_iqRateCombo[idx]->setCurrentIndex(i);
-                break;
+        // Sync rate combo from radio state ONLY while the stream exists and is
+        // not mid-rate-settling. On disable the model resets the stream's
+        // sampleRate to its 48k default; copying that into the combo would
+        // clobber the rate the user selected. During a non-default-rate enable
+        // the stream reports 48k transiently (rateSettling) before the real rate
+        // arrives; syncing then would flip the combo to 48k and back. In both
+        // cases the combo holds user intent and is re-applied on the next enable.
+        // (The On/Off button above still syncs every emit, settling or not.)
+        if (exists && !m_model->daxIqModel().stream(ch).rateSettling) {
+            int rate = m_model->daxIqModel().stream(ch).sampleRate;
+            QSignalBlocker sb(m_iqRateCombo[idx]);
+            for (int i = 0; i < m_iqRateCombo[idx]->count(); ++i) {
+                if (m_iqRateCombo[idx]->itemData(i).toInt() == rate) {
+                    m_iqRateCombo[idx]->setCurrentIndex(i);
+                    break;
+                }
             }
+        }
+    });
+}
+
+void DaxIqApplet::restoreEnabledChannels()
+{
+    // Re-create the persisted-enabled IQ streams a short moment after connect,
+    // once session/stream setup has settled. Idempotent (skips channels whose
+    // stream already exists) so calling it from both the connect handler and the
+    // already-connected path in setRadioModel cannot double-create. The `exists`
+    // guard lags the radio round-trip, though, so two timers scheduled within the
+    // same settle window would both pass it and double-create; collapse overlapping
+    // calls with a pending flag, cleared when the timer fires.
+    if (m_restorePending) {
+        return;
+    }
+    m_restorePending = true;
+    QTimer::singleShot(1500, this, [this]() {
+        m_restorePending = false;
+        if (!m_model || !m_model->isConnected()) {
+            return;
+        }
+        auto& ss = AppSettings::instance();
+        for (int i = 0; i < kChannels; ++i) {
+            if (!m_iqEnable[i]) {
+                continue;
+            }
+            if (ss.value(QStringLiteral("DaxIqEnabled%1").arg(i + 1), "False").toString() != "True") {
+                continue;
+            }
+            if (m_model->daxIqModel().stream(i + 1).exists) {
+                continue;  // already restored
+            }
+            // Restore the saved rate too: sync the model's desired rate to the
+            // combo (restored from DaxIqRate%1 in buildUI) so the stream comes up
+            // at the persisted rate instead of the radio's 48k default.
+            emit iqRateChanged(i + 1, m_iqRateCombo[i]->currentData().toInt());
+            emit iqEnableRequested(i + 1);
+            // The On button is driven by the streamChanged sync once the stream
+            // actually exists; don't pre-set it here so a restore that runs before
+            // the createStream wiring is in place can't show a dead "On".
         }
     });
 }
@@ -213,9 +269,44 @@ void DaxIqApplet::setDaxIqLevel(int channel, float rms)
     if (channel < 1 || channel > kChannels) {
         return;
     }
-    // Scale RMS to 0-100 for QProgressBar (IQ values are typically 0.0-0.5 range)
-    int level = static_cast<int>(std::clamp(rms * 200.0f, 0.0f, 100.0f));
-    m_iqMeter[channel - 1]->setValue(level);
+    const int i = channel - 1;
+
+    // Ignore stale level updates when the channel is off OR unbound from a pan
+    // (pan==0x0): no IQ data flows, and a levelReady queued just before the
+    // disable/unbind would otherwise freeze the bar at its last value (random,
+    // timing-dependent). Force the bar to 0 and reset ballistics in that case.
+    if (!m_model) {
+        m_iqMeterDb[i] = -70.0f; m_iqMeter[i]->setValue(0); return;
+    }
+    const auto& st = m_model->daxIqModel().stream(channel);
+    const bool live = m_iqEnable[i]->text() == QStringLiteral("On")
+                      && st.exists && !st.panId.isEmpty()
+                      && st.panId != QStringLiteral("0x0") && st.panId != QStringLiteral("0");
+    if (!live) {
+        m_iqMeterDb[i] = -70.0f;
+        m_iqMeter[i]->setValue(0);
+        return;
+    }
+
+    // DAX-IQ samples are the radio's raw baseband amplitude (int16 full-scale,
+    // ~32768), NOT normalized [-1,1] like DAX audio. The old `rms * 200` assumed
+    // normalized IQ and pegged the bar on real data (verified live on a FLEX-6700:
+    // 48 kHz IQ noise-floor RMS ~16 -> -66 dBFS, a strong AM carrier ~43 -> -58
+    // dBFS; rms * 200 saturates above 0.5). A wideband IQ RMS is noise-dominated,
+    // so this is really a level/overload meter: map RMS to dBFS vs int16 full-
+    // scale over a [-70, -10] dBFS window, so normal signals sit low and the bar
+    // only fills as the stream approaches digital overload.
+    constexpr float kFullScale = 32768.0f;  // int16 IQ full-scale
+    constexpr float kFloorDb   = -70.0f;    // 0% of bar
+    constexpr float kCeilDb    = -10.0f;    // 100% of bar (overload headroom)
+    const float dbfs = (rms > 1e-4f) ? 20.0f * std::log10(rms / kFullScale) : kFloorDb;
+
+    // Attack-fast / decay-slow ballistics (mirrors DaxApplet RX-meter feel).
+    const float a = (dbfs > m_iqMeterDb[i]) ? 0.5f : 0.15f;
+    m_iqMeterDb[i] = a * dbfs + (1.0f - a) * m_iqMeterDb[i];
+
+    const float frac = (m_iqMeterDb[i] - kFloorDb) / (kCeilDb - kFloorDb);
+    m_iqMeter[i]->setValue(static_cast<int>(std::clamp(frac * 100.0f, 0.0f, 100.0f)));
 }
 
 } // namespace AetherSDR

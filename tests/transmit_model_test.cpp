@@ -67,6 +67,41 @@ int main(int argc, char** argv)
     ok &= expect(commands.isEmpty(),
                  "invalid tune mode is ignored");
 
+    commands.clear();
+    tx.setDexp(true);
+    ok &= expect(commands == QStringList({"transmit set compander=1"})
+                 && tx.dexpOn()
+                 && tx.companderOn(),
+                 "DEXP toggle sends compander command and updates local state");
+
+    commands.clear();
+    tx.setDexpLevel(42);
+    ok &= expect(commands == QStringList({"transmit set compander_level=42"})
+                 && tx.dexpLevel() == 42
+                 && tx.companderLevel() == 42,
+                 "DEXP level sends compander_level command and updates local state");
+
+    tx.applyTransmitStatus({{"compander", "0"}, {"compander_level", "17"}});
+    ok &= expect(!tx.dexpOn()
+                 && !tx.companderOn()
+                 && tx.dexpLevel() == 17
+                 && tx.companderLevel() == 17,
+                 "compander status updates DEXP state");
+
+    tx.applyTransmitStatus({{"compander", "1"}, {"dexp", "0"}, {"compander_level", "33"}, {"noise_gate_level", "9"}});
+    ok &= expect(tx.dexpOn()
+                 && tx.companderOn()
+                 && tx.dexpLevel() == 33
+                 && tx.companderLevel() == 33,
+                 "canonical compander status wins over legacy DEXP aliases");
+
+    tx.applyTransmitStatus({{"dexp", "0"}, {"noise_gate_level", "8"}});
+    ok &= expect(!tx.dexpOn()
+                 && !tx.companderOn()
+                 && tx.dexpLevel() == 8
+                 && tx.companderLevel() == 8,
+                 "legacy DEXP aliases update state when canonical compander status is absent");
+
     tx.setPttPreflight([](TransmitModel::PttSource source) {
         return source == TransmitModel::PttSource::Tune
             ? QStringLiteral("blocked")
@@ -86,6 +121,16 @@ int main(int argc, char** argv)
     ok &= expect(commands.isEmpty()
                  && blockedMessages == QStringList({"blocked"}),
                  "two-tone preflight blocks setup and tune commands");
+
+    commands.clear();
+    tx.loadProfile(QStringLiteral("Contest"));
+    ok &= expect(commands == QStringList({"profile tx load \"Contest\""}),
+                 "TX profile load uses profile tx load");
+
+    commands.clear();
+    tx.loadMicProfile(QStringLiteral("Studio Mic"));
+    ok &= expect(commands == QStringList({"profile mic load \"Studio Mic\""}),
+                 "Mic profile load uses profile mic load");
 
     return ok ? 0 : 1;
 }

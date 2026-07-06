@@ -28,6 +28,7 @@ class FirmwareStager;
 class TgxlConnection;
 class PgxlConnection;
 class AntennaGeniusModel;
+class KiwiSdrManager;
 
 // Radio Setup dialog — tabbed configuration window matching SmartSDR's
 // Settings → Radio Setup. Shows radio info, GPS, TX, RX, filters, etc.
@@ -39,6 +40,7 @@ public:
                               TgxlConnection* tgxl = nullptr,
                               PgxlConnection* pgxl = nullptr,
                               AntennaGeniusModel* ag = nullptr,
+                              KiwiSdrManager* kiwiSdrManager = nullptr,
                               QWidget* parent = nullptr);
     void selectTab(const QString& tabName);
     void refreshFlexControlButtonActions();
@@ -77,6 +79,10 @@ private:
     // (host, sha256 fingerprint, pinned date) with per-row Forget and a
     // Forget All button. Backed by WanCertCache in WanConnection.cpp.
     QWidget* buildSmartLinkTab();
+    // QRZ.com account for callsign lookups (CW decoder contact card +
+    // View → Callsign Lookup).  Username in AppSettings, password in the
+    // OS keychain, lookups cached 7 days by CallsignLookupService.
+    QWidget* buildQrzTab();
 
 public:
     // Public so MainWindow can refresh the table from outside this
@@ -99,6 +105,7 @@ private:
     TgxlConnection*    m_tgxl{nullptr};
     PgxlConnection*    m_pgxl{nullptr};
     AntennaGeniusModel* m_ag{nullptr};
+    KiwiSdrManager* m_kiwiSdrManager{nullptr};
     QTabWidget*  m_tabs{nullptr};
     QHash<QString, QComboBox*> m_flexControlActionCombos;
     QHash<QString, QString> m_flexControlActionDefaults;

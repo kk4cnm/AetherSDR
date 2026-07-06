@@ -372,6 +372,21 @@ void ThemeManager::seedBuiltinDefaults()
     m_tokens.insert("color.accent.danger",   QString("#ff4d4d"));
     m_tokens.insert("color.accent.success",  QString("#4dd87a"));
 
+    // Waterfall LIVE chip — dedicated so the live/history indicator can be
+    // recolored independently of the shared danger/label semantics (#3744).
+    // Defaults mirror the prior shared values (red live, grey history).
+    m_tokens.insert("color.waterfall.live",    QString("#ff4d4d"));
+    m_tokens.insert("color.waterfall.history", QString("#506070"));
+
+    // MOX idle accent — dedicated so the "this is the transmit button" amber
+    // can be recolored independently of the shared button styling (#3663).
+    // Defaults mirror the prior hardcoded literals; the same values seed both
+    // presets, so the appearance is theme-agnostic exactly as before.
+    m_tokens.insert("color.tx.mox.border",       QString("#d08020"));
+    m_tokens.insert("color.tx.mox.text",         QString("#f0c890"));
+    m_tokens.insert("color.tx.mox.border.hover", QString("#e09030"));
+    m_tokens.insert("color.tx.mox.text.hover",   QString("#ffd8a0"));
+
     // Text (4 tiers — label and disabled distinct for Phase 4 contrast
     // tuning).  text.primary aligned to the dominant codebase body-text
     // value (#c8d8e8, 367 refs across applets / dialogs / labels).
@@ -393,6 +408,10 @@ void ThemeManager::seedBuiltinDefaults()
     m_tokens.insert("color.meter.peak",          QString("#e6f0fa"));
     m_tokens.insert("color.meter.gainReduction", QString("#f2c14e"));
     m_tokens.insert("color.meter.bar.fill",      QString("#405060"));
+    // S-meter needle-pivot moulding cover + warm backlight glow (paint code only).
+    m_tokens.insert("color.meter.pivot.fill",    QString("#050509"));
+    m_tokens.insert("color.meter.pivot.rim",     QString("#3a3e48"));
+    m_tokens.insert("color.meter.pivot.glow",    QString("#ffb060"));
     // Vertical (bottom→top, angle 0°) green→amber→red ramp painted by
     // ClientLevelMeter / ClientCompMeter into the level bar.  Seeded so
     // a missing theme file doesn't fall back to whatever the meter
@@ -705,15 +724,21 @@ void ThemeManager::readScopeFromJson(const QJsonObject& obj, ThemeScope* into)
         const QJsonObject children = obj.value("scopes").toObject();
         for (auto it = children.constBegin(); it != children.constEnd(); ++it) {
             const QString name = it.key();
-            auto child = std::make_unique<ThemeScope>();
-            child->name = name;
-            child->path = into->path.isEmpty()
-                              ? name
-                              : into->path + QLatin1Char('/') + name;
-            child->parent = into;
-            ThemeScope* raw = child.get();
-            into->children.emplace(name, std::move(child));
-            readScopeFromJson(it.value().toObject(), raw);
+            ThemeScope* childScope = nullptr;
+            auto existing = into->children.find(name);
+            if (existing != into->children.end()) {
+                childScope = existing->second.get();
+            } else {
+                auto child = std::make_unique<ThemeScope>();
+                child->name = name;
+                child->path = into->path.isEmpty()
+                                  ? name
+                                  : into->path + QLatin1Char('/') + name;
+                child->parent = into;
+                childScope = child.get();
+                into->children.emplace(name, std::move(child));
+            }
+            readScopeFromJson(it.value().toObject(), childScope);
         }
     }
 }
@@ -1587,6 +1612,21 @@ QString ThemeManager::resolve(const QString& stylesheetTemplate) const
     return resolveFor(nullptr, stylesheetTemplate);
 }
 
+QString ThemeManager::checkBoxIndicatorStyle()
+{
+    // Single source of truth for the checkbox indicator used across dialogs
+    // (RadioSetupDialog, DxClusterDialog, FreeDvReporterDialog).  Kept as an
+    // unresolved token template so applyStyleSheet() expands it per widget
+    // and it re-paints on theme switches.
+    static const QString kStyle =
+        "QCheckBox::indicator { width: 14px; height: 14px; "
+        "border: 2px solid {{color.background.3}}; border-radius: 3px; background: {{color.background.0}}; }"
+        "QCheckBox::indicator:hover { border-color: {{color.accent}}; background: {{color.background.1}}; }"
+        "QCheckBox::indicator:checked { border: 2px solid {{color.accent}}; background: {{color.background.2}}; }"
+        "QCheckBox::indicator:disabled { border-color: {{color.background.2}}; background: {{color.background.0}}; }";
+    return kStyle;
+}
+
 QString ThemeManager::resolveFor(const QWidget* widget,
                                  const QString& stylesheetTemplate) const
 {
@@ -1686,7 +1726,7 @@ bool ThemeManager::eventFilter(QObject* watched, QEvent* event)
 void ThemeManager::clearWidgetTracking(QWidget* widget)
 {
     if (!widget) return;
-    if (m_trackedWidgets.remove(widget) > 0) {
+    if (m_trackedWidgets.remove(widget)) {
         QObject::disconnect(widget, &QObject::destroyed,
                             this, &ThemeManager::onTrackedWidgetDestroyed);
     }

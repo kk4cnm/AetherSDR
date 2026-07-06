@@ -4,6 +4,7 @@
 #include "ComboStyle.h"
 #include "HGauge.h"
 #include "Theme.h"
+#include "core/TxKeyingMarker.h"
 #include "models/RadioModel.h"
 #include "models/TransmitModel.h"
 #include "models/TunerModel.h"
@@ -22,6 +23,21 @@
 #include "core/ThemeManager.h"
 
 namespace AetherSDR {
+
+// MOX idle "this is the transmit button" accent — amber border/text, distinct
+// from the neutral btnStyle of its TUNE/ATU/MEM neighbors (#3663).  Tokenized
+// (color.tx.mox.*) so the accent is editable in the Theme Editor, mirroring the
+// waterfall LIVE chip (#3761).  Shared between construction and the moxChanged
+// return-to-idle branch so the two can't drift; background / hover-background /
+// disabled colors stay literal (structural, shared with the neighbor buttons).
+static const char* const kMoxIdleStyle =
+    "QPushButton { background: #1a3a5a; border: 1px solid {{color.tx.mox.border}}; "
+    "border-radius: 3px; color: {{color.tx.mox.text}}; font-size: 10px; font-weight: bold; "
+    "padding: 2px; }"
+    "QPushButton:hover { background: #204060; border: 1px solid {{color.tx.mox.border.hover}}; "
+    "color: {{color.tx.mox.text.hover}}; }"
+    "QPushButton:disabled { background-color: #1a1a2a; color: #556070; "
+    "border: 1px solid #2a3040; }";
 
 
 
@@ -118,6 +134,12 @@ void TxApplet::buildUI()
         this, 80.0f);
     m_fwdGauge->setAccessibleName("Forward power gauge");
     m_fwdGauge->setAccessibleDescription("RF forward power in watts");
+    // Mouse-over readout: exact watts, so the operator isn't left estimating
+    // between the 40 W tick marks while transmitting. (#3936)
+    static_cast<HGauge*>(m_fwdGauge)->setHoverValueFormatter([](float v) {
+        return QStringLiteral("%1 W").arg(QString::number(std::lround(v)));
+    });
+    static_cast<HGauge*>(m_fwdGauge)->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_fwdGauge);
 
     // ── SWR gauge (1.0–3.0, red > 2.5) ─────────────────────────────────────
@@ -126,6 +148,11 @@ void TxApplet::buildUI()
         this, 2.0f);
     m_swrGauge->setAccessibleName("SWR gauge");
     m_swrGauge->setAccessibleDescription("Standing wave ratio");
+    // Mouse-over readout: exact ratio in the conventional N.N:1 form.
+    static_cast<HGauge*>(m_swrGauge)->setHoverValueFormatter([](float v) {
+        return QStringLiteral("%1:1").arg(QString::number(v, 'f', 2));
+    });
+    static_cast<HGauge*>(m_swrGauge)->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_swrGauge);
 
     // ── RF Power slider ─────────────────────────────────────────────────────
@@ -216,6 +243,7 @@ void TxApplet::buildUI()
             "border: 1px solid #2a3040; }";
 
         m_tuneBtn = new QPushButton("TUNE");
+        markTxKeying(m_tuneBtn);   // emits a tune carrier — keys TX (#3646)
         m_tuneBtn->setStyleSheet(btnStyle);
         m_tuneBtn->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
         m_tuneBtn->setFixedHeight(22);
@@ -229,7 +257,8 @@ void TxApplet::buildUI()
         row->addWidget(m_tuneBtn);
 
         m_moxBtn = new QPushButton("MOX");
-        m_moxBtn->setStyleSheet(btnStyle);
+        markTxKeying(m_moxBtn);    // manual transmit (PTT) — keys TX (#3646)
+        AetherSDR::ThemeManager::instance().applyStyleSheet(m_moxBtn, kMoxIdleStyle);
         m_moxBtn->setCheckable(true);
         m_moxBtn->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
         m_moxBtn->setFixedHeight(22);
@@ -238,6 +267,7 @@ void TxApplet::buildUI()
         row->addWidget(m_moxBtn);
 
         m_atuBtn = new QPushButton("ATU");
+        markTxKeying(m_atuBtn);    // starts ATU tune — keys TX (#3646)
         m_atuBtn->setStyleSheet(btnStyle);
         m_atuBtn->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
         m_atuBtn->setFixedHeight(22);
@@ -413,14 +443,18 @@ void TxApplet::setTransmitModel(TransmitModel* model)
     connect(m_model, &TransmitModel::moxChanged, this, [this](bool tx) {
         m_updatingFromModel = true;
         m_moxBtn->setChecked(tx);
-        m_moxBtn->setStyleSheet(tx
-            ? "QPushButton { background: #cc2222; border: 1px solid #ff4444; "
-              "border-radius: 3px; color: #ffffff; font-size: 10px; font-weight: bold; "
-              "padding: 2px; }"
-            : "QPushButton { background: #1a3a5a; border: 1px solid #205070; "
-              "border-radius: 3px; color: #c8d8e8; font-size: 10px; font-weight: bold; "
-              "padding: 2px; }"
-              "QPushButton:hover { background: #204060; }");
+        // Both branches go through applyStyleSheet so the tracked template
+        // matches the current visual state — otherwise a Theme Editor change
+        // mid-transmit would re-resolve the stale idle template over the red.
+        // Active red stays literal (byte-identical to the prior appearance).
+        if (tx) {
+            AetherSDR::ThemeManager::instance().applyStyleSheet(m_moxBtn,
+                "QPushButton { background: #cc2222; border: 1px solid #ff4444; "
+                "border-radius: 3px; color: #ffffff; font-size: 10px; font-weight: bold; "
+                "padding: 2px; }");
+        } else {
+            AetherSDR::ThemeManager::instance().applyStyleSheet(m_moxBtn, kMoxIdleStyle);
+        }
         m_updatingFromModel = false;
     });
 

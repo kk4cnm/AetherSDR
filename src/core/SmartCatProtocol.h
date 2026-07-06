@@ -19,6 +19,9 @@ public:
     explicit SmartCatProtocol(RadioModel* model,
                               int vfoA = 0, int vfoB = -1,
                               bool flexExtensions = true);
+    // On client disconnect, tear down an active split (restore TX to slice A)
+    // so it isn't left applied on the radio.
+    ~SmartCatProtocol();
 
     QString processCommand(const QString& cmd);
 
@@ -149,7 +152,18 @@ private:
     // ── Misc ─────────────────────────────────────────────────────────────────
     QString cmdZZBI(const QString& arg);
     QString cmdZZDE(const QString& arg);
-    QString cmdZZFR();
+    QString cmdZZFR(const QString& arg);
+    // Split mechanism (manager-free): reuse the operator-configured VFO B slice if
+    // present; else NOT_ENABLED ("?;"). Dedicated-TX-slice creation on a genuine
+    // single-VFO port (the SmartSDR-for-Windows behavior) is deferred to the
+    // slice-management consolidation.
+    QString enableSplit();
+    QString disableSplit();
+    void    teardownSplit();
+    // Shared read/set for the three split toggles (FT / ZZSW / ZZFT): read form
+    // (empty or "?") returns "<prefix><0|1>"; "1"/"0" enable/disable; anything else
+    // → "?;" (never silently disables on a malformed arg).
+    QString splitCommand(const QString& prefix, const QString& arg);
 
     QString processCommandImpl(const QString& cmd);
 
@@ -164,7 +178,16 @@ private:
     int         m_vfoB{-1};
     bool        m_flexExtensions{true};
     bool        m_aiEnabled{false};
+    // Reported split state (this client's intent). Set SYNCHRONOUSLY in
+    // enableSplit/teardownSplit because setTxSlice() updates the slice's TX flag
+    // only asynchronously (radio status echo); a model-derived read would be stale
+    // in the window right after enable/disable.
     bool        m_splitEnabled{false};
+    // True only when WE moved TX onto VFO B, so a disconnect undoes only our own
+    // split — never an operator's or another client's.
+    bool        m_weEngagedSplit{false};
+    bool        m_rxVfoB{false};   // false = VFO A is the RX VFO. FR selector echo only:
+                                   // intentionally does NOT swap VFOs (SmartSDR-Mac parity).
     bool        m_pttAssertedByMe{false};
 };
 

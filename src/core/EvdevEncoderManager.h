@@ -51,6 +51,10 @@ signals:
     void tuneSteps(int steps);
     void buttonEvent(const QString& signature, int action);
     void connectionChanged(bool connected, const QString& name);
+    // Emitted when a recognized dial is present but its /dev/input node can't
+    // be opened (EACCES) — i.e. the udev access rule isn't installed. The UI
+    // uses this to offer a one-click, polkit-authenticated rule install.
+    void accessRequired(const QString& deviceName);
 
 private slots:
     void onReadable();
@@ -58,8 +62,10 @@ private slots:
 
 private:
     // Scan /dev/input/event* for a device matching one of our name patterns.
-    // Returns the path of the first match, or empty string if none found.
-    QString findMatchingDevice() const;
+    // Returns the path of the first openable match, or empty string if none.
+    // If a name-matching device is found but its node can't be opened
+    // (EACCES), its name is written to *blockedName (when non-null).
+    QString findMatchingDevice(QString* blockedName = nullptr) const;
     bool openAndGrab(const QString& path);
     void closeFd();
     void emitChord(int keycode, int action);  // chord assembly + signature emit
@@ -70,6 +76,7 @@ private:
     QSocketNotifier* m_notifier{nullptr};
     QFileSystemWatcher* m_watcher{nullptr};
     QTimer* m_rescanTimer{nullptr};  // debounced rescan after directory change
+    bool m_accessRequiredEmitted{false};  // de-dupe accessRequired across rescans
 
     // Decoder state — Ulanzi Dial encodes some buttons as Ctrl+key chords
     // and one as a Ctrl+Y+KEY_PREVIOUSSONG compound. We assemble chords

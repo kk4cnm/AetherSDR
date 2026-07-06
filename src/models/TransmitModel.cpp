@@ -30,6 +30,7 @@ void TransmitModel::resetState()
     m_txSliceMode.clear();
 
     emit apdStateChanged();
+    emit transmittingChanged(false);
     emit moxChanged(false);
     emit tuneChanged(false);
     emit micStateChanged();
@@ -65,6 +66,7 @@ void TransmitModel::applyTransmitStatus(const QMap<QString, QString>& kvs)
 
     // ── Mic / monitor / processor keys ──────────────────────────────────────
     bool micChanged = false;
+    bool phoneChanged = false;
 
     if (kvs.contains("mic_selection")) {
         QString v = kvs["mic_selection"].toUpper();
@@ -89,10 +91,12 @@ void TransmitModel::applyTransmitStatus(const QMap<QString, QString>& kvs)
     if (kvs.contains("compander")) {
         bool v = kvs["compander"] == "1";
         if (m_companderOn != v) { m_companderOn = v; micChanged = true; }
+        if (m_dexpOn != v) { m_dexpOn = v; phoneChanged = true; }
     }
     if (kvs.contains("compander_level")) {
         int v = qBound(0, kvs["compander_level"].toInt(), 100);
         if (m_companderLevel != v) { m_companderLevel = v; micChanged = true; }
+        if (m_dexpLevel != v) { m_dexpLevel = v; phoneChanged = true; }
     }
     if (kvs.contains("dax")) {
         bool v = kvs["dax"] == "1";
@@ -108,7 +112,6 @@ void TransmitModel::applyTransmitStatus(const QMap<QString, QString>& kvs)
     }
 
     // ── VOX keys ───────────────────────────────────────────────────────────
-    bool phoneChanged = false;
 
     if (kvs.contains("vox_enable")) {
         bool v = kvs["vox_enable"] == "1";
@@ -142,12 +145,14 @@ void TransmitModel::applyTransmitStatus(const QMap<QString, QString>& kvs)
         int v = qBound(0, kvs["am_carrier_level"].toInt(), 100);
         if (m_amCarrierLevel != v) { m_amCarrierLevel = v; phoneChanged = true; }
     }
-    if (kvs.contains("dexp")) {
+    if (kvs.contains("dexp") && !kvs.contains("compander")) {
         bool v = kvs["dexp"] == "1";
+        if (m_companderOn != v) { m_companderOn = v; micChanged = true; }
         if (m_dexpOn != v) { m_dexpOn = v; phoneChanged = true; }
     }
-    if (kvs.contains("noise_gate_level")) {
+    if (kvs.contains("noise_gate_level") && !kvs.contains("compander_level")) {
         int v = qBound(0, kvs["noise_gate_level"].toInt(), 100);
+        if (m_companderLevel != v) { m_companderLevel = v; micChanged = true; }
         if (m_dexpLevel != v) { m_dexpLevel = v; phoneChanged = true; }
     }
     bool filterCutoffChanged = false;
@@ -435,6 +440,7 @@ void TransmitModel::setMox(bool on)
     // Interlock status from the radio will still reconcile final state.
     if (m_transmitting != on) {
         m_transmitting = on;
+        emit transmittingChanged(on);
         emit moxChanged(on);
     }
     emit commandReady(QString("xmit %1").arg(on ? 1 : 0));
@@ -444,6 +450,9 @@ void TransmitModel::setTransmitting(bool tx)
 {
     if (tx == m_transmitting) return;
     m_transmitting = tx;
+    emit transmittingChanged(tx);
+    // Keep moxChanged for backward compat — CW decoder gate and QSO recorder
+    // currently gate on this signal and need interlock-driven TX edges too.
     emit moxChanged(tx);
 }
 
@@ -551,11 +560,25 @@ void TransmitModel::setSpeechProcessorLevel(int level)
 
 void TransmitModel::setDax(bool on)
 {
+    // Optimistic local update mirroring the sibling mic setters; the radio's
+    // dax= status echo (parsed above, under the micChanged path) supersedes.
+    if (m_daxOn != on) {
+        m_daxOn = on;
+        emit micStateChanged();  // PhoneCwApplet's DAX button binds to this
+    }
     emit commandReady(QString("transmit set dax=%1").arg(on ? 1 : 0));
 }
 
 void TransmitModel::setSbMonitor(bool on)
 {
+    // Optimistic update — radio status echo (sb_monitor) supersedes. micStateChanged
+    // is the signal the MON button's model->widget sync (syncPhoneFromModel) binds to,
+    // matching the sibling setMonGainSb; the sync is guarded by m_updatingFromModel so
+    // the optimistic setChecked cannot re-emit the command.
+    if (m_sbMonitor != on) {
+        m_sbMonitor = on;
+        emit micStateChanged();
+    }
     emit commandReady(QString("transmit set mon=%1").arg(on ? 1 : 0));
 }
 
@@ -614,24 +637,33 @@ void TransmitModel::setMicBias(bool on)
 void TransmitModel::setAmCarrierLevel(int level)
 {
     level = qBound(0, level, 100);
+    if (m_amCarrierLevel != level) {
+        m_amCarrierLevel = level;  // optimistic — radio status echo supersedes
+        emit phoneStateChanged();
+    }
     emit commandReady(QString("transmit set am_carrier=%1").arg(level));
 }
 
 void TransmitModel::setDexp(bool on)
 {
-    // Optimistic update — radio may not echo dexp in incremental status
+    // FlexLib v4.2.18 and a SmartSDR v4.2.20 capture show DEXP is the
+    // radio's compander control; older dexp/noise_gate keys are rejected.
     m_dexpOn = on;
+    m_companderOn = on;
     emit phoneStateChanged();
-    emit commandReady(QString("transmit set dexp=%1").arg(on ? 1 : 0));
+    emit micStateChanged();
+    emit commandReady(QString("transmit set compander=%1").arg(on ? 1 : 0));
 }
 
 void TransmitModel::setDexpLevel(int level)
 {
     level = qBound(0, level, 100);
-    // Optimistic update — radio may not echo noise_gate_level in incremental status
+    // See setDexp(): SmartSDR backs DEXP level with compander_level.
     m_dexpLevel = level;
+    m_companderLevel = level;
     emit phoneStateChanged();
-    emit commandReady(QString("transmit set noise_gate_level=%1").arg(level));
+    emit micStateChanged();
+    emit commandReady(QString("transmit set compander_level=%1").arg(level));
 }
 
 void TransmitModel::setTxFilterLow(int hz)
@@ -691,6 +723,10 @@ void TransmitModel::setCwDelay(int ms)
 
 void TransmitModel::setCwSidetone(bool on)
 {
+    if (m_cwSidetone != on) {
+        m_cwSidetone = on;  // optimistic — radio status echo supersedes
+        emit phoneStateChanged();
+    }
     emit commandReady(QString("cw sidetone %1").arg(on ? 1 : 0));
 }
 

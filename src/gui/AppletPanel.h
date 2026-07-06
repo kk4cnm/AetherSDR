@@ -50,8 +50,10 @@ class DaxIqApplet;
 class AntennaGeniusApplet;
 class ShackSwitchApplet;
 class MeterApplet;
+class ProfileSwitcherApplet;
 class HealthApplet;
 class MqttApplet;
+class KiwiSdrApplet;
 class FavoritesPickerDialog;
 #ifdef HAVE_RADE
 class RadeApplet;
@@ -121,7 +123,9 @@ public:
     AntennaGeniusApplet* agApplet()  { return m_agApplet; }
     ShackSwitchApplet*   ssApplet()  { return m_ssApplet; }
     MeterApplet*  meterApplet()  { return m_meterApplet; }
+    ProfileSwitcherApplet* profileSwitcherApplet() { return m_profApplet; }
     HealthApplet* healthApplet() { return m_healthApplet; }
+    KiwiSdrApplet* kiwiSdrApplet() { return m_kiwiSdrApplet; }
 #ifdef HAVE_RADE
     RadeApplet*   radeApplet()   { return m_radeApplet; }
 #endif
@@ -251,8 +255,6 @@ private:
     ContainerWidget* m_sMeterContainer{nullptr};
     QPushButton*     m_vuBtn{nullptr};
     SMeterWidget*    m_sMeter{nullptr};
-    QComboBox*    m_txSelect{nullptr};
-    QComboBox*    m_rxSelect{nullptr};
     RxApplet*    m_rxApplet{nullptr};
     TunerApplet* m_tunerApplet{nullptr};
     AmpApplet*   m_ampApplet{nullptr};
@@ -283,7 +285,9 @@ private:
     AntennaGeniusApplet* m_agApplet{nullptr};
     ShackSwitchApplet*   m_ssApplet{nullptr};
     MeterApplet* m_meterApplet{nullptr};
+    ProfileSwitcherApplet* m_profApplet{nullptr};
     HealthApplet* m_healthApplet{nullptr};
+    KiwiSdrApplet* m_kiwiSdrApplet{nullptr};
 #ifdef HAVE_RADE
     RadeApplet*  m_radeApplet{nullptr};
 #endif

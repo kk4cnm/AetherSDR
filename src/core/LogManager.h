@@ -4,10 +4,13 @@
 
 #include <QObject>
 #include <QList>
+#include <QHash>
 #include <QString>
 #include <QLoggingCategory>
 #include <QMutex>
 #include <QtCore/qlogging.h>
+
+#include <functional>
 
 namespace AetherSDR {
 
@@ -38,6 +41,11 @@ Q_DECLARE_LOGGING_CATEGORY(lcPerf)
 Q_DECLARE_LOGGING_CATEGORY(lcCw)
 Q_DECLARE_LOGGING_CATEGORY(lcSHistory)
 Q_DECLARE_LOGGING_CATEGORY(lcAx25)
+Q_DECLARE_LOGGING_CATEGORY(lcWaveform)
+Q_DECLARE_LOGGING_CATEGORY(lcKiwiSdr)
+Q_DECLARE_LOGGING_CATEGORY(lcKiwiSdrAudio)
+Q_DECLARE_LOGGING_CATEGORY(lcAutomation)
+Q_DECLARE_LOGGING_CATEGORY(lcQrz)
 
 // Central registry for toggling per-module diagnostic logging at runtime.
 // The Support dialog (Help → Support) uses this to let users enable/disable
@@ -70,6 +78,16 @@ public:
     void shutdownLogging();
     void enqueueMessage(QtMsgType type, const QMessageLogContext& ctx, const QString& msg);
     void flushLog() const;
+
+    // Diagnostic tap (#3646 observability). Invoked synchronously, on the
+    // logging thread, for every enqueued message — after it is handed to the
+    // writer. The automation bridge registers one to expose a high-resolution,
+    // monotonic-timestamped event stream that mirrors the log file. Taps must
+    // be cheap and MUST NOT log (re-entrancy would deadlock the tap mutex).
+    using LogTap = std::function<void(QtMsgType type, const QString& category,
+                                      const QString& message)>;
+    int  addTap(LogTap tap);
+    void removeTap(int id);
     AsyncLogWriter::Counters logCounters() const;
 
     QString logFilePath() const;
@@ -105,6 +123,10 @@ private:
     mutable QMutex m_pathMutex;
     QString m_activeLogFilePath;
     mutable AsyncLogWriter m_writer;
+
+    mutable QMutex m_tapMutex;
+    QHash<int, LogTap> m_taps;
+    int m_nextTapId{1};
 };
 
 } // namespace AetherSDR

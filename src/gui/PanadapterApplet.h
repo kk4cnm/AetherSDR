@@ -12,6 +12,7 @@ class RangeSlider;
 namespace AetherSDR {
 
 class SpectrumWidget;
+class CallsignCard;
 
 // Container for a single panadapter display (FFT spectrum + waterfall).
 // Adds a title bar with placeholder min/max/close buttons above the
@@ -19,6 +20,10 @@ class SpectrumWidget;
 // slice gets its own PanadapterApplet in a vertical splitter.
 class PanadapterApplet : public QWidget {
     Q_OBJECT
+    // Expose panId via the meta-object so the automation bridge (core/, no GUI
+    // include) can map a pan back to its radio stream id without depending on
+    // this header — used by `grab pan <index>` and `pan close <index>` (#3646).
+    Q_PROPERTY(QString panId READ panId WRITE setPanId)
 
 public:
     explicit PanadapterApplet(QWidget* parent = nullptr);
@@ -44,6 +49,9 @@ public:
     QPushButton* lockPitchButton()  const { return m_lockPitchBtn; }
     QPushButton* lockSpeedButton()  const { return m_lockSpeedBtn; }
     float        cwCostThreshold()  const { return m_cwCostThreshold; }
+    // Contact card beside the decoded text — MainWindow's QRZ wiring
+    // fills it when the CW stream identifies a station (hidden until then).
+    CallsignCard* cwCallsignCard() const { return m_cwCallsignCard; }
     int speedRangeLow()   const;
     int speedRangeHigh()  const;
     int pitchRangeLow()   const;
@@ -72,6 +80,9 @@ signals:
     void pitchRangeChanged(int minHz, int maxHz);
     void speedRangeChanged(int minWpm, int maxWpm);
     void cwPanelCloseRequested();
+    // RX text that passed the confidence filter and was rendered — the
+    // stream the CW callsign spotter watches for "DE <call> <call>".
+    void cwRxTextDisplayed(const QString& text);
 
     // RTTY
     void rttyMarkHzChanged(int hz);
@@ -84,6 +95,13 @@ protected:
     bool eventFilter(QObject* obj, QEvent* ev) override;
 
 private:
+    // Re-apply the decoded-text stylesheet at the current font size (#3628).
+    void applyCwFont();
+    // Change the decoded-text font size by `delta` px, clamp, and persist (#3628).
+    void adjustCwFont(int delta);
+    // Persist + clamp the CW panel height after a grip drag (#3628).
+    void setCwPanelHeight(int h);
+
     QString         m_panId;
     SpectrumWidget* m_spectrum{nullptr};
     QWidget*        m_titleBar{nullptr};
@@ -95,7 +113,9 @@ private:
 
     // CW decode
     QWidget*      m_cwPanel{nullptr};
+    QWidget*      m_cwGrip{nullptr};
     QTextEdit*    m_cwText{nullptr};
+    CallsignCard* m_cwCallsignCard{nullptr};
     QLabel*       m_cwStatsLabel{nullptr};
     QSlider*      m_cwSensSlider{nullptr};
     QPushButton*  m_lockPitchBtn{nullptr};
@@ -103,6 +123,13 @@ private:
     RangeSlider*  m_pitchRangeSlider{nullptr};
     RangeSlider*  m_speedRangeSlider{nullptr};
     float         m_cwCostThreshold{0.70f};
+
+    // Adjustable, persisted decoded-text display (#3628)
+    int           m_cwFontPx{13};
+    int           m_cwPanelHeight{80};
+    bool          m_cwResizing{false};
+    int           m_cwResizeStartY{0};
+    int           m_cwResizeStartH{0};
 
     enum class CwTextSource { None, Rx, Tx };
     CwTextSource  m_lastCwTextSource{CwTextSource::None};

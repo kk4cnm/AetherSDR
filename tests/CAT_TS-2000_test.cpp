@@ -204,6 +204,13 @@ static QString hz11(qint64 hz)
     return QStringLiteral("%1").arg(hz, 11, 10, QChar('0'));
 }
 
+// Does this port have a usable VFO B? FB returns its frequency when present, or "?"
+// (NOT_ENABLED) on a single-VFO port / when the VFO B slice isn't open.
+static bool hasVfoB(CatClient& c)
+{
+    return c.query(QStringLiteral("FB")).startsWith(QLatin1String("FB"));
+}
+
 static bool isDigits(const QString& s, int n)
 {
     if (s.size() != n) return false;
@@ -340,8 +347,12 @@ void section3(CatClient& c, Runner& r)
     r.section(QStringLiteral("Section 3 — VFO-B Frequency (FB)"));
 
     QString resp = c.query(QStringLiteral("FB"));
-    r.check(QStringLiteral("3.1  FB; returns \"FB\" + 11-digit Hz"),
-            resp.startsWith(QLatin1String("FB")) && isDigits(resp.mid(2), 11),
+    // FB returns the VFO B frequency when a VFO B slice is mapped, else "?" — it
+    // does NOT fall back to VFO A. The old fallback reported VFO A's frequency for
+    // FB while ZZME returned "?;", and that contradiction broke VFO sync (#3633).
+    r.check(QStringLiteral("3.1  FB; → \"FB\"+11-digit Hz (VFO B mapped) or \"?\" (no VFO B)"),
+            (resp.startsWith(QLatin1String("FB")) && isDigits(resp.mid(2), 11))
+                || resp == QLatin1String("?"),
             repr(resp));
 
     QString faResp = c.query(QStringLiteral("FA"));
@@ -518,6 +529,25 @@ void section7(CatClient& c, Runner& r)
 {
     r.section(QStringLiteral("Section 7 — Split (FT)"));
 
+    // The dual-VFO tests below assume a usable VFO B. On a single-VFO port (or a
+    // port whose VFO B slice isn't open) split cannot engage, so FT1 returns "?"
+    // (NOT_ENABLED) instead of a silent ack — which would desync the read stream
+    // if issued with send(). Detect VFO B; when absent, verify NOT_ENABLED with
+    // query() (consuming the "?") and return, keeping the stream in sync.
+    const bool vfoB = hasVfoB(c);
+    if (!vfoB) {
+        const QString ft0 = c.query(QStringLiteral("FT"));
+        r.check(QStringLiteral("7.1  FT; → FT0 (split off, single VFO)"),
+                ft0 == QLatin1String("FT0"), repr(ft0));
+        const QString ft1 = c.query(QStringLiteral("FT1"));
+        r.check(QStringLiteral("7.2  FT1; with no VFO B → \"?\" (NOT_ENABLED)"),
+                ft1 == QLatin1String("?"), repr(ft1));
+        const QString ft0b = c.query(QStringLiteral("FT"));
+        r.check(QStringLiteral("7.3  split still off (FT0) after rejected enable"),
+                ft0b == QLatin1String("FT0"), repr(ft0b));
+        return;
+    }
+
     QString resp = c.query(QStringLiteral("FT"));
     r.check(QStringLiteral("7.1  FT; → FT0 (split off initially)"),
             resp == QLatin1String("FT0"), repr(resp));
@@ -550,15 +580,25 @@ void section7(CatClient& c, Runner& r)
 
 void section8(CatClient& c, Runner& r)
 {
-    r.section(QStringLiteral("Section 8 — FR (RX VFO select — accepted, no-op)"));
+    r.section(QStringLiteral("Section 8 — FR (RX VFO select)"));
 
+    // FR0 selects VFO A (always valid → no reply). FR1 selects VFO B, accepted
+    // only when a real VFO B exists (configured + present) else "?;". FA always
+    // reports VFO A (no A/B swap). query() FR1 so a "?;" reply is consumed and the
+    // read stream stays in sync; an accepted FR1 (no reply) just returns empty.
     c.send(QStringLiteral("FR0"));
-    c.send(QStringLiteral("FR1"));
     QThread::msleep(50);
-    QString resp = c.query(QStringLiteral("FA"));
-    r.check(QStringLiteral("8.1  FR0; FR1; produce no response; FA; works normally after"),
-            resp.startsWith(QLatin1String("FA")) && isDigits(resp.mid(2), 11),
-            repr(resp));
+    QString fr1 = c.query(QStringLiteral("FR1"));   // "?" if no real VFO B, else empty
+    QThread::msleep(50);
+    QString sel = c.query(QStringLiteral("FR"));     // selector read (always replies)
+    QString fa  = c.query(QStringLiteral("FA"));     // FA still reports VFO A
+    const bool faOk = fa.startsWith(QLatin1String("FA")) && isDigits(fa.mid(2), 11);
+    const bool frOk = (fr1 == QLatin1String("?") && sel == QLatin1String("FR0"))   // rejected: no VFO B
+                   || (sel == QLatin1String("FR1"));                                // accepted: VFO B present
+    c.send(QStringLiteral("FR0"));   // restore RX = VFO A
+    r.check(QStringLiteral("8.1  FR1 gated on a real VFO B (else \"?\"); FA reports VFO A; no swap"),
+            faOk && frOk,
+            QStringLiteral("FR1=%1 sel=%2 FA=%3").arg(repr(fr1), repr(sel), repr(fa)));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1007,6 +1047,15 @@ void section14pty(Runner& r, const QString& ptyPath)
 }
 #endif
 
+// Skipped form when --pty was not passed: don't try the round-trip (it would just
+// time out against a PTY that isn't wired up) — skip cleanly instead.
+void section14ptySkip(Runner& r)
+{
+    r.section(QStringLiteral("Section 14 — PTY round-trip (skipped — pass --pty PATH to enable)"));
+    for (const char* name : { "14.1 PTY ID;", "14.2 PTY FA;", "14.3 PTY PS;" })
+        r.skip(QString::fromLatin1(name), QStringLiteral("--pty not set"));
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Section 15 — Squelch, NR/NL/NT/RL, MG, FW, OI, UP/DN, stubs
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1213,6 +1262,7 @@ int main(int argc, char* argv[])
     const quint16 port    = static_cast<quint16>(parser.value(QStringLiteral("port")).toUInt());
     const int     timeout = parser.value(QStringLiteral("timeout")).toInt();
     const bool    doPtt   = parser.isSet(QStringLiteral("ptt"));
+    const bool    doPty   = parser.isSet(QStringLiteral("pty"));
     const bool    doCw    = parser.isSet(QStringLiteral("cw"));
 
     std::cout << '\n' << bold(QStringLiteral("AetherSDR TS-2000 CAT Test Suite")).toStdString() << '\n'
@@ -1256,7 +1306,7 @@ int main(int argc, char* argv[])
     section11(c, r);
     section12(c, r);
     if (doCw) { section13cw(c, r); } else { section13skip(r); }
-    section14pty(r, parser.value(QStringLiteral("pty")));
+    if (doPty) { section14pty(r, parser.value(QStringLiteral("pty"))); } else { section14ptySkip(r); }
     section15(c, r);
 
     // Restore radio state

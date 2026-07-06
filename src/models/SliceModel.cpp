@@ -1,4 +1,5 @@
 #include "SliceModel.h"
+#include "core/KiwiSdrProtocol.h"
 #include <QDebug>
 
 namespace AetherSDR {
@@ -75,7 +76,9 @@ void SliceModel::setMode(const QString& mode)
 {
     if (m_mode == mode) return;
     m_mode = mode;
-    sendCommand(QString("slice set %1 mode=%2").arg(m_id).arg(mode));
+    // aetherd RFC 2.3: express intent; FlexBackend builds "slice set N mode=…"
+    // and routes it through the TX-inhibit-guarded slice sink.
+    emit modeChangeRequested(mode);
     emit modeChanged(mode);
 }
 
@@ -83,7 +86,90 @@ void SliceModel::setFilterWidth(int low, int high)
 {
     m_filterLow  = low;
     m_filterHigh = high;
+    // Operator-driven filter change (preset/drag): bump the user epoch so the
+    // adaptive engine adopts this as its new baseline. applyAdaptiveFilter()
+    // deliberately does NOT bump it. RFC #3878.
+    ++m_userFilterEpoch;
     // FlexAPI: "filt <id> <low_hz> <high_hz>"
+    sendCommand(QString("filt %1 %2 %3").arg(m_id).arg(low).arg(high));
+    emit filterChanged(low, high);
+}
+
+// ── Adaptive RX filter (RFC #3878) ──────────────────────────────────────
+// Client-side only: the radio does not store these toggles/bounds, so they
+// send no command (cf. setQsk). The engine drives the actual passband via
+// applyAdaptiveFilter(); the filter edges themselves remain radio-authoritative.
+
+void SliceModel::setAdaptiveFilterEnabled(bool on)
+{
+    if (m_adaptiveFilterEnabled == on) return;
+    m_adaptiveFilterEnabled = on;
+    // Disabling drops any live-fit indication; the engine restores the
+    // operator's selected filter separately.
+    if (!on) setAdaptiveActive(false);
+    emit adaptiveFilterEnabledChanged(on);
+}
+
+void SliceModel::setAdaptiveMinLowCut(int hz)
+{
+    if (m_adaptiveMinLowCut == hz) return;
+    m_adaptiveMinLowCut = hz;
+    emit adaptiveMinLowCutChanged(hz);
+}
+
+void SliceModel::setAdaptiveMaxHighCut(int hz)
+{
+    if (m_adaptiveMaxHighCut == hz) return;
+    m_adaptiveMaxHighCut = hz;
+    emit adaptiveMaxHighCutChanged(hz);
+}
+
+void SliceModel::setAdaptiveMinSnr(int level)
+{
+    level = std::clamp(level, 0, 2);
+    if (m_adaptiveMinSnr == level) return;
+    m_adaptiveMinSnr = level;
+    emit adaptiveMinSnrChanged(level);
+}
+
+void SliceModel::setAdaptiveResponse(int level)
+{
+    level = std::clamp(level, 0, 2);
+    if (m_adaptiveResponse == level) return;
+    m_adaptiveResponse = level;
+    emit adaptiveResponseChanged(level);
+}
+
+void SliceModel::setAdaptiveSplatter(int level)
+{
+    level = std::clamp(level, 0, 2);
+    if (m_adaptiveSplatter == level) return;
+    m_adaptiveSplatter = level;
+    emit adaptiveSplatterChanged(level);
+}
+
+void SliceModel::setAdaptiveHetReject(bool on)
+{
+    if (m_adaptiveHetReject == on) return;
+    m_adaptiveHetReject = on;
+    emit adaptiveHetRejectChanged(on);
+}
+
+void SliceModel::setAdaptiveActive(bool on)
+{
+    if (m_adaptiveActive == on) return;
+    m_adaptiveActive = on;
+    emit adaptiveActiveChanged(on);
+}
+
+void SliceModel::applyAdaptiveFilter(int low, int high)
+{
+    // Identical wire effect to setFilterWidth() — the radio stays
+    // authoritative and we never persist the edges. Kept as a separate entry
+    // point so the engine can distinguish its own writes from a user's
+    // preset/drag for baseline tracking.
+    m_filterLow  = low;
+    m_filterHigh = high;
     sendCommand(QString("filt %1 %2 %3").arg(m_id).arg(low).arg(high));
     emit filterChanged(low, high);
 }
@@ -285,7 +371,18 @@ void SliceModel::setAnflLevel(int v)
 
 void SliceModel::setAgcMode(const QString& mode)
 {
-    if (m_agcMode == mode) return;
+    if (m_externalReceiveAudioReplacement) {
+        if (m_externalReceiveAgcMode == mode) {
+            return;
+        }
+        m_externalReceiveAgcMode = mode;
+        emit externalReceiveAgcModeChanged(m_externalReceiveAgcMode);
+        return;
+    }
+
+    if (m_agcMode == mode) {
+        return;
+    }
     m_agcMode = mode;
     sendCommand(QString("slice set %1 agc_mode=%2").arg(m_id).arg(mode));
     emit agcModeChanged(mode);
@@ -293,8 +390,21 @@ void SliceModel::setAgcMode(const QString& mode)
 
 void SliceModel::setAgcThreshold(int value)
 {
+    if (m_externalReceiveAudioReplacement) {
+        value = qBound(KiwiSdrProtocol::kAgcThresholdMinDb, value,
+                       KiwiSdrProtocol::kAgcThresholdMaxDb);
+        if (m_externalReceiveAgcThreshold == value) {
+            return;
+        }
+        m_externalReceiveAgcThreshold = value;
+        emit externalReceiveAgcThresholdChanged(m_externalReceiveAgcThreshold);
+        return;
+    }
+
     value = qBound(0, value, 100);
-    if (m_agcThreshold == value) return;
+    if (m_agcThreshold == value) {
+        return;
+    }
     m_agcThreshold = value;
     sendCommand(QString("slice set %1 agc_threshold=%2").arg(m_id).arg(value));
     emit agcThresholdChanged(value);
@@ -303,7 +413,18 @@ void SliceModel::setAgcThreshold(int value)
 void SliceModel::setAgcOffLevel(int value)
 {
     value = qBound(0, value, 100);
-    if (m_agcOffLevel == value) return;
+    if (m_externalReceiveAudioReplacement) {
+        if (m_externalReceiveAgcOffLevel == value) {
+            return;
+        }
+        m_externalReceiveAgcOffLevel = value;
+        emit externalReceiveAgcOffLevelChanged(m_externalReceiveAgcOffLevel);
+        return;
+    }
+
+    if (m_agcOffLevel == value) {
+        return;
+    }
     m_agcOffLevel = value;
     sendCommand(QString("slice set %1 agc_off_level=%2").arg(m_id).arg(value));
     emit agcOffLevelChanged(value);
@@ -311,6 +432,19 @@ void SliceModel::setAgcOffLevel(int value)
 
 void SliceModel::setSquelch(bool on, int level)
 {
+    if (m_externalReceiveAudioReplacement) {
+        level = qBound(0, level, 99);
+        const bool onChanged = (m_externalReceiveSquelchOn != on);
+        const bool levelChanged = (m_externalReceiveSquelchLevel != level);
+        if (!onChanged && !levelChanged) {
+            return;
+        }
+        m_externalReceiveSquelchOn = on;
+        m_externalReceiveSquelchLevel = level;
+        emit externalReceiveSquelchChanged(on, level);
+        return;
+    }
+
     level = qBound(0, level, 100);
     const bool onChanged = (m_squelchOn != on);
     const bool levelChanged = (m_squelchLevel != level);
@@ -326,6 +460,15 @@ void SliceModel::setSquelch(bool on, int level)
         sendCommand(QString("slice set %1 squelch_level=%2").arg(m_id).arg(level));
 
     emit squelchChanged(on, level);
+}
+
+void SliceModel::setExternalReceiveAutoSquelch(bool on)
+{
+    if (m_externalReceiveAutoSquelch == on) {
+        return;
+    }
+    m_externalReceiveAutoSquelch = on;
+    emit externalReceiveAutoSquelchChanged(on);
 }
 
 void SliceModel::setRit(bool on, int hz)
@@ -468,6 +611,15 @@ void SliceModel::setFmDeviation(int hz)
 void SliceModel::setAudioGain(float gain)
 {
     gain = qBound(0.0f, gain, 100.0f);
+    if (m_externalReceiveAudioReplacement) {
+        if (m_externalReceiveAudioGain == gain) {
+            return;
+        }
+        m_externalReceiveAudioGain = gain;
+        emit audioGainChanged(m_externalReceiveAudioGain);
+        return;
+    }
+
     if (m_audioGain == gain) return;
     m_audioGain = gain;
     emit commandReady(QString("slice set %1 audio_level=%2")
@@ -483,10 +635,99 @@ void SliceModel::setRfGain(float gain)
 
 void SliceModel::setAudioMute(bool mute)
 {
+    const bool previousVisibleMute = audioMute();
+    if (m_externalReceiveAudioReplacement) {
+        if (m_externalReceiveAudioMute == mute) {
+            return;
+        }
+        m_externalReceiveAudioMute = mute;
+        if (audioMute() != previousVisibleMute) {
+            emit audioMuteChanged(audioMute());
+        }
+        return;
+    }
+
     if (m_audioMute == mute) return;
     m_audioMute = mute;
     sendCommand(QString("slice set %1 audio_mute=%2").arg(m_id).arg(mute ? 1 : 0));
-    emit audioMuteChanged(mute);
+    if (audioMute() != previousVisibleMute) {
+        emit audioMuteChanged(audioMute());
+    }
+}
+
+void SliceModel::setExternalReceiveAudioReplacementMute(bool active,
+                                                        bool restoreMute)
+{
+    const bool previousVisibleMute = audioMute();
+    const float previousVisibleGain = audioGain();
+    const int previousVisiblePan = audioPan();
+    const QString previousReceiveAgcMode = receiveAgcMode();
+    const int previousReceiveAgcThreshold = receiveAgcThreshold();
+    const int previousReceiveAgcOffLevel = receiveAgcOffLevel();
+    const bool previousReceiveSquelchOn = receiveSquelchOn();
+    const int previousReceiveSquelchLevel = receiveSquelchLevel();
+    const bool previousExternalAutoSquelch = m_externalReceiveAutoSquelch;
+    if (active) {
+        m_externalReceiveAudioGain = m_audioGain;
+        m_externalReceiveAudioPan = m_audioPan;
+        m_externalReceiveAudioMute = false;
+        m_externalReceiveAudioReplacement = true;
+        if (!m_audioMute) {
+            m_audioMute = true;
+            sendCommand(QString("slice set %1 audio_mute=1").arg(m_id));
+        }
+    } else {
+        m_externalReceiveAudioReplacement = false;
+        m_externalReceiveAutoSquelch = false;
+        if (m_audioMute != restoreMute) {
+            m_audioMute = restoreMute;
+            sendCommand(QString("slice set %1 audio_mute=%2")
+                            .arg(m_id)
+                            .arg(restoreMute ? 1 : 0));
+        }
+    }
+    if (audioMute() != previousVisibleMute) {
+        emit audioMuteChanged(audioMute());
+    }
+    if (audioGain() != previousVisibleGain) {
+        emit audioGainChanged(audioGain());
+    }
+    if (audioPan() != previousVisiblePan) {
+        emit audioPanChanged(audioPan());
+    }
+    if (receiveAgcMode() != previousReceiveAgcMode) {
+        if (m_externalReceiveAudioReplacement) {
+            emit externalReceiveAgcModeChanged(receiveAgcMode());
+        } else {
+            emit agcModeChanged(agcMode());
+        }
+    }
+    if (receiveAgcThreshold() != previousReceiveAgcThreshold) {
+        if (m_externalReceiveAudioReplacement) {
+            emit externalReceiveAgcThresholdChanged(receiveAgcThreshold());
+        } else {
+            emit agcThresholdChanged(agcThreshold());
+        }
+    }
+    if (receiveAgcOffLevel() != previousReceiveAgcOffLevel) {
+        if (m_externalReceiveAudioReplacement) {
+            emit externalReceiveAgcOffLevelChanged(receiveAgcOffLevel());
+        } else {
+            emit agcOffLevelChanged(agcOffLevel());
+        }
+    }
+    if (receiveSquelchOn() != previousReceiveSquelchOn
+        || receiveSquelchLevel() != previousReceiveSquelchLevel) {
+        if (m_externalReceiveAudioReplacement) {
+            emit externalReceiveSquelchChanged(receiveSquelchOn(),
+                                               receiveSquelchLevel());
+        } else {
+            emit squelchChanged(squelchOn(), squelchLevel());
+        }
+    }
+    if (m_externalReceiveAutoSquelch != previousExternalAutoSquelch) {
+        emit externalReceiveAutoSquelchChanged(m_externalReceiveAutoSquelch);
+    }
 }
 
 void SliceModel::setDiversity(bool on)
@@ -530,6 +771,15 @@ void SliceModel::setEscPhaseShift(float deg)
 void SliceModel::setAudioPan(int pan)
 {
     pan = qBound(0, pan, 100);
+    if (m_externalReceiveAudioReplacement) {
+        if (m_externalReceiveAudioPan == pan) {
+            return;
+        }
+        m_externalReceiveAudioPan = pan;
+        emit audioPanChanged(m_externalReceiveAudioPan);
+        return;
+    }
+
     if (m_audioPan == pan) return;
     m_audioPan = pan;
     sendCommand(QString("slice set %1 audio_pan=%2").arg(m_id).arg(pan));
@@ -646,41 +896,73 @@ void SliceModel::applyStatus(const QMap<QString, QString>& kvs)
     }
     if (kvs.contains("audio_level")) {
         float g = kvs["audio_level"].toFloat();
-        if (m_audioGain != g) { m_audioGain = g; emit audioGainChanged(g); }
+        if (m_audioGain != g) {
+            const float previousVisibleGain = audioGain();
+            m_audioGain = g;
+            if (audioGain() != previousVisibleGain) {
+                emit audioGainChanged(audioGain());
+            }
+        }
     }
     if (kvs.contains("audio_pan")) {
+        const int previousVisiblePan = audioPan();
         m_audioPan = kvs["audio_pan"].toInt();
-        emit audioPanChanged(m_audioPan);
+        if (audioPan() != previousVisiblePan) {
+            emit audioPanChanged(audioPan());
+        }
     }
     if (kvs.contains("audio_mute")) {
         bool mute = kvs["audio_mute"] == "1";
         if (mute != m_audioMute) {
+            const bool previousVisibleMute = audioMute();
             m_audioMute = mute;
-            emit audioMuteChanged(mute);
+            if (m_externalReceiveAudioReplacement && !m_audioMute) {
+                m_audioMute = true;
+                sendCommand(QString("slice set %1 audio_mute=1").arg(m_id));
+            }
+            if (audioMute() != previousVisibleMute) {
+                emit audioMuteChanged(audioMute());
+            }
         }
     } else if (kvs.value("in_use") == "1" && m_audioMute) {
         // Full status w/o audio_mute key → radio reset to default (0)
         // on (re)connect. Resync so UI doesn't show a stale 🔇 while
         // audio is actually playing. Radio does not persist audio_mute
         // (see MainWindow.cpp migration note ~line 1264).
-        m_audioMute = false;
-        emit audioMuteChanged(false);
+        if (m_externalReceiveAudioReplacement) {
+            sendCommand(QString("slice set %1 audio_mute=1").arg(m_id));
+        } else {
+            const bool previousVisibleMute = audioMute();
+            m_audioMute = false;
+            if (audioMute() != previousVisibleMute) {
+                emit audioMuteChanged(audioMute());
+            }
+        }
     }
     // Parse child/parent flags before emitting diversityChanged so handlers
     // can check isDiversityChild() to gate ESC panel visibility.
-    if (kvs.contains("diversity_child"))
+    const bool previousDiversityChild = m_diversityChild;
+    const bool previousDiversityParent = m_diversityParent;
+    const bool previousDiversity = m_diversity;
+    const int previousDiversityIndex = m_diversityIndex;
+    if (kvs.contains("diversity_child")) {
         m_diversityChild = kvs["diversity_child"] == "1";
-    if (kvs.contains("diversity_parent"))
-        m_diversityParent = kvs["diversity_parent"] == "1";
-    if (kvs.contains("diversity")) {
-        bool div = kvs["diversity"] == "1";
-        if (div != m_diversity) {
-            m_diversity = div;
-            emit diversityChanged(div);
-        }
     }
-    if (kvs.contains("diversity_index"))
+    if (kvs.contains("diversity_parent")) {
+        m_diversityParent = kvs["diversity_parent"] == "1";
+    }
+    if (kvs.contains("diversity")) {
+        m_diversity = kvs["diversity"] == "1";
+    }
+    if (kvs.contains("diversity_index")) {
         m_diversityIndex = kvs["diversity_index"].toInt();
+    }
+    if (m_diversityChild != previousDiversityChild
+        || m_diversityParent != previousDiversityParent
+        || m_diversity != previousDiversity
+        || m_diversityIndex != previousDiversityIndex) {
+        emit diversityChanged(m_diversity);
+    }
 
     // ESC (Enhanced Signal Clarity) — diversity beamforming
     if (kvs.contains("esc")) {

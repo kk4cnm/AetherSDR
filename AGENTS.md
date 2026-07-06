@@ -9,13 +9,13 @@ tool. Each tool has its own well-known file at a different path
 project-wide lives in **this** file.
 
 If you are an AI assistant: read this file end-to-end before writing
-code or recommending merges. The file is ~330 lines; that's the cost
+code or recommending merges. The file is ~440 lines; that's the cost
 of doing the job right on this codebase.
 
 ## Project Goal
 
 Replicate the **Windows-only FlexRadio SmartSDR client** (written in C#) as a
-**Linux-native C++ application** using Qt6 and C++20. The aim is to mirror the
+**native, cross-platform C++ application** using Qt6 and C++20. The aim is to mirror the
 look, feel, and every function SmartSDR is capable of. The reference radio is a
 **FLEX-8600 running firmware 4.2.18**, which speaks **SmartSDR protocol v1.4.0.0**.
 
@@ -32,15 +32,26 @@ When helping with AetherSDR:
 - Flag any proposal that would break slice 0 RX flow
 - If unsure about protocol behavior → ask for logs/wireshark captures first
 - **Use `AppSettings`, never `QSettings`** — see "Settings Persistence" below
+- **New engine code goes in `libaethercore`** (`src/core/` or `src/models/`),
+  exposed to the UI through models — never via a new gui→core header include.
+  See "Build targets" and "In-flight: aetherd" under Architecture Overview.
 - **Read `CONTRIBUTING.md`** for full contributor guidelines, coding conventions,
   and the AI-to-AI debugging protocol (open a GitHub issue for cross-agent coordination)
+- **Sign every commit you author.** `main` enforces `required_signatures`, so a
+  PR with unsigned commits cannot merge without an admin override. If the
+  contributor has not set up commit signing yet, walk them through
+  `docs/COMMIT-SIGNING.md` **before** you commit — the top of that file is a
+  step-by-step AI-assistant algorithm covering Windows / macOS / Linux / WSL /
+  Raspberry Pi. Default to SSH signing; GPG is the fallback for existing GPG
+  workflows. Verify with `git log --show-signature -1` after the first commit.
 - **Read the AetherSDR Constitution before writing or reviewing code.**
   Canonical source: `.specify/memory/constitution.md`. Byte-identical
   mirror at `CONSTITUTION.md` in repo root for discoverability. 14
-  principles total: 7 AetherSDR-domain conventions (FlexLib authority,
-  MeterSmoother, UI labels, BandPlanManager, nested-JSON config, CHAIN
-  widget, auto-generated Contributors) + 7 defensive engineering
-  principles adopted from Cisco's
+  principles total (constitution v2.0.0): 7 AetherSDR-domain governance
+  principles (FlexLib authority, radio-authoritative live state,
+  radio-persistable settings, clean-room contributions, per-feature
+  config ownership, transmit-on-intent, boundary input validation) + 7
+  defensive engineering principles adopted from Cisco's
   [Foundry Constitution](https://github.com/CiscoDevNet/foundry-security-spec/blob/main/constitution.md)
   (Evidence Over Assertion, Surface Only What Survives, Claims Are
   Atomic And Mortal, Fixes Are Demonstrated, Sandbox By Infrastructure,
@@ -160,7 +171,7 @@ cmake --build build -j$(nproc)
 
 Full dependency list is in `README.md` — don't duplicate it here.
 
-Current version: **26.5.2.1** (set in both `CMakeLists.txt` and `README.md`).
+Current version: **26.7.1** (set in both `CMakeLists.txt` and `README.md`).
 Versioning scheme is **CalVer** (`YY.M.patch[.hotfix]`) starting from v26.5.1,
 the 1.0-equivalent. Hotfix sub-patches use a 4th component (e.g. 26.5.2.1).
 Earlier tags used semver through v0.9.8.
@@ -198,17 +209,83 @@ Key source directories: `src/core/` (protocol, audio, DSP), `src/models/`
 
 **Key classes:**
 - `RadioModel` — central state, owns connection + all sub-models
+- `RadioSession` — per-radio aggregate that owns `RadioModel` + `TciServer` +
+  `CatPorts`, giving teardown a structural order (#3351 / #3445)
 - `AudioEngine` — RX/TX audio, NR2/RN2/NR4/BNR/DFNR DSP pipeline
 - `SpectrumWidget` — GPU-accelerated FFT spectrum + waterfall (QRhiWidget)
-- `MainWindow` — wires everything together, signal routing hub
+- `MainWindow` — wires everything together, signal routing hub. **Decomposed
+  (#3351)** into one class across `MainWindow.cpp` + `MainWindow_*.cpp` sibling
+  TUs; new feature code goes in a sibling, NOT `MainWindow.cpp` — see
+  [Adding code to MainWindow](#adding-code-to-mainwindow)
 - `PanadapterStream` — VITA-49 UDP parsing, routes FFT/waterfall/audio/meters
 
-**Threading:** up to 11 threads — see `docs/architecture/pipelines.md` for the
+**Threading:** up to 12 threads — see `docs/architecture/pipelines.md` for the
 full thread diagram, data flow, cross-thread signal map, and GPU rendering notes.
 
 **Design principle:** RadioModel owns all sub-models on the main thread.
 Worker threads communicate exclusively via auto-queued signals. Never hold
 a mutex in the audio callback.
+
+### In-flight: aetherd engine/UI decoupling (RFC accepted 2026-07-04)
+
+The accepted RFC at
+[`docs/aetherd-headless-engine-design.md`](docs/aetherd-headless-engine-design.md)
+(tracking issue #3849) splits this codebase into an engine library
+(`libaethercore`), a headless engine daemon (`aetherd`), and thin UI
+clients, with pluggable radio backends (`IRadioBackend`). Implementation
+follows the RFC's §10 staged order; **step 1 (`libaethercore`) and the
+step-2 seam have landed** — the engine is a static library, and
+`IRadioBackend` (`src/core/backends/`) with its first implementor
+`FlexBackend` (`src/core/backends/flex/`) exist. `FlexBackend` is a
+skeleton so far: RadioModel owns it and it observes the connection
+lifecycle, but the SmartSDR wire stack moves behind it incrementally
+(2.2b–2.4). The versioned protocol (step 3+) has not landed — UI code
+still consumes models directly, and that remains correct.
+
+**Build targets (post-RFC step 1):**
+
+| Target | Contents | May link |
+|---|---|---|
+| `libaethercore` (`aethercore`) | `src/core/` + `src/models/` — the engine | Qt Core/Network/Multimedia/WebSockets/SerialPort/DBus, the DSP + third-party libs. **Never `gui/`; QtWidgets only via the tracked-legacy files below, shrinking to zero** |
+| `AetherSDR` | `src/gui/` + `main.cpp` — the desktop app | `aethercore` + Qt Widgets + qgeoview + QRhi private |
+
+The engine→gui dependency direction is CI-enforced
+(`tools/check_engine_boundary.py`, `engine-boundary.yml`, `--strict`): no
+`core/`/`models/` file may include a `gui/` header (**EB1 — now zero,
+any finding is an error**), nor use QtWidgets (**EB2** — a shrinking
+tracked-legacy set warns, new usage errors). If your change trips the
+check, restructure the change — do not move the file, weaken the check,
+or add an exemption. Engine code that needs a UI callback defines a
+gui-free interface in `core/` (e.g. `IConnectionAutomation`) that the gui
+implements — never a `gui/` include.
+
+**Until migration rules appear in this file, nothing changes for you.**
+Do not pre-emptively restructure code toward the RFC — no new engine/UI
+seams, no backend interfaces, no speculative library targets. Each
+migration step lands together with an update to this file stating the new
+rules (pre-drafted in
+[`docs/aetherd-agents-md-staging.md`](docs/aetherd-agents-md-staging.md));
+if a rule isn't in this file, its step hasn't landed. Architecture changes
+ahead of the RFC steps remain maintainer-only (see Autonomous Agent
+Boundaries above). One rule is already CI-enforced: the engine
+(`src/core/` + `src/models/`) must not gain new `gui/` includes or
+QtWidgets usage (`tools/check_engine_boundary.py`, warning for tracked
+legacy files, error for new ones).
+
+**Where radio-facing code goes now that the seam exists.** Route by kind:
+
+| Your change | Goes |
+|---|---|
+| Code speaking a vendor wire protocol (commands, discovery, stream parsing) | that family's backend under `src/core/backends/<family>/`, behind `IRadioBackend` — never in `gui/`, and increasingly not in the models (they're being decoupled from the wire over 2.2b–2.4) |
+| A new radio family | a new `IRadioBackend` implementation under `src/core/backends/<family>/` — requires an approved design doc naming its open protocol authority (Constitution Principles I & IV apply per backend) |
+| A new engine feature | `libaethercore`, exposed through models — never via a new gui→core header |
+
+Do **not** yet reroute existing model↔wire code through `FlexBackend`
+wholesale — the per-touchpoint conversion is staged work
+(`docs/architecture/aetherd-touchpoints.md`), and its claim protocol +
+before/after `tools/verify_slice0_rx.py` verification recipe land in this
+file when those conversions (2.3) begin. Until then the models' existing
+direct wire access remains correct.
 
 ---
 
@@ -261,6 +338,38 @@ audio payload, meter data — see `docs/architecture/vita49-format.md`.
 ---
 
 ## Key Implementation Patterns
+
+### Adding code to MainWindow
+
+`MainWindow` was a ~19,500-line monolith; **#3351 split it into one class across
+`MainWindow.cpp` + a family of `MainWindow_*.cpp` sibling TUs.** It is still one
+`MainWindow` class — every sibling-TU function is a `MainWindow::` member
+declared in `MainWindow.h`. The split is about *which file* a body lives in.
+
+**Do not add new feature code to `MainWindow.cpp`.** Route it by subsystem:
+
+| Your change | Goes in |
+|---|---|
+| Feature lifecycle/handler fitting an existing subsystem | that subsystem's TU — demods (RADE/FreeDV/DAX/RTTY/WFM) → `MainWindow_DigitalModes.cpp`; physical controllers → `MainWindow_Controllers.cpp`; SWR sweep → `MainWindow_SwrSweep.cpp`; spot clients → `MainWindow_Spots.cpp`; discovery/connection/pan-lifecycle → `MainWindow_Session.cpp`; client-DSP applets → `MainWindow_DspApplets.cpp` |
+| Wiring a newly-created radio object (slice/pan/VFO/DSP) to the UI | `MainWindow_Wiring.cpp` |
+| A menu item / action | `MainWindow_Menus.cpp` |
+| A keyboard shortcut | `MainWindow_Shortcuts.cpp` |
+| A stateless helper with no `MainWindow` dependency | `MainWindowHelpers.{h,cpp}` |
+| A whole new subsystem with no TU home | a **new** `MainWindow_<Subsystem>.cpp` sibling — only if it's a cohesive subsystem ~500+ lines; smaller waits in the closest sibling |
+| A member field, or a guard inside a function that can't move | stays in `MainWindow.{h,cpp}` (keep minimal) |
+
+A new TU is not free — every sibling re-parses the ~1,000-line `MainWindow.h`,
+and any header edit rebuilds all of them. Split only to a cohesive, reviewable
+granularity, then **stop**: if tempted to subdivide one subsystem into several
+thin TUs, extract a real class instead (the #3557 direction) — that's the only
+move that actually decouples.
+
+Sibling TUs must **carry their includes explicitly** — the Linux CI floor is
+Qt 6.4.2; don't rely on transitive includes (this broke #3532). When you move
+the last user of a header out of `MainWindow.cpp`, drop that `#include` too.
+
+Full map + decision guide:
+**[`docs/architecture/mainwindow-decomposition.md`](docs/architecture/mainwindow-decomposition.md)**.
 
 ### Adding or converting a dialog
 
@@ -323,9 +432,10 @@ Run once at app or feature startup, not on every access.
 
 ### Radio-Authoritative Settings Policy
 
-**The radio is always authoritative for any setting it stores.** AetherSDR
-must never save, recall, or override radio-side settings from client-side
-persistence. Only save client-side settings for things the radio does NOT save.
+**The radio is always authoritative for any setting it stores** (Constitution
+Principles II & III). AetherSDR must never save, recall, or override radio-side
+settings from client-side persistence. Only save client-side settings for things
+the radio does NOT save.
 
 **Radio-authoritative (do NOT persist):** frequency, mode, filter, step size,
 AGC, squelch, DSP flags, antennas, TX power, panadapter *count* and per-pan
@@ -362,6 +472,37 @@ value through `MeterSmoother` (`src/gui/MeterSmoother.h`). Don't write
 new envelope-follower code or copy smoothing logic from other widgets
 — `MeterSmoother`'s header has the API and a usage example.
 
+### User-facing names match the on-screen UI labels
+
+In prose (issue comments, README, What's-New strings, error toasts, support
+requests) call a control by the label the user sees, not the C++ class name —
+e.g. the **DIGI applet** (class `CatApplet`), and the Help → Support logging
+toggles **Discovery / Commands / Status** (not backend names like
+`radio.connection`). The on-screen label wins for prose, so users can find the
+control you're naming.
+
+### Region-aware band data — read from BandPlanManager, not BandDefs.h
+
+Anything needing band edges, segment sizes, or per-band metadata reads the
+active plan via `BandPlanManager` (`AppSettings["BandPlanName"]` + the JSON in
+`resources/bandplans/`). `src/models/BandDefs.h::kBands[]` is ARRL/US-only and
+not region-aware — don't source new features from it; AetherSDR's users span
+IARU regions 1/2/3.
+
+### TX DSP stages integrate with the CHAIN widget
+
+The TX DSP chain is stage-per-applet and the visual **CHAIN** widget is the
+primary entry point. New TX DSP stages must be ordered, toggleable, and
+inspectable through the CHAIN widget rather than adding a parallel UI entry —
+it's the user's mental model for the TX signal path.
+
+### The About-dialog Contributors list is auto-generated
+
+The Contributors list in the About dialog is built at runtime from the GitHub
+API; manual edits are overwritten on the next build. If someone is missing, fix
+the GitHub-side attribution (commit authorship / `Co-Authored-By` trailer),
+don't patch the dialog string.
+
 ---
 
 ## Multi-Panadapter Support
@@ -392,6 +533,16 @@ all initially, remove other clients' when handle arrives.
 
 ---
 
+## KiwiSDR Public-Receiver Browser
+
+The KiwiSDR browser is a clean-room, API-policy-aware public-receiver directory
+(#3679) — find and connect to public KiwiSDR receivers, independent of the
+FlexRadio protocol path. Kiwi panadapters are receive-only (TX is inhibited).
+See `docs/kiwisdr-public-directory.md` (directory / API-policy behaviour) and
+`docs/kiwisdr-cleanroom-design.md` (clean-room design notes, Principle IV).
+
+---
+
 ## Accessibility — `src/gui/` Rules
 
 Touching any file under `src/gui/`? Read [`docs/a11y.md`](docs/a11y.md)
@@ -405,3 +556,34 @@ CI enforcement: [`tools/check_a11y.py`](tools/check_a11y.py) runs on every
 PR via [`.github/workflows/a11y-check.yml`](.github/workflows/a11y-check.yml)
 and emits inline diff annotations for the patterns above. Warning-only
 (`exit 0`); never blocks a build.
+
+## Agent Automation Bridge — verify the GUI without pixels
+
+Need to assert on UI state, drive a control, confirm a widget rendered, or
+capture the panadapter while verifying a change? AetherSDR ships an in-process,
+agent-drivable bridge (off in production). Launch with `AETHER_AUTOMATION=1`
+and drive a `QLocalServer` that speaks newline-delimited JSON:
+
+- `dumpTree` → semantic snapshot of the whole widget tree (objectName,
+  accessibleName, enabled, geometry, live `value`) — your "DOM" for controls.
+- `grab <widget>` → PNG of any widget, including a correct GPU-framebuffer
+  readback of the panadapter (`SpectrumWidget`).
+- `invoke <target> <action> [value]` → click/toggle/setValue/setText/… a
+  control. **Refuses any control marked transmit-keying (`markTxKeying()` /
+  `aetherTxKeying` property — MOX/PTT, TUNE, ATU, CWX send, packet/APRS send)
+  unless `AETHER_AUTOMATION_ALLOW_TX=1`** — the bridge can never key a live
+  radio by accident; setpoint sliders ("Tune power", "RF power") stay drivable.
+  Marked controls show `"keying": true` in `dumpTree`. Also **refuses disabled
+  controls** (no silent no-op). Disambiguate duplicate names with a scoped
+  target: `"RxApplet/AF gain"` vs `"PanadapterApplet/AF gain"`.
+- `get radio|transmit|equalizer|slice|slices|pan|pans [selector] [property]` →
+  live JSON model snapshot (frequency, mode, filter, NB/NR, squelch/AGC/APF,
+  center MHz, min/max dBm, RF/mic/CW TX-chain, EQ bands, …). Assert on truth
+  without screenshots. Sliders/spinboxes also report `range` in `dumpTree`.
+
+Quick start: `python3 tools/automation_probe.py demo` (no Qt dependency); also
+`get radio`, `invoke 'Master volume' setValue 35`. Full reference — protocol,
+JSON schemas, targeting rules, recipes, gotchas — in
+**[`docs/automation-bridge.md`](docs/automation-bridge.md)**. This is the
+deterministic, cross-OS way to do "snapshot → act → assert" on the native UI
+(issue [#3646](https://github.com/aethersdr/AetherSDR/issues/3646)).

@@ -11,6 +11,9 @@ context that would otherwise live in tribal knowledge.
   graph end to end.
 - [`tx-audio-signal-path.md`](tx-audio-signal-path.md) — client-side
   TX DSP stages and how they reach the radio's firmware.
+- [`websdr-sourced-slice.md`](websdr-sourced-slice.md) — design for a
+  VFO/slice that takes audio from a WebSDR feed instead of the radio,
+  the RX-antenna-menu UX, and the aux-source / DSP-routing split.
 - [`flex-meter-learnings.md`](flex-meter-learnings.md) — capture-backed
   notes on the radio's 15 transmit meters across firmware revisions.
 - [`vita49-format.md`](vita49-format.md) — VITA-49 packet layout for
@@ -22,6 +25,9 @@ context that would otherwise live in tribal knowledge.
   lessons learned from the multi-panadapter rollout.
 - [`recenter-policy.md`](recenter-policy.md) — when AetherSDR re-centers
   the panadapter view on a slice change.
+- [`mainwindow-decomposition.md`](mainwindow-decomposition.md) — the
+  `MainWindow_*.cpp` TU map and a decision guide for where new
+  `MainWindow` code belongs (read before touching anything `MainWindow*`).
 
 Code-level reviewers should also skim the corresponding header files
 in `src/core/` and `src/models/`.

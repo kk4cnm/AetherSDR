@@ -1,4 +1,6 @@
 #include "PanadapterApplet.h"
+#include "CallsignCard.h"
+#include "CwDecodeSettings.h"
 #include "FramelessMoveHelper.h"
 #include "GuardedSlider.h"
 #include "RangeSlider.h"
@@ -23,6 +25,8 @@
 #include <QGuiApplication>
 #include <QClipboard>
 #include "core/ThemeManager.h"
+
+#include <algorithm>
 
 namespace AetherSDR {
 
@@ -109,15 +113,34 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     layout->addWidget(m_spectrum, 1);
 
     // ── CW decode panel (hidden by default, shown in CW mode) ─────────
+    // Restore persisted display preferences (#3628): font size and panel
+    // height are user-tunable for readability and history depth.
+    m_cwFontPx     = std::clamp(CwDecodeSettings::fontPx(), 8, 32);
+    m_cwPanelHeight = std::clamp(CwDecodeSettings::panelHeight(), 60, 600);
+
     m_cwPanel = new QWidget(this);
+    m_cwPanel->setObjectName("cwDecodePanel");  // addressable for automation (#3628/#3646)
     m_cwPanel->setCursor(Qt::ArrowCursor);  // prevent invisible cursor from native-window parent (#1096)
-    m_cwPanel->setFixedHeight(80);
+    m_cwPanel->setFixedHeight(m_cwPanelHeight);
     m_cwPanel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     AetherSDR::ThemeManager::instance().applyStyleSheet(m_cwPanel, "QWidget { background: {{color.background.0}}; border-top: 1px solid {{color.background.1}}; }");
 
     auto* cwLayout = new QVBoxLayout(m_cwPanel);
-    cwLayout->setContentsMargins(4, 2, 4, 2);
+    cwLayout->setContentsMargins(4, 0, 4, 2);
     cwLayout->setSpacing(1);
+
+    // Drag-grip along the top edge — drag up/down to resize the panel and
+    // reveal more decoded-text history (#3628).  A thin strip rather than a
+    // QSplitter so the GPU SpectrumWidget (QRhiWidget) is never reparented.
+    m_cwGrip = new QWidget(m_cwPanel);
+    m_cwGrip->setObjectName("cwResizeGrip");
+    m_cwGrip->setFixedHeight(4);
+    m_cwGrip->setCursor(Qt::SizeVerCursor);
+    m_cwGrip->setToolTip("Drag to resize the CW decode panel");
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_cwGrip,
+        "QWidget { background: {{color.background.2}}; }");
+    m_cwGrip->installEventFilter(this);
+    cwLayout->addWidget(m_cwGrip);
 
     // Stats bar: pitch, speed, clear button
     auto* cwBar = new QHBoxLayout;
@@ -223,6 +246,21 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     });
     cwBar->addWidget(copyVisBtn);
 
+    // Font-size controls — adjust and persist the decoded-text size (#3628).
+    auto* fontDownBtn = new QPushButton("A-");
+    fontDownBtn->setObjectName("cwFontDown");
+    fontDownBtn->setToolTip("Decrease decoded-text font size");
+    fontDownBtn->setStyleSheet(cwBtnStyle);
+    connect(fontDownBtn, &QPushButton::clicked, this, [this] { adjustCwFont(-1); });
+    cwBar->addWidget(fontDownBtn);
+
+    auto* fontUpBtn = new QPushButton("A+");
+    fontUpBtn->setObjectName("cwFontUp");
+    fontUpBtn->setToolTip("Increase decoded-text font size");
+    fontUpBtn->setStyleSheet(cwBtnStyle);
+    connect(fontUpBtn, &QPushButton::clicked, this, [this] { adjustCwFont(+1); });
+    cwBar->addWidget(fontUpBtn);
+
     auto* clearBtn = new QPushButton("CLR");
     clearBtn->setStyleSheet(cwBtnStyle);
     connect(clearBtn, &QPushButton::clicked, this, &PanadapterApplet::clearCwText);
@@ -246,11 +284,7 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     m_cwText = new QTextEdit;
     m_cwText->setReadOnly(true);
     m_cwText->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    AetherSDR::ThemeManager::instance().applyStyleSheet(m_cwText, "QTextEdit { background: {{color.background.0}}; color: {{color.accent.success}}; border: none;"
-        " font-family: monospace; font-size: 13px; font-weight: bold; }"
-        "QScrollBar:vertical { width: 6px; background: {{color.background.0}}; }"
-        "QScrollBar::handle:vertical { background: {{color.background.2}}; border-radius: 3px; }"
-        "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }");
+    applyCwFont();  // font-size driven by persisted m_cwFontPx (#3628)
     m_cwText->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     m_cwText->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_cwText->setWordWrapMode(QTextOption::WrapAnywhere);
@@ -258,11 +292,32 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
     connect(m_cwText, &QWidget::customContextMenuRequested, this, [this](const QPoint &pos) {
         QMenu *menu = m_cwText->createStandardContextMenu();
         menu->addSeparator();
+        menu->addAction(tr("Increase font size"), this, [this] { adjustCwFont(+1); });
+        menu->addAction(tr("Decrease font size"), this, [this] { adjustCwFont(-1); });
+        menu->addSeparator();
         menu->addAction(tr("Clear"), this, &PanadapterApplet::clearCwText);
         menu->exec(m_cwText->mapToGlobal(pos));
         delete menu;
     });
-    cwLayout->addWidget(m_cwText);
+    // Decoded text + contact card side by side.  The card stays hidden
+    // until the QRZ wiring spots a station identifying itself in the RX
+    // stream ("DE <call> <call>") and fills it with the lookup result.
+    auto* cwTextRow = new QHBoxLayout;
+    cwTextRow->setContentsMargins(0, 0, 0, 0);
+    cwTextRow->setSpacing(4);
+    cwTextRow->addWidget(m_cwText, 1);
+    m_cwCallsignCard = new CallsignCard(CallsignCard::Variant::Compact, m_cwPanel);
+    m_cwCallsignCard->setCloseButtonVisible(true);
+    m_cwCallsignCard->setMinimumWidth(240);
+    m_cwCallsignCard->setMaximumWidth(320);
+    // Cap the height so the card stays card-shaped (not a full-height
+    // sidebar) when the operator drags the decode panel tall.
+    m_cwCallsignCard->setMaximumHeight(120);
+    m_cwCallsignCard->setVisible(false);
+    connect(m_cwCallsignCard, &CallsignCard::closeRequested,
+            m_cwCallsignCard, &QWidget::hide);
+    cwTextRow->addWidget(m_cwCallsignCard, 0, Qt::AlignTop);
+    cwLayout->addLayout(cwTextRow);
 
     m_cwPanel->hide();
     layout->addWidget(m_cwPanel);
@@ -520,6 +575,38 @@ void PanadapterApplet::setCwPanelVisible(bool visible)
     m_cwPanel->setVisible(visible);
 }
 
+void PanadapterApplet::applyCwFont()
+{
+    // Re-apply the decoded-text stylesheet with the current font size.  The
+    // inserted runs use colour-only <span>s, so the widget font governs them.
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_cwText,
+        QStringLiteral(
+            "QTextEdit { background: {{color.background.0}}; color: {{color.accent.success}}; border: none;"
+            " font-family: monospace; font-size: %1px; font-weight: bold; }"
+            "QScrollBar:vertical { width: 6px; background: {{color.background.0}}; }"
+            "QScrollBar::handle:vertical { background: {{color.background.2}}; border-radius: 3px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }")
+            .arg(m_cwFontPx));
+}
+
+void PanadapterApplet::adjustCwFont(int delta)
+{
+    const int next = std::clamp(m_cwFontPx + delta, 8, 32);
+    if (next == m_cwFontPx)
+        return;
+    m_cwFontPx = next;
+    applyCwFont();
+    CwDecodeSettings::setFontPx(m_cwFontPx);
+}
+
+void PanadapterApplet::setCwPanelHeight(int h)
+{
+    // Live apply only — persistence happens once on grip release to avoid
+    // writing settings on every mouse-move during a drag.
+    m_cwPanelHeight = std::clamp(h, 60, 600);
+    m_cwPanel->setFixedHeight(m_cwPanelHeight);
+}
+
 int PanadapterApplet::speedRangeLow()  const
 {
     return m_speedRangeSlider ? m_speedRangeSlider->low() : 15;
@@ -570,6 +657,8 @@ void PanadapterApplet::appendCwText(const QString& text, float cost)
     m_cwText->insertHtml(QString("<span style=\"color:%1\">%2</span>")
         .arg(color, clean.toHtmlEscaped()));
     m_cwText->moveCursor(QTextCursor::End);
+
+    emit cwRxTextDisplayed(clean);
 }
 
 void PanadapterApplet::appendCwTextTx(const QString& text, float cost)
@@ -611,6 +700,30 @@ void PanadapterApplet::clearCwText()
 
 bool PanadapterApplet::eventFilter(QObject* obj, QEvent* ev)
 {
+    // CW panel resize grip — drag the top edge to grow/shrink the decode
+    // panel (and reveal more decoded-text history) (#3628).
+    if (obj == m_cwGrip) {
+        if (ev->type() == QEvent::MouseButtonPress) {
+            auto* me = static_cast<QMouseEvent*>(ev);
+            if (me->button() == Qt::LeftButton) {
+                m_cwResizing     = true;
+                m_cwResizeStartY = me->globalPosition().toPoint().y();
+                m_cwResizeStartH = m_cwPanel->height();
+                return true;
+            }
+        } else if (ev->type() == QEvent::MouseMove && m_cwResizing) {
+            auto* me = static_cast<QMouseEvent*>(ev);
+            // Dragging up (smaller Y) enlarges the panel.
+            const int dy = m_cwResizeStartY - me->globalPosition().toPoint().y();
+            setCwPanelHeight(m_cwResizeStartH + dy);
+            return true;
+        } else if (ev->type() == QEvent::MouseButtonRelease && m_cwResizing) {
+            m_cwResizing = false;
+            CwDecodeSettings::setPanelHeight(m_cwPanelHeight);
+            return true;
+        }
+    }
+
     if (obj == m_titleBar && m_isFloating && ev->type() == QEvent::MouseMove) {
         return FramelessMoveHelper::move(m_titleBar, static_cast<QMouseEvent*>(ev));
     }
@@ -686,7 +799,7 @@ void PanadapterApplet::appendRttyText(const QString& text, float confidence)
     m_rttyText->moveCursor(QTextCursor::End);
 }
 
-void PanadapterApplet::setRttyStats(float markLevel, float spaceLevel, float snrDb, bool locked)
+void PanadapterApplet::setRttyStats(float markLevel, float /* spaceLevel */, float snrDb, bool locked)
 {
     const int markSegs = qBound(0, qRound(markLevel * 15.0f), 15);
 

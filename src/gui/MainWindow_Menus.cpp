@@ -59,6 +59,8 @@
 #include <QVBoxLayout>
 #include <QWidgetAction>
 
+#include <cmath>
+
 namespace AetherSDR {
 
 void MainWindow::buildMenuBar()
@@ -68,7 +70,7 @@ void MainWindow::buildMenuBar()
     auto* waveformsAct = fileMenu->addAction("Waveforms...");
     waveformsAct->setMenuRole(QAction::NoRole);
     connect(waveformsAct, &QAction::triggered, this, [this] {
-        showOrRaisePersistent(m_waveformsDialog, &m_radioModel.flexWaveformModel());
+        showOrRaisePersistent(m_waveformsDialog, &m_radioModel);
     });
 
     fileMenu->addSeparator();
@@ -94,7 +96,8 @@ void MainWindow::buildMenuBar()
         const bool wasFresh = !m_radioSetupDialog;
         showOrRaisePersistent(m_radioSetupDialog,
                               &m_radioModel, m_audio,
-                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius);
+                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius,
+                              m_kiwiSdrManager);
         if (wasFresh && m_radioSetupDialog)
             wireRadioSetupDialogSignals(m_radioSetupDialog, prevComp);
     });
@@ -114,6 +117,163 @@ void MainWindow::buildMenuBar()
     connect(networkAction, &QAction::triggered, this, [this] {
         showNetworkDiagnosticsDialog();
     });
+
+    auto* receiveSyncMenu = settingsMenu->addMenu("Receive Sync");
+    auto* receiveSyncEnabledAct =
+        receiveSyncMenu->addAction("Sync Kiwi Audio && Display");
+    receiveSyncEnabledAct->setCheckable(true);
+    receiveSyncEnabledAct->setChecked(receivePresentationSettings().enabled);
+
+    auto* receiveSyncModeGroup = new QActionGroup(receiveSyncMenu);
+    receiveSyncModeGroup->setExclusive(true);
+    auto* receiveSyncManualAct = receiveSyncMenu->addAction("Manual Offset");
+    receiveSyncManualAct->setCheckable(true);
+    receiveSyncModeGroup->addAction(receiveSyncManualAct);
+    auto* receiveSyncAutoAct = receiveSyncMenu->addAction("Auto Assist");
+    receiveSyncAutoAct->setCheckable(true);
+    receiveSyncModeGroup->addAction(receiveSyncAutoAct);
+    receiveSyncMenu->addSeparator();
+
+    auto* receiveSyncOffsetLabel = receiveSyncMenu->addAction(QString());
+    receiveSyncOffsetLabel->setEnabled(false);
+    auto* receiveSyncOffsetMinus =
+        receiveSyncMenu->addAction("Delay KiwiSDR 50 ms");
+    auto* receiveSyncOffsetPlus =
+        receiveSyncMenu->addAction("Delay Flex 50 ms");
+    auto* receiveSyncOffsetReset = receiveSyncMenu->addAction("Reset Offset");
+    receiveSyncMenu->addSeparator();
+
+    auto* receiveSyncLatencyMenu = receiveSyncMenu->addMenu("Latency");
+    auto* receiveSyncLatencyGroup = new QActionGroup(receiveSyncLatencyMenu);
+    receiveSyncLatencyGroup->setExclusive(true);
+    auto* receiveSyncLatencyNormal =
+        receiveSyncLatencyMenu->addAction("Normal (360 ms)");
+    receiveSyncLatencyNormal->setCheckable(true);
+    receiveSyncLatencyGroup->addAction(receiveSyncLatencyNormal);
+    auto* receiveSyncLatencyStable =
+        receiveSyncLatencyMenu->addAction("More Stable (520 ms)");
+    receiveSyncLatencyStable->setCheckable(true);
+    receiveSyncLatencyGroup->addAction(receiveSyncLatencyStable);
+    auto* receiveSyncLatencyHigh =
+        receiveSyncLatencyMenu->addAction("High Jitter (1000 ms)");
+    receiveSyncLatencyHigh->setCheckable(true);
+    receiveSyncLatencyGroup->addAction(receiveSyncLatencyHigh);
+    receiveSyncMenu->addSeparator();
+    auto* receiveSyncStatusLabel = receiveSyncMenu->addAction(QString());
+    receiveSyncStatusLabel->setEnabled(false);
+
+    auto refreshReceiveSyncMenu = [this, receiveSyncEnabledAct,
+                                   receiveSyncManualAct, receiveSyncAutoAct,
+                                   receiveSyncOffsetLabel,
+                                   receiveSyncLatencyNormal,
+                                   receiveSyncLatencyStable,
+                                   receiveSyncLatencyHigh,
+                                   receiveSyncStatusLabel]() {
+        const ReceivePresentationSettings settings =
+            receivePresentationSettings();
+        const ReceiveDelayBreakdown delays =
+            receivePresentationDelayBreakdown();
+        receiveSyncEnabledAct->setChecked(settings.enabled);
+        receiveSyncManualAct->setChecked(settings.mode == ReceiveSyncMode::Manual);
+        receiveSyncAutoAct->setChecked(settings.mode == ReceiveSyncMode::AutoAssist);
+        receiveSyncOffsetLabel->setText(
+            QStringLiteral("Offset: %1%2 ms")
+                .arg(settings.manualOffsetMs >= 0 ? QStringLiteral("+")
+                                                  : QString())
+                .arg(settings.manualOffsetMs));
+        receiveSyncLatencyNormal->setChecked(settings.baseLatencyMs == 360);
+        receiveSyncLatencyStable->setChecked(settings.baseLatencyMs == 520);
+        receiveSyncLatencyHigh->setChecked(settings.baseLatencyMs == 1000);
+        QString status = QStringLiteral("Off");
+        switch (delays.status) {
+        case ReceiveSyncStatus::Off:
+            status = QStringLiteral("Off");
+            break;
+        case ReceiveSyncStatus::Manual:
+            status = QStringLiteral("Manual");
+            break;
+        case ReceiveSyncStatus::Searching:
+            status = QStringLiteral("Searching");
+            break;
+        case ReceiveSyncStatus::Holding:
+            status = QStringLiteral("Coasting");
+            break;
+        case ReceiveSyncStatus::Locked:
+            status = QStringLiteral("Locked");
+            break;
+        case ReceiveSyncStatus::LowConfidence:
+            status = QStringLiteral("Low confidence");
+            break;
+        }
+        QString statusText =
+            QStringLiteral("Status: %1, Flex %2 ms, KiwiSDR %3 ms")
+                .arg(status)
+                .arg(delays.flexDelayMs)
+                .arg(delays.kiwiDelayMs);
+        if (settings.mode == ReceiveSyncMode::AutoAssist
+            && settings.autoEstimate.valid) {
+            statusText += QStringLiteral(", est %1%2 ms, conf %3%, drift %4%5 ppm")
+                              .arg(settings.autoEstimate.offsetMs >= 0
+                                       ? QStringLiteral("+")
+                                       : QString())
+                              .arg(settings.autoEstimate.offsetMs)
+                              .arg(static_cast<int>(std::lround(
+                                  settings.autoEstimate.confidence * 100.0f)))
+                              .arg(settings.autoEstimate.driftPpm >= 0
+                                       ? QStringLiteral("+")
+                                       : QString())
+                              .arg(settings.autoEstimate.driftPpm);
+        }
+        receiveSyncStatusLabel->setText(statusText);
+    };
+    refreshReceiveSyncMenu();
+    connect(receiveSyncMenu, &QMenu::aboutToShow, this, refreshReceiveSyncMenu);
+
+    connect(receiveSyncEnabledAct, &QAction::toggled, this,
+            [this, refreshReceiveSyncMenu](bool enabled) {
+        setReceivePresentationSyncEnabled(enabled);
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncManualAct, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        setReceivePresentationSyncMode(ReceiveSyncMode::Manual);
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncAutoAct, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        setReceivePresentationSyncMode(ReceiveSyncMode::AutoAssist);
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncOffsetMinus, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        adjustReceivePresentationManualOffsetMs(-50);
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncOffsetPlus, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        adjustReceivePresentationManualOffsetMs(50);
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncOffsetReset, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        resetReceivePresentationManualOffset();
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncLatencyNormal, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        setReceivePresentationLatencyMs(360);
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncLatencyStable, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        setReceivePresentationLatencyMs(520);
+        refreshReceiveSyncMenu();
+    });
+    connect(receiveSyncLatencyHigh, &QAction::triggered, this,
+            [this, refreshReceiveSyncMenu]() {
+        setReceivePresentationLatencyMs(1000);
+        refreshReceiveSyncMenu();
+    });
 #ifdef HAVE_MQTT
     auto* mqttAction = settingsMenu->addAction("MQTT...");
     mqttAction->setMenuRole(QAction::NoRole);
@@ -124,13 +284,18 @@ void MainWindow::buildMenuBar()
     connect(memoryAction, &QAction::triggered, this, [this] {
         showMemoryDialog();
     });
+    auto* netSchedulerAction = settingsMenu->addAction("Net Scheduler...");
+    connect(netSchedulerAction, &QAction::triggered, this, [this] {
+        showNetSchedulerDialog();
+    });
     auto* usbCablesAction = settingsMenu->addAction("USB Cables...");
     connect(usbCablesAction, &QAction::triggered, this, [this] {
         const QString prevComp = m_radioModel.audioCompressionParam();
         const bool wasFresh = !m_radioSetupDialog;
         showOrRaisePersistent(m_radioSetupDialog,
                               &m_radioModel, m_audio,
-                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius);
+                              &m_tgxlConn, &m_pgxlConn, &m_antennaGenius,
+                              m_kiwiSdrManager);
         if (wasFresh && m_radioSetupDialog)
             wireRadioSetupDialogSignals(m_radioSetupDialog, prevComp);
         if (m_radioSetupDialog)
@@ -149,11 +314,19 @@ void MainWindow::buildMenuBar()
         showOrRaisePersistent(m_rc28MappingDialog, m_hidEncoder);
         if (fresh && m_rc28MappingDialog)
             connect(m_rc28MappingDialog, &RC28MappingDialog::mappingFieldChanged,
-                    this, [this](const QString& field, const QString&) {
+                    this, [this](const QString& field, const QString& value) {
                 if (field == "f1Hold" || field == "f2Hold") {
                     m_hidFastTune = false;
                     m_hidFineTune = false;
                     updateRC28Leds();
+                } else if (field == "sensitivity") {
+                    m_hidSensitivity = value.toInt();
+                    if (m_hidSensitivity < 1) m_hidSensitivity = 1;
+                    m_hidPulseAccum = 0;
+                } else if (field == "autoSnap") {
+                    m_hidAutoSnap = (value == "True");
+                    if (!m_hidAutoSnap && m_hidSnapTimer)
+                        m_hidSnapTimer->stop();
                 }
             });
     });
@@ -235,34 +408,34 @@ void MainWindow::buildMenuBar()
         });
         connect(dlg, &DxClusterDialog::connectRequested,
                 this, [this](const QString& host, quint16 port, const QString& call) {
-            QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->connectToCluster(host, port, call); });
+            QMetaObject::invokeMethod(m_dxCluster, [=, this] { m_dxCluster->connectToCluster(host, port, call); });
         });
         connect(dlg, &DxClusterDialog::disconnectRequested,
-                this, [this] { QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->disconnect(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_dxCluster, [=, this] { m_dxCluster->disconnect(); }); });
         connect(dlg, &DxClusterDialog::rbnConnectRequested,
                 this, [this](const QString& host, quint16 port, const QString& call) {
-            QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->connectToCluster(host, port, call); });
+            QMetaObject::invokeMethod(m_rbnClient, [=, this] { m_rbnClient->connectToCluster(host, port, call); });
         });
         connect(dlg, &DxClusterDialog::rbnDisconnectRequested,
-                this, [this] { QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->disconnect(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_rbnClient, [=, this] { m_rbnClient->disconnect(); }); });
         connect(dlg, &DxClusterDialog::wsjtxStartRequested,
                 this, [this](const QString& addr, quint16 port) {
-            QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->startListening(addr, port); });
+            QMetaObject::invokeMethod(m_wsjtxClient, [=, this] { m_wsjtxClient->startListening(addr, port); });
         });
         connect(dlg, &DxClusterDialog::wsjtxStopRequested,
-                this, [this] { QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->stopListening(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_wsjtxClient, [=, this] { m_wsjtxClient->stopListening(); }); });
         connect(dlg, &DxClusterDialog::spotCollectorStartRequested,
                 this, [this](quint16 port) {
-            QMetaObject::invokeMethod(m_spotCollectorClient, [=] { m_spotCollectorClient->startListening(port); });
+            QMetaObject::invokeMethod(m_spotCollectorClient, [=, this] { m_spotCollectorClient->startListening(port); });
         });
         connect(dlg, &DxClusterDialog::spotCollectorStopRequested,
-                this, [this] { QMetaObject::invokeMethod(m_spotCollectorClient, [=] { m_spotCollectorClient->stopListening(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_spotCollectorClient, [=, this] { m_spotCollectorClient->stopListening(); }); });
         connect(dlg, &DxClusterDialog::potaStartRequested,
                 this, [this](int interval) {
-            QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->startPolling(interval); });
+            QMetaObject::invokeMethod(m_potaClient, [=, this] { m_potaClient->startPolling(interval); });
         });
         connect(dlg, &DxClusterDialog::potaStopRequested,
-                this, [this] { QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->stopPolling(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_potaClient, [=, this] { m_potaClient->stopPolling(); }); });
 #ifdef HAVE_WEBSOCKETS
         connect(dlg, &DxClusterDialog::freedvStartRequested,
                 this, [this] { QMetaObject::invokeMethod(m_freedvClient, [this] { m_freedvClient->startConnection(); }); });
@@ -464,12 +637,12 @@ void MainWindow::buildMenuBar()
         s.setValue("AutoStartTCI", on ? "True" : "False");
         s.save();
 #ifdef HAVE_WEBSOCKETS
-        if (m_tciServer) {
-            if (on && !m_tciServer->isRunning()) {
+        if (tciServer()) {
+            if (on && !tciServer()->isRunning()) {
                 int port = s.value("TciPort", "50001").toInt();
-                m_tciServer->start(static_cast<quint16>(port));
-            } else if (!on && m_tciServer->isRunning()) {
-                m_tciServer->stop();
+                tciServer()->start(static_cast<quint16>(port));
+            } else if (!on && tciServer()->isRunning()) {
+                tciServer()->stop();
             }
             if (m_appletPanel && m_appletPanel->tciApplet())
                 m_appletPanel->tciApplet()->setTciEnabled(on);
@@ -743,6 +916,18 @@ void MainWindow::buildMenuBar()
         m_appletPanel->resetOrder();
     });
 
+    auto* pskMapAction = viewMenu->addAction("PSK Reporter...");
+    pskMapAction->setMenuRole(QAction::NoRole);
+    connect(pskMapAction, &QAction::triggered,
+            this, &MainWindow::showPskReporterMapDialog);
+
+    auto* callsignLookupAct = viewMenu->addAction("Callsign Lookup...");
+    callsignLookupAct->setMenuRole(QAction::NoRole);
+    callsignLookupAct->setShortcut(QKeySequence("Ctrl+Shift+L"));
+    callsignLookupAct->setToolTip("Look up a callsign on QRZ.com");
+    connect(callsignLookupAct, &QAction::triggered,
+            this, [this] { showCallsignLookupDialog(); });
+
 #ifdef HAVE_WEBSOCKETS
     {
         auto* fdvReporterAct = viewMenu->addAction(tr("FreeDV Reporter..."));
@@ -994,7 +1179,7 @@ void MainWindow::buildMenuBar()
             "<h2 style='margin-bottom:2px; color:#c8d8e8;'>AetherSDR</h2>"
             "<p style='margin-top:0; color:#8aa8c0;'>v%1<br>"
             "<span style='font-size:10px; color:#6a8090;'>(%4)</span></p>"
-            "<p style='margin-top:8px; color:#c8d8e8;'>Linux-native SmartSDR-compatible client<br>"
+            "<p style='margin-top:8px; color:#c8d8e8;'>Cross-platform SmartSDR-compatible client<br>"
             "for FlexRadio transceivers.</p>"
             "<p style='font-size:11px; color:#6a8090;'>"
             "Built with Qt %2 &middot; C++20<br>"

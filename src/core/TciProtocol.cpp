@@ -10,6 +10,7 @@
 
 #include <QList>
 #include <QMetaObject>
+#include <algorithm>
 #include <cmath>
 
 namespace AetherSDR {
@@ -82,9 +83,17 @@ QString TciProtocol::generateInitBurst()
     QString burst;
 
     // ── Phase 1: Initialization commands (spec section 4.1) ───────────
-    // Sent in spec order, terminated by READY.  Strict clients (notably
-    // RF2K-S amps) treat anything before READY that isn't one of the 9
-    // listed init commands as malformed and refuse to engage.
+    // Sent in spec order.  READY is NOT sent here: real ExpertSDR3
+    // transmits its complete initial state (including the audio/IQ
+    // stream parameters) and only then sends READY, and clients written
+    // against it (SDC / CW Skimmer, reported by UT4LW) latch their
+    // cached settings when READY arrives — an early READY makes them
+    // initialize from defaults (notably a wrong iq_samplerate).  The
+    // earlier early-READY rationale from #2597 ("strict clients reject
+    // non-init commands before READY") does not match the reference
+    // parser it cited: eesdr-tci aborts only on *unrecognized* command
+    // names, anywhere in the stream, and imposes no pre-READY grammar;
+    // the RF2K-S engagement fix was split_enable, not READY placement.
     burst += QStringLiteral("vfo_limits:1000,75000000;");
     burst += QStringLiteral("if_limits:-48000,48000;");
 
@@ -123,12 +132,13 @@ QString TciProtocol::generateInitBurst()
     burst += QStringLiteral("receive_only:false;");
     burst += QStringLiteral("modulations_list:usb,lsb,cw,cwr,am,sam,fm,nfm,digu,digl,rtty;");
     burst += QStringLiteral("protocol:ExpertSDR3,1.5;");
-    burst += QStringLiteral("ready;");
 
     // ── Phase 2: Current state notifications ──────────────────────────
-    // After READY these are plain event notifications, indistinguishable
-    // from the events fired by a live tuning operation.  All current TCI
-    // clients (WSJT-X, JTDX, aether_pad) should process them identically.
+    // Identical in syntax to the events fired by a live tuning
+    // operation; clients cache them whether they arrive before or after
+    // READY (verified in WSJT-X TCITransceiver.cpp, which parses every
+    // command on arrival and uses READY only to advance its own init
+    // state machine).
     if (m_model) {
         for (auto* s : slices) {
             int trx = tciTrxForSlice(m_model, s);
@@ -168,13 +178,14 @@ QString TciProtocol::generateInitBurst()
 
             // SQL
             burst += QStringLiteral("sql_enable:%1,%2;")
-                         .arg(trx).arg(s->squelchOn() ? "true" : "false");
+                         .arg(trx)
+                         .arg(s->receiveSquelchOn() ? "true" : "false");
             burst += QStringLiteral("sql_level:%1,%2;")
-                         .arg(trx).arg(s->squelchLevel());
+                         .arg(trx).arg(s->receiveSquelchLevel());
 
             // AGC
             burst += QStringLiteral("agc_mode:%1,%2;")
-                         .arg(trx).arg(s->agcMode().toLower());
+                         .arg(trx).arg(s->receiveAgcMode().toLower());
 
             // DSP
             burst += QStringLiteral("rx_nb_enable:%1,%2;")
@@ -209,25 +220,35 @@ QString TciProtocol::generateInitBurst()
         burst += QStringLiteral("trx:%1,%2;").arg(txTrx).arg(isTx ? "true" : "false");
 
         // Master AF volume — whole-radio (no trx prefix), same saved value
-        // cmdVolume's GET returns. Without it the init burst seeds drive/
-        // mic_level but not AF, so a client's local mirror starts at a default
-        // guess and the first AF-gain step jumps to that guess instead of the
-        // radio's real level (Ulanzi/Elgato/StreamController gain steppers).
+        // cmdVolume's GET returns, reported in dB per the TCI spec
+        // (-60..0; ExpertSDR3 wire scale). Without it the init burst seeds
+        // drive/mic_level but not AF, so a client's local mirror starts at
+        // a default guess and the first AF-gain step jumps to that guess
+        // instead of the radio's real level (Ulanzi/Elgato/StreamController
+        // gain steppers).
         burst += QStringLiteral("volume:%1;")
-                     .arg(AppSettings::instance().value("MasterVolume", "100").toInt());
+                     .arg(volumeDbFromPercent(
+                         AppSettings::instance().value("MasterVolume", "100").toInt()));
     }
 
     // ── Phase 3: Audio / IQ stream configuration ──────────────────────
-    // After READY and after current state — these are clients-of-audio
-    // concerns (WSJT-X), and irrelevant to control-only clients like
-    // amplifiers.  Sending them post-READY keeps strict amp clients
-    // happy without breaking WSJT-X's TX audio FIFO setup.
+    // Last of the settings: clients-of-audio concerns (WSJT-X, CW
+    // Skimmer / SDC), irrelevant to control-only clients like
+    // amplifiers — which simply cache or ignore them pre-READY.
     burst += QStringLiteral("audio_samplerate:48000;");
     burst += QStringLiteral("audio_stream_sample_type:float32;");
     burst += QStringLiteral("audio_stream_channels:2;");
     burst += QStringLiteral("audio_stream_samples:2048;");
     burst += QStringLiteral("tx_stream_audio_buffering:50;");
     burst += QStringLiteral("iq_samplerate:48000;");
+
+    // READY terminates the settings dump — it must follow EVERY setting
+    // (in particular iq_samplerate), because SDC / CW Skimmer reads its
+    // cached settings the moment READY arrives.  Matches real
+    // ExpertSDR3 behavior and the spec's READY definition ("sent after
+    // the initialization commands").  Reported by Yuri UT4LW.
+    burst += QStringLiteral("ready;");
+
     // audio_start primes WSJT-X's TCI audio state machine so it sends
     // audio_start:0 back to request RX audio streaming.
     burst += QStringLiteral("audio_start;");
@@ -386,8 +407,19 @@ QString TciProtocol::cmdVfo(const QStringList& args, bool isSet)
     if (!ok || hz < 0) return {};
     double mhz = hz / 1e6;
 
-    QMetaObject::invokeMethod(s, [s, mhz]() {
-        s->tuneAndRecenter(mhz);
+    // Same policy as RigctlProtocol::cmdSetFreq: recenter only for tunes
+    // that leave the pan's current span (band changes); in-span retunes
+    // (Doppler steps from satellite trackers) use autopan=0 so the pan
+    // stays put.
+    RadioModel* model = m_model;
+    QMetaObject::invokeMethod(s, [s, model, mhz]() {
+        bool inSpan = false;
+        if (auto* pan = model ? model->panadapter(s->panId()) : nullptr) {
+            const double halfBw = pan->bandwidthMhz() / 2.0;
+            inSpan = halfBw > 0.0 && qAbs(mhz - pan->centerMhz()) <= halfBw;
+        }
+        if (inSpan) s->setFrequency(mhz);
+        else        s->tuneAndRecenter(mhz);
     }, Qt::QueuedConnection);
 
     m_pendingNotification = QStringLiteral("vfo:%1,0,%2;").arg(trx).arg(hz);
@@ -812,12 +844,13 @@ QString TciProtocol::cmdSqlEnable(const QStringList& args, bool isSet)
 
     if (!isSet) {
         return QStringLiteral("sql_enable:%1,%2;")
-                   .arg(trx).arg(s->squelchOn() ? "true" : "false");
+                   .arg(trx)
+                   .arg(s->receiveSquelchOn() ? "true" : "false");
     }
 
     if (args.size() < 2) return {};
     bool on = (args[1].toLower() == "true");
-    int level = s->squelchLevel();
+    int level = s->receiveSquelchLevel();
     QMetaObject::invokeMethod(s, [s, on, level]() { s->setSquelch(on, level); },
                               Qt::QueuedConnection);
 
@@ -835,12 +868,12 @@ QString TciProtocol::cmdSqlLevel(const QStringList& args, bool isSet)
 
     if (!isSet) {
         return QStringLiteral("sql_level:%1,%2;")
-                   .arg(trx).arg(s->squelchLevel());
+                   .arg(trx).arg(s->receiveSquelchLevel());
     }
 
     if (args.size() < 2) return {};
     int level = args[1].toInt();
-    bool on = s->squelchOn();
+    bool on = s->receiveSquelchOn();
     QMetaObject::invokeMethod(s, [s, on, level]() { s->setSquelch(on, level); },
                               Qt::QueuedConnection);
 
@@ -857,7 +890,19 @@ QString TciProtocol::cmdSqlLevel(const QStringList& args, bool isSet)
 // volume goes through the separate `rx_volume` command (cmdRxVolume).
 //
 // Spec form:  GET = `volume;`  (no args)
-//             SET = `volume:N;` (1 arg, 0-100)
+//             SET = `volume:N;` (1 arg, dB, -60..0; -60 = silence)
+//
+// Wire scale is dB per TCI Protocol v2.0 ("The range of values is from
+// -60 to 0 dB, at a value of -60 dB there is no sound") — real
+// ExpertSDR3 sends e.g. `VOLUME:-12;`.  Internally AetherSDR's master
+// volume is a 0-100 percent amplitude (title bar slider /
+// applyMasterVolume), so the dB<->percent conversion happens here at
+// the wire and everything inboard stays percent.
+//
+// Legacy compat: values >= 1 cannot be dB (the spec range is
+// non-positive), so they are accepted as the old AetherSDR percent
+// scale — existing percent senders keep working.  `volume:0` is 0 dB =
+// full volume per spec (mute belongs to the `mute:` command).
 //
 // We also accept the legacy TRX-prefixed form `volume:trx,N;` for
 // backward compatibility — the trx is ignored since master volume is
@@ -870,23 +915,46 @@ QString TciProtocol::cmdSqlLevel(const QStringList& args, bool isSet)
 // level in m_pendingMasterVolume; TciServer reads it after handleCommand
 // and forwards the request to MainWindow via signal, mirroring the path
 // taken by the title bar's masterVolumeChanged signal.
+
+int TciProtocol::volumeDbFromPercent(int pct)
+{
+    if (pct <= 0) return -60;
+    if (pct > 100) pct = 100;
+    const int db = static_cast<int>(std::lround(20.0 * std::log10(pct / 100.0)));
+    return std::clamp(db, -60, 0);
+}
+
+int TciProtocol::volumePercentFromDb(double db)
+{
+    if (db <= -60.0) return 0;
+    if (db > 0.0) db = 0.0;
+    const int pct = static_cast<int>(std::lround(100.0 * std::pow(10.0, db / 20.0)));
+    // Integer percent can't resolve below -40 dB; floor at 1 so only
+    // -60 dB (the spec's explicit silence point) maps to mute.
+    return std::clamp(pct, 1, 100);
+}
+
 QString TciProtocol::cmdVolume(const QStringList& args, bool /*isSet*/)
 {
     if (args.isEmpty()) {
         // GET — current master volume from saved settings (the same value
-        // the title bar slider reads on startup).
+        // the title bar slider reads on startup), reported in dB.
         int pct = AppSettings::instance()
                       .value("MasterVolume", "100").toInt();
-        return QStringLiteral("volume:%1;").arg(pct);
+        return QStringLiteral("volume:%1;").arg(volumeDbFromPercent(pct));
     }
 
     // SET — accept either spec form (1 arg) or legacy trx-prefixed (2+ args).
-    int vol = args[args.size() == 1 ? 0 : 1].toInt();
-    if (vol < 0)   vol = 0;
-    if (vol > 100) vol = 100;
-    m_pendingMasterVolume = vol;
+    const double val = args[args.size() == 1 ? 0 : 1].toDouble();
+    const int pct = (val >= 1.0)
+        ? std::min(static_cast<int>(std::lround(val)), 100)  // legacy percent
+        : volumePercentFromDb(val);                          // spec dB
+    m_pendingMasterVolume = pct;
 
-    m_pendingNotification = QStringLiteral("volume:%1;").arg(vol);
+    // Echo in dB (round-tripped through the percent store so the echo
+    // matches what a subsequent GET would return).
+    m_pendingNotification =
+        QStringLiteral("volume:%1;").arg(volumeDbFromPercent(pct));
     return {};
 }
 
@@ -927,7 +995,7 @@ QString TciProtocol::cmdAgcMode(const QStringList& args, bool isSet)
 
     if (!isSet) {
         return QStringLiteral("agc_mode:%1,%2;")
-                   .arg(trx).arg(s->agcMode().toLower());
+                   .arg(trx).arg(s->receiveAgcMode().toLower());
     }
 
     if (args.size() < 2) return {};
@@ -950,7 +1018,7 @@ QString TciProtocol::cmdAgcGain(const QStringList& args, bool isSet)
 
     if (!isSet) {
         return QStringLiteral("agc_gain:%1,%2;")
-                   .arg(trx).arg(s->agcThreshold());
+                   .arg(trx).arg(s->receiveAgcThreshold());
     }
 
     if (args.size() < 2) return {};

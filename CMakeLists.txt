@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(AetherSDR VERSION 26.6.2 LANGUAGES C CXX)
+project(AetherSDR VERSION 26.7.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -22,11 +22,17 @@ option(USE_SYSTEM_LIQUID_DSP   "Use system liquid-dsp"   OFF)
 # Build features options
 
 option(REQUIRE_SERIALPORT "Fail if Qt6 SerialPort is not found (use for release builds)" OFF)
+option(REQUIRE_KEYCHAIN "Fail if Qt6Keychain is not found (use for release builds)" OFF)
 option(ENABLE_RADE "Build with RADE digital voice support (uses vendored Opus snapshot)" ON)
 option(AETHER_GPU_SPECTRUM "Enable QRhi GPU spectrum rendering" ON)
-option(ENABLE_BNR "Enable NVIDIA NIM BNR noise removal (requires grpc++)" OFF)
 option(ENABLE_SPECBLEACH "Enable NR4 spectral bleach noise reduction" ON)
 option(ENABLE_DFNR "Enable DFNR DeepFilterNet3 noise reduction" ON)
+# ON by default (like the other NR engines) so the pre-compiled release images
+# all ship BNR — the runtime is download-on-demand, so this only compiles a small
+# dlopen wrapper (no NVIDIA SDK at build time). Compiled on Linux/Windows only
+# (see the platform gate below; macOS has no AFX runtime and uses DFNR). Pass
+# -DENABLE_NVIDIA_AFX=OFF to opt out.
+option(ENABLE_NVIDIA_AFX "Enable the NVIDIA Maxine AFX GPU denoiser (BNR; runtime-loaded, download-on-demand; NVIDIA RTX/GeForce, Linux/Windows)" ON)
 option(ENABLE_MQTT "Enable MQTT client support" ON)
 option(MQTT_TLS "Enable MQTT TLS via OpenSSL (disable for AppImage)" ON)
 option(LOWER_CASE_BINARY_NAME "Make the output binary lower case. Only affects Linux" OFF)
@@ -61,6 +67,7 @@ endif()
 # — became available.  Binary distributions bundle Qt 6.7+ for QRhiWidget.
 find_package(Qt6 6.2 REQUIRED COMPONENTS
     Core
+    Concurrent
     Widgets
     Network
     Multimedia
@@ -112,7 +119,22 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         message(STATUS "Qt6::DBus not found — sleep inhibition disabled on Linux")
     endif()
 endif()
-find_package(Qt6Keychain QUIET)
+# qtkeychain may be staged into third_party/ by scripts/setup/setup-qtkeychain.*
+# (Windows + Linux AppImage release builds build it from source there). Prepend
+# so find_package resolves it before any system install. This EXISTS-guarded
+# prepend supersedes the earlier WIN32-only one (#3634): Windows stages into the
+# same dir, so the general form covers both platforms.
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/qtkeychain")
+    list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/third_party/qtkeychain")
+endif()
+# REQUIRE_KEYCHAIN makes a missing Qt6Keychain a hard build failure rather than
+# a silent compile-out of SmartLink credential persistence — release/packaged
+# builds set it so an artifact can never ship without working persistence (#3639).
+if(REQUIRE_KEYCHAIN)
+    find_package(Qt6Keychain REQUIRED)
+else()
+    find_package(Qt6Keychain QUIET)
+endif()
 if(Qt6Keychain_FOUND)
     message(STATUS "Qt6Keychain found — SmartLink credential persistence enabled")
 else()
@@ -313,9 +335,12 @@ if(AETHER_GPU_SPECTRUM)
             endif()
         endif()
 
-        # Detect Debian paths early (support any multiarch tuple, e.g. aarch64-linux-gnu)
+        # Some Qt distributions ship the private QtGui headers on disk but omit the
+        # Qt6GuiPrivate CMake package (so no Qt6::GuiPrivate target): Debian multi-arch,
+        # and Windows/macOS installs deployed via aqtinstall. Locate the private
+        # include root directly and wire it up manually (see DEBIAN_GPU_FIX_REQUIRED).
         if(NOT Qt6GuiPrivate_FOUND)
-            message(STATUS "Qt6GuiPrivate not found, checking Debian multi-arch paths...")
+            message(STATUS "Qt6GuiPrivate CMake package not found, searching for private headers directly...")
             set(DEB_HOST_MULTIARCH "")
             find_program(DPKG_ARCH dpkg-architecture)
             if(DPKG_ARCH)
@@ -323,14 +348,28 @@ if(AETHER_GPU_SPECTRUM)
                     OUTPUT_VARIABLE DEB_HOST_MULTIARCH OUTPUT_STRIP_TRAILING_WHITESPACE
                     ERROR_QUIET)
             endif()
+            # Derive the Qt include root from the Gui target — covers Windows/macOS SDK
+            # layouts (<prefix>/include) where dpkg multi-arch paths don't apply.
+            set(_qt_gui_inc_root "")
+            if(TARGET Qt6::Gui)
+                get_target_property(_qt_gui_incs Qt6::Gui INTERFACE_INCLUDE_DIRECTORIES)
+                foreach(_inc IN LISTS _qt_gui_incs)
+                    if(EXISTS "${_inc}/QtGui/${Qt6_VERSION}/QtGui/private/qhighdpiscaling_p.h")
+                        set(_qt_gui_inc_root "${_inc}")
+                        break()
+                    endif()
+                endforeach()
+            endif()
             find_path(DEBIAN_PRIVATE_INC
                 NAMES "QtGui/${Qt6_VERSION}/QtGui/private/qhighdpiscaling_p.h"
-                PATHS "/usr/include/${DEB_HOST_MULTIARCH}/qt6" "/usr/include/qt6"
+                PATHS
+                    "${_qt_gui_inc_root}"
+                    "/usr/include/${DEB_HOST_MULTIARCH}/qt6" "/usr/include/qt6"
                 NO_DEFAULT_PATH
             )
             if(DEBIAN_PRIVATE_INC)
                 set(Qt6GuiPrivate_FOUND TRUE)
-                set(DEBIAN_GPU_FIX_REQUIRED TRUE) # Mark for Step 2
+                set(DEBIAN_GPU_FIX_REQUIRED TRUE) # Mark for Step 2 (manual include dirs)
             endif()
         endif()
 
@@ -344,44 +383,6 @@ if(AETHER_GPU_SPECTRUM)
     endif()
 else()
     message(STATUS "GPU spectrum rendering disabled (use -DAETHER_GPU_SPECTRUM=ON to enable)")
-endif()
-
-# NVIDIA NIM BNR (Background Noise Removal) — GPU-accelerated neural denoising
-# Requires: grpc++, protobuf, NVIDIA RTX 4000+ GPU, Docker container
-if(ENABLE_BNR)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(GRPC REQUIRED grpc++)
-    pkg_check_modules(PROTOBUF REQUIRED protobuf)
-    find_program(PROTOC protoc REQUIRED)
-    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin REQUIRED)
-
-    # Generate C++ stubs from bnr.proto
-    set(BNR_PROTO "${CMAKE_SOURCE_DIR}/src/core/proto/bnr.proto")
-    set(BNR_GEN_DIR "${CMAKE_BINARY_DIR}/bnr_gen")
-    file(MAKE_DIRECTORY ${BNR_GEN_DIR})
-
-    set(BNR_PB_CC "${BNR_GEN_DIR}/bnr.pb.cc")
-    set(BNR_PB_H  "${BNR_GEN_DIR}/bnr.pb.h")
-    set(BNR_GRPC_CC "${BNR_GEN_DIR}/bnr.grpc.pb.cc")
-    set(BNR_GRPC_H  "${BNR_GEN_DIR}/bnr.grpc.pb.h")
-
-    add_custom_command(
-        OUTPUT ${BNR_PB_CC} ${BNR_PB_H} ${BNR_GRPC_CC} ${BNR_GRPC_H}
-        COMMAND ${PROTOC}
-            --proto_path=${CMAKE_SOURCE_DIR}/src/core/proto
-            --cpp_out=${BNR_GEN_DIR}
-            --grpc_out=${BNR_GEN_DIR}
-            --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
-            ${BNR_PROTO}
-        DEPENDS ${BNR_PROTO}
-        COMMENT "Generating BNR gRPC stubs from bnr.proto"
-    )
-
-    set(BNR_SOURCES ${BNR_PB_CC} ${BNR_GRPC_CC})
-    message(STATUS "NVIDIA BNR enabled (gRPC ${GRPC_VERSION})")
-else()
-    set(BNR_SOURCES "")
-    message(STATUS "NVIDIA BNR disabled (use -DENABLE_BNR=ON to enable)")
 endif()
 
 # libspecbleach NR4 — bundled spectral noise reduction (LGPL-2.1)
@@ -517,8 +518,12 @@ endif()
 
 # Sources
 set(CORE_SOURCES
+    src/core/backends/flex/FlexBackend.cpp   # aetherd RFC step 2.2 (§5.5)
     src/core/AppSettings.cpp
+    src/core/GpuSelector.cpp
     src/core/AgcTCalibrator.cpp
+    src/core/AdaptiveFilterEngine.cpp
+    src/core/OccupiedRegion.cpp
     src/core/SettingsHelpers.cpp
     src/core/ThemeManager.cpp
     src/core/BandStackSettings.cpp
@@ -530,6 +535,7 @@ set(CORE_SOURCES
     src/core/AudioSummaryLogger.cpp
     src/core/AudioFormatNegotiator.cpp
     src/core/AudioDeviceNegotiator.cpp
+    src/core/AudioOutputRouter.cpp
     src/core/AudioEngine.cpp
     src/core/TxMicChannelNormalizer.cpp
     src/core/ChannelStripPresets.cpp
@@ -561,21 +567,30 @@ set(CORE_SOURCES
     src/core/SmartCatSession.cpp
     src/core/CatPort.cpp
     src/core/SmartLinkClient.cpp
+    src/core/KiwiSdrProtocol.cpp
+    src/core/KiwiSdrRedirectPolicy.cpp
+    src/core/KiwiSdrClient.cpp
+    src/core/KiwiSdrManager.cpp
+    src/core/ReceivePresentationSync.cpp
+    src/core/KiwiPublicDirectory.cpp
     src/core/WanConnection.cpp
     src/core/DxClusterClient.cpp
     src/core/WsjtxClient.cpp
     src/core/SpotCollectorClient.cpp
     src/core/PotaClient.cpp
     src/core/PropForecastClient.cpp
+    src/core/PskReporterClient.cpp
     src/core/MqttAntennaAlias.cpp
     src/core/MqttSettings.cpp
     src/core/SpotCommandPolicy.cpp
     src/core/SpotModeResolver.cpp
     src/core/TciServer.cpp
     src/core/TciProtocol.cpp
+    src/core/AutomationServer.cpp
     src/core/MqttClient.cpp
     src/core/PgxlConnection.cpp
     src/core/FirmwareUploader.cpp
+    src/core/WaveformInstaller.cpp
     src/core/DvkWavTransfer.cpp
     src/core/ZipArchive.cpp
     src/core/ProfileTransfer.cpp
@@ -587,12 +602,17 @@ set(CORE_SOURCES
     src/core/RNNoiseFilter.cpp
     src/core/SpecbleachFilter.cpp
     src/core/CwDecoder.cpp
+    src/core/CwCallsignSpotter.cpp
+    src/core/CallsignInfo.cpp
+    src/core/QrzClient.cpp
+    src/core/CallsignLookupService.cpp
     src/core/RttyDecoder.cpp
     src/core/VoiceSignalDetector.cpp
     src/core/SpectrogramBuffer.cpp
     src/core/SignalClassifier.cpp
     src/core/Resampler.cpp
-    src/core/NvidiaBnrFilter.cpp
+    src/core/NvidiaAfxFilter.cpp
+    src/core/NvidiaAfxPack.cpp
     src/core/DeepFilterFilter.cpp
     src/core/RADEEngine.cpp
     src/core/AsyncLogWriter.cpp
@@ -609,7 +629,15 @@ set(CORE_SOURCES
     src/core/DxccColorProvider.cpp
     src/core/SleepInhibitor.cpp
     src/core/MemoryCsvCompat.cpp
+    src/core/MemoryFieldValues.cpp
     src/core/MemoryRecallPolicy.cpp
+    src/core/NetRecurrence.cpp
+    src/core/NetSchedulePlanner.cpp
+    src/core/NetScheduleStore.cpp
+    src/core/NetScheduler.cpp
+    src/core/WfmDemodulator.cpp
+    src/core/WfmDsp.cpp
+    src/core/WaveOutWriter.cpp
     src/core/tnc/AetherAx25LibmodemShim.cpp
     src/core/tnc/HdlcCodec.cpp
     src/core/tnc/Ax25FrameFormatter.cpp
@@ -620,6 +648,11 @@ set(CORE_SOURCES
     src/core/tnc/KissTncServer.cpp
     src/core/tnc/TncTerminal.cpp
     src/core/pms/PmsMailbox.cpp
+    src/core/aprs/AprsPacket.cpp
+    src/core/aprs/AprsStationList.cpp
+    src/core/aprs/AprsMessenger.cpp
+    src/core/aprs/AprsBeacon.cpp
+    src/core/aprs/AprsSettings.cpp
 )
 
 if(APPLE)
@@ -645,6 +678,7 @@ endif()
 
 set(MODEL_SOURCES
     src/models/RadioModel.cpp
+    src/models/RadioSession.cpp
     src/models/ModelCapabilities.cpp
     src/models/AntennaAliasStore.cpp
     src/models/SliceModel.cpp
@@ -667,32 +701,61 @@ set(MODEL_SOURCES
     src/models/AntennaGeniusModel.cpp
 )
 
+# Vendored QGeoView (LGPL-3.0) — slippy-map widget for the common
+# mapping engine (PSK Reporter map, future APRS map). Patched per
+# third_party/QGeoView/AETHERSDR-PATCHES.md.
+add_subdirectory(third_party/QGeoView/lib EXCLUDE_FROM_ALL)
+
 set(GUI_SOURCES
     src/gui/MainWindow.cpp
     src/gui/MainWindowHelpers.cpp
     src/gui/MainWindow_Controllers.cpp
+    src/gui/MainWindow_DspApplets.cpp
     src/gui/MainWindow_Menus.cpp
+    src/gui/MainWindow_Session.cpp
     src/gui/MainWindow_Shortcuts.cpp
+    src/gui/MainWindow_DigitalModes.cpp
+    src/gui/MainWindow_Spots.cpp
+    src/gui/MainWindow_SwrSweep.cpp
     src/gui/MainWindow_Wiring.cpp
+    src/gui/MainWindow_Nets.cpp
+    src/gui/MainWindow_Callsign.cpp
+    src/gui/MainWindow_ReceiveSync.cpp
+    src/gui/MainWindow_KiwiSdr.cpp
+    src/gui/map/MapView.cpp
+    src/gui/map/MapMarkerItem.cpp
+    src/gui/map/MapPathItem.cpp
+    src/gui/PskReporterMapDialog.cpp
     src/gui/AgcCalibrationDialog.cpp
     src/gui/AudioDeviceChangeDialog.cpp
+    src/gui/WfmDeviceDialog.cpp
     src/gui/ConnectionPanel.cpp
     src/gui/ClientDisconnectDialog.cpp
     src/gui/ConnectedStationsDialog.cpp
+    src/gui/PanadapterMessageOverlay.cpp
+    src/gui/PanadapterMessageOverlay.h
     src/gui/SpectrumWidget.cpp
     src/gui/SpectrumOverlayMenu.cpp
+    src/gui/DssRenderer.cpp
     src/gui/FrequencyEntryParser.cpp
     src/gui/SliceColorManager.cpp
     src/gui/SliceLabel.cpp
     src/gui/VfoWidget.cpp
+    src/gui/SmartMtrWidget.cpp
+    src/gui/SmartMtrConfig.cpp
+    src/gui/MeterViewController.cpp
     src/gui/RadioSetupDialog.cpp
     src/gui/NetworkDiagnosticsDialog.cpp
     src/gui/Ax25HfPacketDecodeDialog.cpp
+    src/gui/AprsMessagesDialog.cpp
+    src/gui/AprsSymbolIcons.cpp
     src/gui/FlexControlDialog.cpp
     src/gui/PropDashboardDialog.cpp
     src/gui/MemoryCommands.cpp
     src/gui/MemoryBrowsePanel.cpp
     src/gui/MemoryDialog.cpp
+    src/gui/NetSchedulerDialog.cpp
+    src/gui/NetReminderBanner.cpp
     src/gui/SpotSettingsDialog.cpp
     src/gui/AetherDspDialog.cpp
     src/gui/AetherDspWidget.cpp
@@ -702,6 +765,8 @@ set(GUI_SOURCES
     src/gui/DspParamPopup.cpp
     src/gui/DxClusterDialog.cpp
     src/gui/DxClusterStartupCommandsDialog.cpp
+    src/gui/CallsignCard.cpp
+    src/gui/CallsignLookupDialog.cpp
     src/gui/CwxPanel.cpp
     src/gui/BandStackPanel.cpp
     src/gui/FramelessWindowTitleBar.cpp
@@ -710,6 +775,7 @@ set(GUI_SOURCES
     src/gui/DvkPanel.cpp
     src/gui/AmpApplet.cpp
     src/gui/MeterApplet.cpp
+    src/gui/ProfileSwitcherApplet.cpp
     src/gui/RadeApplet.cpp
     src/gui/HealthApplet.cpp
     src/gui/PersistentDialog.cpp
@@ -721,8 +787,11 @@ set(GUI_SOURCES
     src/gui/PanadapterStack.cpp
     src/gui/PanLayoutDialog.cpp
     src/gui/AppletPanel.cpp
+    src/gui/KiwiSdrApplet.cpp
+    src/gui/KiwiPublicReceiverPicker.cpp
     src/gui/FavoritesPickerDialog.cpp
     src/gui/RxApplet.cpp
+    src/gui/AdaptiveFilterControls.cpp
     src/gui/FilterPassbandWidget.cpp
     src/gui/SMeterWidget.cpp
     src/gui/TunerApplet.cpp
@@ -733,6 +802,7 @@ set(GUI_SOURCES
     src/gui/PhoneApplet.cpp
     src/gui/EqApplet.cpp
     src/gui/WaveApplet.cpp
+    src/gui/WaveformScopeModel.cpp
     src/gui/WaveformWidget.cpp
     src/gui/ClientEqApplet.cpp
     src/gui/ClientEqCurveWidget.cpp
@@ -775,7 +845,6 @@ set(GUI_SOURCES
     src/gui/StripPuduPanel.cpp
     src/gui/ClientReverbApplet.cpp
     src/gui/StripReverbPanel.cpp
-    src/gui/StripWaveform.cpp
     src/gui/StripWaveformPanel.cpp
     src/gui/StripFinalOutputPanel.cpp
     src/gui/AetherialAudioStrip.cpp
@@ -809,13 +878,6 @@ set(GUI_SOURCES
     src/gui/GradientEditorDialog.cpp
     src/gui/TokenEditorWidget.cpp
     src/gui/CompactColorPicker.cpp
-)
-
-set(ALL_SOURCES
-    src/main.cpp
-    ${CORE_SOURCES}
-    ${MODEL_SOURCES}
-    ${GUI_SOURCES}
 )
 
 # Bundled RNNoise (Mozilla/Xiph BSD-3) — client-side neural noise suppression
@@ -910,6 +972,21 @@ else()
     target_compile_options(aether_libmodem_core PRIVATE -w)
 endif()
 
+# AetherAFSKDemod — Direwolf profile-A AFSK demodulator.
+# Vendored Dire Wolf source is GPL-2.0-or-later; the combined AetherSDR work is
+# GPL-3.0-or-later (see THIRD_PARTY_LICENSES).
+# Profile A: IQ-mix + RRC + AGC/multi-slicer (best for amplitude-imbalanced signals).
+# VHF 1200 baud only; HF 300 baud stays on aether_libmodem_core.
+# AX.25 framing (bitstream, HDLC, FCS) continues to use aether_libmodem_core.
+add_library(aether_afskdemod STATIC
+    third_party/direwolf_afsk/AetherAFSKDemod.cpp
+)
+target_include_directories(aether_afskdemod PUBLIC
+    ${CMAKE_SOURCE_DIR}/third_party/direwolf_afsk
+)
+target_compile_features(aether_afskdemod PUBLIC cxx_std_20)
+message(STATUS "AetherAFSKDemod: Direwolf profile-A (VHF 1200 baud), GPL-2.0-or-later")
+
 # Bundled liquid-dsp (MIT) — comprehensive DSP toolkit covering modems
 # (PSK/QAM/FSK/GMSK/OFDM), FEC (Hamming/Golay/RS/convolutional), adaptive
 # filters (LMS/RLS), AGC, NCO, polyphase resampling, and equalizers.
@@ -993,24 +1070,50 @@ endif()
 
 qt_add_resources(RESOURCES resources/resources.qrc)
 
+# aetherd RFC step 1: engine static library — src/core + src/models
+# plus the vendored C/C++ sources those engine files compile against
+# (rnnoise, ggmorse, RADE, specbleach; mosquitto/rtmidi are appended below in
+# their feature blocks). Qt resources (resources.qrc, DFNR model qrc) stay on
+# the executable: rcc registration runs from the exe's static initializers and
+# is process-global, so core code reading ":/..." keeps working.
+add_library(aethercore STATIC
+    ${CORE_SOURCES}
+    ${MODEL_SOURCES}
+    ${RNNOISE_SOURCES}
+    ${GGMORSE_SOURCES}
+    ${RADE_SOURCES}
+    ${SPECBLEACH_SOURCES}
+)
+
 if(ANDROID)
     # qt_add_executable is required on Android: it builds the app as a
     # shared library and drives androiddeployqt/Gradle APK packaging.
-    qt_add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${BNR_SOURCES} ${SPECBLEACH_SOURCES} ${RESOURCES} ${DFNR_RESOURCES})
+    qt_add_executable(AetherSDR
+        src/main.cpp
+        ${GUI_SOURCES}
+        ${RESOURCES}
+        ${DFNR_RESOURCES}
+    )
 else()
-    add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${BNR_SOURCES} ${SPECBLEACH_SOURCES} ${RESOURCES} ${DFNR_RESOURCES})
+    add_executable(AetherSDR
+        src/main.cpp
+        ${GUI_SOURCES}
+        ${RESOURCES}
+        ${DFNR_RESOURCES}
+    )
 endif()
+target_link_libraries(AetherSDR PRIVATE aethercore)
 
 if (USE_SYSTEM_ZLIB)
-    target_link_libraries(AetherSDR PRIVATE PkgConfig::zlib)
+    target_link_libraries(aethercore PRIVATE PkgConfig::zlib)      # core: ZipArchive
 else()
-    target_link_libraries(AetherSDR PRIVATE zlibstatic) # bundled third_party/zlib 1.3.1
+    target_link_libraries(aethercore PRIVATE zlibstatic) # bundled third_party/zlib 1.3.1
 endif()
 
 if (USE_SYSTEM_MSPACK)
-    target_link_libraries(AetherSDR PRIVATE PkgConfig::libmspack)
+    target_link_libraries(aethercore PRIVATE PkgConfig::libmspack) # core: CabExtractor
 else()
-    target_link_libraries(AetherSDR PRIVATE mspack_static)
+    target_link_libraries(aethercore PRIVATE mspack_static)
 endif()
 
 # Link the system libmosquitto target only when MQTT is enabled — the
@@ -1019,7 +1122,7 @@ endif()
 # (ENABLE_MQTT=OFF + USE_SYSTEM_LIBMOSQUITTO=ON) would configure cleanly
 # then fail at link time with a missing target.
 if (ENABLE_MQTT AND USE_SYSTEM_LIBMOSQUITTO)
-    target_link_libraries(AetherSDR PRIVATE PkgConfig::libmosquitto)
+    target_link_libraries(aethercore PRIVATE PkgConfig::libmosquitto) # core: MqttClient
 endif()
 
 # Optionally change binary name to lower case on Linux
@@ -1096,7 +1199,7 @@ if(ANDROID)
     )
     # WifiManager.MulticastLock helper — without it Android Wi-Fi stacks
     # drop the UDP broadcast discovery packets FlexRadio sends on :4992.
-    target_sources(AetherSDR PRIVATE
+    target_sources(aethercore PRIVATE
         src/core/AndroidMulticastLock.cpp
         src/core/AndroidMulticastLock.h)
 endif()
@@ -1112,8 +1215,8 @@ if(APPLE)
         MACOSX_BUNDLE_ICON_FILE "AetherSDR.icns"
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_SOURCE_DIR}/packaging/macos/Info.plist.in"
     )
-    target_link_libraries(AetherSDR PRIVATE "-framework AVFoundation" "-framework Accelerate")
-    target_sources(AetherSDR PRIVATE src/core/MacNRFilter.cpp)
+    target_link_libraries(aethercore PRIVATE "-framework AVFoundation" "-framework Accelerate") # core: MacNRFilter/VirtualAudioBridge
+    target_sources(aethercore PRIVATE src/core/MacNRFilter.cpp)
 
     # Generate AetherSDR.icns at build time from docs/assets/logo-circle.png so local
     # builds get an app icon without any extra setup (sips and iconutil are
@@ -1147,16 +1250,21 @@ elseif(WIN32)
         target_sources(AetherSDR PRIVATE "${WIN_RC}")
     endif()
     if(MSVC)
-        # /MANIFESTINPUT requires /MANIFEST:EMBED per MSVC docs.  Newer MSVC
-        # toolsets (VS 18.x / 14.50+) enforce this strictly with LNK1220;
-        # older ones were lenient.  Be explicit.
-        target_link_options(AetherSDR PRIVATE
-            "/MANIFEST:EMBED"
-            "/MANIFESTINPUT:${CMAKE_SOURCE_DIR}/packaging/windows/AetherSDR.exe.manifest")
+        # Embed the application manifest the CMake-native way: list it as a
+        # source so CMake hands it to its own vs_link_exe/mt.exe embed step.
+        # Passing /MANIFEST:EMBED + /MANIFESTINPUT directly fights that
+        # machinery — link.exe embeds inline and emits no side-car manifest,
+        # so CMake's mt.exe step runs with an empty --manifests list and dies
+        # with c10100a7 (cmake 4.x) / LNK1220 the other way (#3237).
+        target_sources(AetherSDR PRIVATE
+            "${CMAKE_SOURCE_DIR}/packaging/windows/AetherSDR.exe.manifest")
     endif()
 endif()
 
-target_include_directories(AetherSDR PRIVATE
+# PUBLIC: src/ is the project include root for both layers ("core/..." and
+# "gui/..." includes); the vendored include dirs leak into headers used by
+# gui translation units today (e.g. hidapi via MainWindow_Controllers.cpp).
+target_include_directories(aethercore PUBLIC
     src/
     ${RNNOISE_DIR}/include
     ${RNNOISE_DIR}/src
@@ -1164,55 +1272,115 @@ target_include_directories(AetherSDR PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/r8brain
 )
 
-target_link_libraries(AetherSDR PRIVATE
+# Engine dependency surface. Qt6::Widgets is still linked into the engine
+# because five core files use QtWidgets (TxKeyingMarker.h, ThemeManager.cpp,
+# AutomationServer.cpp, ShortcutManager.cpp, SettingsHelpers.cpp). These are
+# tracked as EB2 legacy in tools/check_engine_boundary.py (per-file baseline
+# counts that may only shrink) and split out in step 3 — AutomationServer's
+# widget-facing dumpTree/grab half is the bulk of it.
+target_link_libraries(aethercore PUBLIC
     Qt6::Core
+    Qt6::Concurrent
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
     Qt6::Multimedia
     aether_libmodem_core
+    aether_afskdemod
+    ${CMAKE_DL_LIBS}   # NvidiaAfxFilter dlopen
+)
+
+target_link_libraries(AetherSDR PRIVATE
+    qgeoview           # gui/map only
     ${CMAKE_DL_LIBS}   # dlopen/dlsym for tolerant X11 error handler (#1839)
 )
 
 if (USE_SYSTEM_LIQUID_DSP)
-    target_link_libraries(AetherSDR PRIVATE PkgConfig::liquid-dsp)
+    target_link_libraries(aethercore PRIVATE PkgConfig::liquid-dsp)
 else()
     # bundled third_party/liquid-dsp (#3043) — non-MSVC only; see CMakeLists
     # block above for the liquid-dsp/MSVC C99 _Complex incompatibility.
-    target_link_libraries(AetherSDR PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:liquid-static>)
+    target_link_libraries(aethercore PRIVATE $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:liquid-static>)
 endif()
 
 if(Qt6SerialPort_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_SERIALPORT)
-    target_link_libraries(AetherSDR PRIVATE Qt6::SerialPort)
+    # PUBLIC: gui (MainWindow.cpp, RadioSetupDialog.cpp) uses QSerialPort and
+    # #ifdef HAVE_SERIALPORT directly.
+    target_compile_definitions(aethercore PUBLIC HAVE_SERIALPORT)
+    target_link_libraries(aethercore PUBLIC Qt6::SerialPort)
 endif()
 
 if(Qt6WebSockets_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_WEBSOCKETS)
-    target_sources(AetherSDR PRIVATE
+    # PUBLIC: gui (MainWindow_Spots.cpp) uses QWebSocket directly.
+    target_compile_definitions(aethercore PUBLIC HAVE_WEBSOCKETS)
+    target_sources(aethercore PRIVATE
         src/core/FreeDvClient.cpp
+    )
+    target_sources(AetherSDR PRIVATE
         src/gui/FreeDvReporterDialog.cpp
         src/gui/FreeDvReporterModel.cpp
     )
-    target_link_libraries(AetherSDR PRIVATE Qt6::WebSockets)
+    target_link_libraries(aethercore PUBLIC Qt6::WebSockets)
 endif()
 
 if(Qt6Keychain_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_KEYCHAIN)
-    target_link_libraries(AetherSDR PRIVATE Qt6Keychain::Qt6Keychain)
+    # PUBLIC (both): gui setup tabs test HAVE_KEYCHAIN *and* MqttApplet.cpp /
+    # MqttSettingsDialog.cpp include <qt6keychain/keychain.h> directly, so the
+    # exe's gui TUs need the imported target's INTERFACE_INCLUDE_DIRECTORIES.
+    # A PRIVATE link on a static lib propagates only $<LINK_ONLY:...> — the
+    # include dir would be lost and the gui TU fails to find the header on any
+    # platform where qtkeychain is not on a default include path (e.g. the
+    # bundled third_party/qtkeychain on Windows). Matches Qt6::SerialPort /
+    # Qt6::WebSockets, which are PUBLIC for the same reason.
+    target_compile_definitions(aethercore PUBLIC HAVE_KEYCHAIN)
+    target_link_libraries(aethercore PUBLIC Qt6Keychain::Qt6Keychain)
+    # Local Windows builds run straight from the build dir with no packaging
+    # step — windeployqt, which stages qt6keychain.dll for the installer, isn't
+    # involved — so the DLL needs to land next to the exe or the app fails to
+    # start with "qt6keychain.dll was not found".
+    if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/qtkeychain/bin/qt6keychain.dll")
+        add_custom_command(TARGET AetherSDR POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/third_party/qtkeychain/bin/qt6keychain.dll"
+                "$<TARGET_FILE_DIR:AetherSDR>"
+        )
+    endif()
+    # Same problem on macOS: a staged third_party/qtkeychain dylib is found
+    # via an absolute rpath into THIS checkout, so a bundle copied to another
+    # Mac (SFTP test deploys) fails to load it.  Ship the dylib inside the
+    # bundle and add the standard Frameworks rpath at link time (linker-added
+    # rpath keeps the ad-hoc signature valid — no install_name_tool).
+    # macdeployqt still handles release DMGs; copy_if_different is a no-op
+    # for it.
+    if(APPLE AND EXISTS "${CMAKE_SOURCE_DIR}/third_party/qtkeychain/lib/libqt6keychain.1.dylib")
+        set_property(TARGET AetherSDR APPEND PROPERTY
+            BUILD_RPATH "@executable_path/../Frameworks")
+        add_custom_command(TARGET AetherSDR POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_BUNDLE_CONTENT_DIR:AetherSDR>/Frameworks"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_SOURCE_DIR}/third_party/qtkeychain/lib/libqt6keychain.1.dylib"
+                "$<TARGET_BUNDLE_CONTENT_DIR:AetherSDR>/Frameworks"
+        )
+    endif()
 endif()
 
 if(Qt6DBus_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_DBUS)
-    target_link_libraries(AetherSDR PRIVATE Qt6::DBus)
+    target_compile_definitions(aethercore PUBLIC HAVE_DBUS)
+    target_link_libraries(aethercore PRIVATE Qt6::DBus)
 endif()
 
 if(AETHER_GPU_SPECTRUM)
-    target_compile_definitions(AetherSDR PRIVATE AETHER_GPU_SPECTRUM)
+    # PUBLIC on the engine: src/core/AutomationServer.cpp compiles QRhiWidget
+    # grab paths under #ifdef AETHER_GPU_SPECTRUM (QRhiWidget is public
+    # QtWidgets API on Qt 6.7+, so no GuiPrivate needed engine-side).
+    target_compile_definitions(aethercore PUBLIC AETHER_GPU_SPECTRUM)
 
-    # Apply the Debian include paths now that AetherSDR exists
+    # Apply the manual private-include paths now that AetherSDR exists. Covers
+    # Debian multi-arch and Windows/macOS aqt installs that lack the Qt6::GuiPrivate
+    # target (headers present on disk — located during detection above).
     if(DEBIAN_GPU_FIX_REQUIRED)
-        message(STATUS "Applying Debian GPU include paths to AetherSDR")
+        message(STATUS "Applying private QtGui include paths to AetherSDR (${DEBIAN_PRIVATE_INC})")
         target_include_directories(AetherSDR PRIVATE
             "${DEBIAN_PRIVATE_INC}/QtGui/${Qt6_VERSION}"
             "${DEBIAN_PRIVATE_INC}/QtGui/${Qt6_VERSION}/QtGui"
@@ -1221,6 +1389,23 @@ if(AETHER_GPU_SPECTRUM)
 
     if(TARGET Qt6::GuiPrivate)
         target_link_libraries(AetherSDR PRIVATE Qt6::GuiPrivate)
+    elseif(NOT DEBIAN_GPU_FIX_REQUIRED)
+        # No GuiPrivate target and no manual path (e.g. some macOS layouts) —
+        # locate the rhi/ headers within the Qt6::Gui include dirs.
+        get_target_property(_qt_gui_inc Qt6::Gui INTERFACE_INCLUDE_DIRECTORIES)
+        foreach(_dir IN LISTS _qt_gui_inc)
+            if(EXISTS "${_dir}/rhi/qrhi.h")
+                break() # already on the include path via Qt6::Gui
+            endif()
+            file(GLOB _priv_dirs "${_dir}/${Qt6_VERSION}/QtGui")
+            foreach(_pd IN LISTS _priv_dirs)
+                if(EXISTS "${_pd}/rhi/qrhi.h")
+                    target_include_directories(AetherSDR PRIVATE "${_pd}")
+                    message(STATUS "QRhi headers found at ${_pd}/rhi/")
+                    break()
+                endif()
+            endforeach()
+        endforeach()
     endif()
 
     qt_add_shaders(AetherSDR "aether_shaders"
@@ -1232,6 +1417,10 @@ if(AETHER_GPU_SPECTRUM)
             resources/shaders/overlay.frag
             resources/shaders/spectrum.vert
             resources/shaders/spectrum.frag
+            resources/shaders/panscope.frag
+            resources/shaders/dss_mesh.vert
+            resources/shaders/dss_mesh.frag
+            resources/shaders/wavescope.frag
     )
 endif()
 
@@ -1251,35 +1440,40 @@ endif()
 # whole MIDI feature is compiled out there; HAVE_MIDI guards all call sites.
 if(NOT ANDROID)
 message(STATUS "MIDI controller support enabled (RtMidi)")
-target_compile_definitions(AetherSDR PRIVATE HAVE_MIDI)
-target_sources(AetherSDR PRIVATE
+target_compile_definitions(aethercore PUBLIC HAVE_MIDI) # gui MidiMappingDialog + MainWindow check it too
+target_sources(aethercore PRIVATE
     src/core/MidiControlManager.cpp
-    src/core/MidiSettings.cpp
+    src/core/MidiSettings.cpp)
+target_sources(AetherSDR PRIVATE
     src/gui/MidiMappingDialog.cpp)
 if (USE_SYSTEM_RTMIDI)
     find_package(PkgConfig REQUIRED)
     if(PkgConfig_FOUND)
         pkg_check_modules(rtmidi REQUIRED IMPORTED_TARGET rtmidi)
     endif()
-    target_link_libraries(AetherSDR PRIVATE PkgConfig::rtmidi)
+    target_link_libraries(aethercore PRIVATE PkgConfig::rtmidi)
 else()
-    target_sources(AetherSDR PRIVATE third_party/rtmidi/RtMidi.cpp)
-    target_include_directories(AetherSDR PRIVATE third_party/rtmidi)
+    target_sources(aethercore PRIVATE third_party/rtmidi/RtMidi.cpp)
+    # PUBLIC: MidiControlManager.h includes RtMidi.h
+    target_include_directories(aethercore PUBLIC third_party/rtmidi)
 endif()
 
 if(APPLE)
-    target_compile_definitions(AetherSDR PRIVATE __MACOSX_CORE__)
-    target_link_libraries(AetherSDR PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation" "-framework IOKit")
+    # RtMidi backend selectors — PUBLIC because MidiControlManager.h includes
+    # RtMidi.h (its class layout is backend-conditional in places).
+    target_compile_definitions(aethercore PUBLIC __MACOSX_CORE__)
+    target_link_libraries(aethercore PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation" "-framework IOKit")
 elseif(WIN32)
-    target_compile_definitions(AetherSDR PRIVATE __WINDOWS_MM__)
-    target_link_libraries(AetherSDR PRIVATE winmm)
+    target_compile_definitions(aethercore PUBLIC __WINDOWS_MM__)
+    target_link_libraries(aethercore PRIVATE winmm)
+    target_link_libraries(aethercore PRIVATE dxgi)  # GpuSelector adapter enumeration
 else()
-    target_compile_definitions(AetherSDR PRIVATE __LINUX_ALSA__)
+    target_compile_definitions(aethercore PUBLIC __LINUX_ALSA__)
     find_package(PkgConfig REQUIRED)
     if(PkgConfig_FOUND)
         pkg_check_modules(alsa REQUIRED IMPORTED_TARGET alsa)
     endif()
-    target_link_libraries(AetherSDR PRIVATE PkgConfig::alsa)
+    target_link_libraries(aethercore PRIVATE PkgConfig::alsa)
 endif()
 endif() # NOT ANDROID (MIDI controller support)
 
@@ -1313,37 +1507,42 @@ endif()
 # expose the same Qt signal contract (see UlanziDialBackend.h); the
 # mapper dialog and MainWindow dispatcher are unchanged across
 # platforms.  See #3232 for the design.
+target_sources(aethercore PRIVATE
+    src/core/UlanziDialBackend.h    # header-only Q_OBJECT — listed so AUTOMOC mocs it in the engine
+    src/core/backends/IRadioBackend.h)  # aetherd RFC step 2.1: radio-facing seam (§5.5); header-only Q_OBJECT
 target_sources(AetherSDR PRIVATE
-    src/core/UlanziDialBackend.h
     src/gui/UlanziDialMapperDialog.cpp
     src/gui/UlanziDialMapperDialog.h)
 if(UNIX AND NOT APPLE AND NOT ANDROID)
-    target_sources(AetherSDR PRIVATE
+    target_sources(aethercore PRIVATE
         src/core/EvdevEncoderManager.cpp
         src/core/EvdevEncoderManager.h)
 endif()
 if(WIN32)
-    target_sources(AetherSDR PRIVATE
+    target_sources(aethercore PRIVATE
         src/core/UlanziDialWindowsManager.cpp
         src/core/UlanziDialWindowsManager.h)
 endif()
 if(APPLE)
-    target_sources(AetherSDR PRIVATE
+    target_sources(aethercore PRIVATE
         src/core/UlanziDialMacOSManager.cpp
         src/core/UlanziDialMacOSManager.h)
-    target_link_libraries(AetherSDR PRIVATE
+    target_link_libraries(aethercore PRIVATE
         "-framework IOKit"
         "-framework CoreFoundation")
 endif()
 
 if(HIDAPI_FOUND)
     message(STATUS "hidapi found — USB HID encoder support enabled")
-    target_compile_definitions(AetherSDR PRIVATE HAVE_HIDAPI)
-    target_sources(AetherSDR PRIVATE
+    # PUBLIC: gui (MainWindow_Controllers.cpp) includes hidapi.h and checks
+    # HAVE_HIDAPI directly.
+    target_compile_definitions(aethercore PUBLIC HAVE_HIDAPI)
+    target_sources(aethercore PRIVATE
         src/core/HidEncoderManager.cpp
         src/core/HidEncoderManager.h
         src/core/HidDeviceParser.cpp
-        src/core/HidDeviceParser.h
+        src/core/HidDeviceParser.h)
+    target_sources(AetherSDR PRIVATE
         src/gui/RC28MappingDialog.cpp
         src/gui/RC28MappingDialog.h)
     set(HIDAPI_NORMALIZED_INCLUDE_DIRS ${HIDAPI_INCLUDE_DIRS})
@@ -1357,8 +1556,8 @@ if(HIDAPI_FOUND)
         endif()
     endforeach()
     list(REMOVE_DUPLICATES HIDAPI_NORMALIZED_INCLUDE_DIRS)
-    target_include_directories(AetherSDR PRIVATE ${HIDAPI_NORMALIZED_INCLUDE_DIRS})
-    target_link_libraries(AetherSDR PRIVATE ${HIDAPI_LIBRARIES})
+    target_include_directories(aethercore PUBLIC ${HIDAPI_NORMALIZED_INCLUDE_DIRS})
+    target_link_libraries(aethercore PRIVATE ${HIDAPI_LIBRARIES})
     # Copy DLL to build dir on Windows
     if(WIN32 AND HIDAPI_DLL)
         add_custom_command(TARGET AetherSDR POST_BUILD
@@ -1407,22 +1606,28 @@ else()
 endif()
 
 if(PORTAUDIO_FOUND)
-    target_sources(AetherSDR PRIVATE src/core/CwSidetonePortAudioSink.cpp)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_PORTAUDIO)
-    target_include_directories(AetherSDR PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
-    target_link_directories(AetherSDR PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
-    target_link_libraries(AetherSDR PRIVATE ${PORTAUDIO_LIBRARIES})
+    target_sources(aethercore PRIVATE src/core/CwSidetonePortAudioSink.cpp)
+    target_compile_definitions(aethercore PUBLIC HAVE_PORTAUDIO)
+    target_include_directories(aethercore PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
+    target_link_directories(aethercore PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
+    target_link_libraries(aethercore PRIVATE ${PORTAUDIO_LIBRARIES})
 endif()
 
 if(FFTW3_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_FFTW3
+    target_compile_definitions(aethercore PUBLIC HAVE_FFTW3
         # On Windows lld-link (used by ClangCL) requires explicit dllimport
         # declarations; define FFTW_DLL so fftw3.h emits __declspec(dllimport)
         # and the linker can resolve __imp_fftwf_* symbols from the import lib.
         $<$<BOOL:${WIN32}>:FFTW_DLL>)
-    target_include_directories(AetherSDR PRIVATE ${FFTW3_INCLUDE_DIRS})
-    target_link_directories(AetherSDR PRIVATE ${FFTW3_LIBRARY_DIRS})
-    target_link_libraries(AetherSDR PRIVATE ${FFTW3_LIBRARIES})
+    # PUBLIC: core/SpectralNR.h includes <fftw3.h> under HAVE_FFTW3 (also
+    # PUBLIC), and SpectralNR.h is pulled in by AudioEngine.h — a header many
+    # gui TUs include. A PRIVATE include dir is lost to the exe, so those gui
+    # TUs fail to find fftw3.h wherever it is off the default path (Windows
+    # bundled third_party/fftw3). The library link stays PRIVATE (symbols reach
+    # the exe transitively through the static lib).
+    target_include_directories(aethercore PUBLIC ${FFTW3_INCLUDE_DIRS})
+    target_link_directories(aethercore PRIVATE ${FFTW3_LIBRARY_DIRS})
+    target_link_libraries(aethercore PRIVATE ${FFTW3_LIBRARIES})
     # Copy DLL to build dir on Windows
     if(WIN32 AND FFTW3_DLL)
         add_custom_command(TARGET AetherSDR POST_BUILD
@@ -1434,9 +1639,12 @@ if(FFTW3_FOUND)
 endif()
 
 if(ORT_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_ONNX)
-    target_include_directories(AetherSDR PRIVATE ${ORT_INCLUDE_DIRS})
-    target_link_libraries(AetherSDR PRIVATE ${ORT_LIBRARIES})
+    target_compile_definitions(aethercore PUBLIC HAVE_ONNX)
+    # PUBLIC include dir: core/SignalClassifier.h includes onnxruntime under
+    # HAVE_ONNX (PUBLIC) and is pulled in by gui/MainWindow.h. Same transitive
+    # leak as FFTW3 above. Library link stays PRIVATE (transitive via the lib).
+    target_include_directories(aethercore PUBLIC ${ORT_INCLUDE_DIRS})
+    target_link_libraries(aethercore PRIVATE ${ORT_LIBRARIES})
     if(WIN32 AND ORT_DLLS)
         foreach(_ort_dll IN LISTS ORT_DLLS)
             add_custom_command(TARGET AetherSDR POST_BUILD
@@ -1448,47 +1656,46 @@ if(ORT_FOUND)
 endif()
 
 if(RADE_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_RADE HAVE_OPUS IS_BUILDING_RADE_API=1)
+    # PUBLIC defines: gui (RadeApplet etc.) checks HAVE_RADE/HAVE_OPUS.
+    target_compile_definitions(aethercore PUBLIC HAVE_RADE HAVE_OPUS IS_BUILDING_RADE_API=1)
     if(RADE_WAV_TAP)
         set(RADE_TAP_DIR "${CMAKE_BINARY_DIR}/rade_taps"
             CACHE PATH "Output directory for RADE WAV tap files")
-        target_compile_definitions(AetherSDR PRIVATE RADE_WAV_TAP
+        # PUBLIC: RADEEngine.h guards two QByteArray members with
+        # #ifdef RADE_WAV_TAP mid-class, so the flag changes sizeof(RADEEngine)
+        # and every later member offset. A gui TU allocates it
+        # (MainWindow_DigitalModes.cpp `new RADEEngine`); a PRIVATE define would
+        # give the exe a smaller layout than the constructor compiled here →
+        # ODR violation / heap corruption under -DRADE_WAV_TAP=ON. Matches the
+        # sibling HAVE_RADE/HAVE_OPUS defines.
+        target_compile_definitions(aethercore PUBLIC RADE_WAV_TAP
             RADE_TAP_DIR="${RADE_TAP_DIR}")
     endif()
-    target_include_directories(AetherSDR PRIVATE ${RADE_DIR}/src)
+    target_include_directories(aethercore PRIVATE ${RADE_DIR}/src)
     if(WIN32)
-        target_link_libraries(AetherSDR PRIVATE opus)
+        target_link_libraries(aethercore PRIVATE opus)
     else()
-        target_link_libraries(AetherSDR PRIVATE opus m)
+        target_link_libraries(aethercore PRIVATE opus m)
     endif()
 elseif(OPUS_FOUND)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_OPUS)
-    target_include_directories(AetherSDR PRIVATE ${OPUS_INCLUDE_DIRS})
-    target_link_libraries(AetherSDR PRIVATE ${OPUS_LIBRARIES})
-endif()
-
-if(ENABLE_BNR)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_BNR)
-    target_include_directories(AetherSDR PRIVATE
-        ${BNR_GEN_DIR}
-        ${GRPC_INCLUDE_DIRS}
-        ${PROTOBUF_INCLUDE_DIRS})
-    target_link_libraries(AetherSDR PRIVATE ${GRPC_LIBRARIES} ${PROTOBUF_LIBRARIES})
+    target_compile_definitions(aethercore PUBLIC HAVE_OPUS)
+    target_include_directories(aethercore PRIVATE ${OPUS_INCLUDE_DIRS})
+    target_link_libraries(aethercore PRIVATE ${OPUS_LIBRARIES})
 endif()
 
 if(ENABLE_SPECBLEACH)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_SPECBLEACH)
-    target_include_directories(AetherSDR PRIVATE
+    target_compile_definitions(aethercore PUBLIC HAVE_SPECBLEACH)
+    target_include_directories(aethercore PRIVATE
         ${CMAKE_SOURCE_DIR}/third_party/libspecbleach/include
         ${CMAKE_SOURCE_DIR}/third_party/libspecbleach/src)
     if(MSVC AND SPECBLEACH_STATIC_LIB)
         # Link pre-built clang-cl static lib
-        add_dependencies(AetherSDR specbleach_build)
-        target_link_libraries(AetherSDR PRIVATE ${SPECBLEACH_STATIC_LIB})
+        add_dependencies(aethercore specbleach_build)
+        target_link_libraries(aethercore PRIVATE ${SPECBLEACH_STATIC_LIB})
         # fftw3f (float precision) for Windows
         set(FFTW3F_LIB "${CMAKE_SOURCE_DIR}/third_party/fftw3/lib/fftw3f.lib")
         if(EXISTS ${FFTW3F_LIB})
-            target_link_libraries(AetherSDR PRIVATE ${FFTW3F_LIB})
+            target_link_libraries(aethercore PRIVATE ${FFTW3F_LIB})
             set(FFTW3F_DLL "${CMAKE_SOURCE_DIR}/third_party/fftw3/bin/libfftw3f-3.dll")
             add_custom_command(TARGET AetherSDR POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -1498,19 +1705,21 @@ if(ENABLE_SPECBLEACH)
             message(WARNING "fftw3f.lib not found — run scripts/setup/setup-fftw.ps1 and gen-fftw3f-lib.bat")
         endif()
     else()
-        # libspecbleach C sources include <fftw3.h> directly — ensure it's findable
+        # libspecbleach C sources include <fftw3.h> directly — ensure it's
+        # findable. PUBLIC for the same transitive reason as the main FFTW3
+        # block above (AudioEngine.h -> SpectralNR.h -> <fftw3.h> reaches gui).
         if(FFTW3_INCLUDE_DIRS)
-            target_include_directories(AetherSDR PRIVATE ${FFTW3_INCLUDE_DIRS})
+            target_include_directories(aethercore PUBLIC ${FFTW3_INCLUDE_DIRS})
         else()
             find_path(FFTW3_H_DIR fftw3.h HINTS ${CMAKE_SOURCE_DIR}/third_party/fftw3/include)
             if(FFTW3_H_DIR)
-                target_include_directories(AetherSDR PRIVATE ${FFTW3_H_DIR})
+                target_include_directories(aethercore PUBLIC ${FFTW3_H_DIR})
             endif()
         endif()
         # libspecbleach uses fftwf (float precision FFTW3)
         find_library(FFTW3F_LIB fftw3f HINTS /opt/homebrew/lib /usr/local/lib ${CMAKE_SOURCE_DIR}/third_party/fftw3/lib)
         if(FFTW3F_LIB)
-            target_link_libraries(AetherSDR PRIVATE ${FFTW3F_LIB})
+            target_link_libraries(aethercore PRIVATE ${FFTW3F_LIB})
         else()
             message(WARNING "fftw3f not found — NR4 will fail to link")
         endif()
@@ -1520,17 +1729,17 @@ if(ENABLE_SPECBLEACH)
 endif()
 
 if(ENABLE_DFNR)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_DFNR)
-    target_include_directories(AetherSDR PRIVATE ${DEEPFILTER_DIR}/include)
-    target_link_libraries(AetherSDR PRIVATE ${DFNR_LIB})
+    target_compile_definitions(aethercore PUBLIC HAVE_DFNR)
+    target_include_directories(aethercore PRIVATE ${DEEPFILTER_DIR}/include)
+    target_link_libraries(aethercore PRIVATE ${DFNR_LIB})
     if(WIN32)
-        target_link_libraries(AetherSDR PRIVATE ws2_32 bcrypt userenv ntdll)
+        target_link_libraries(aethercore PRIVATE ws2_32 bcrypt userenv ntdll)
     elseif(APPLE)
         # Rust runtime deps on macOS
-        target_link_libraries(AetherSDR PRIVATE "-framework Security" "-framework CoreFoundation")
+        target_link_libraries(aethercore PRIVATE "-framework Security" "-framework CoreFoundation")
     else()
         # Rust runtime deps on Linux
-        target_link_libraries(AetherSDR PRIVATE pthread dl m)
+        target_link_libraries(aethercore PRIVATE pthread dl m)
     endif()
     # Copy DLL and model to build directory
     if(DFNR_DLL AND EXISTS ${DFNR_DLL})
@@ -1564,110 +1773,103 @@ if(ENABLE_DFNR)
     endif()
 endif()
 
+# Optional NVIDIA Maxine AFX GPU denoiser. The AFX runtime (libnv_audiofx +
+# the ~2 GB CUDA/TensorRT libs) is NOT linked here — it is dlopen'd at runtime
+# from a downloaded/cached pack, so the shipped binary carries none of it.
+# We only compile the wrapper (it uses its own minimal NvAFX_* declarations,
+# so no NVIDIA headers are vendored) and link the dynamic loader.
+if(ENABLE_NVIDIA_AFX)
+    # x86_64 ONLY: NVIDIA Maxine AFX ships no ARM runtime, so aarch64 (Raspberry
+    # Pi etc. — which also have no NVIDIA GPU) and macOS get the DFNR fallback,
+    # not BNR. The arch guard means BNR is simply absent there (no dead button).
+    if(((UNIX AND NOT APPLE) OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        # PUBLIC: gui surfaces the BNR button under #ifdef HAVE_NVIDIA_AFX.
+        target_compile_definitions(aethercore PUBLIC HAVE_NVIDIA_AFX)
+        # Linux loads the AFX runtime via libdl; Windows uses the Win32
+        # LoadLibrary family from kernel32 (linked by default).
+        if(UNIX)
+            target_link_libraries(aethercore PRIVATE ${CMAKE_DL_LIBS})
+        endif()
+        message(STATUS "NVIDIA AFX GPU denoiser enabled (runtime-loaded)")
+    else()
+        message(STATUS "NVIDIA AFX GPU denoiser not built (x86_64 Linux/Windows only; macOS/aarch64 use DFNR)")
+    endif()
+endif()
+
 if(ENABLE_MQTT)
     # HAVE_MQTT gates the project's MQTT client code (MqttApplet,
     # RadioModel plumbing) — must be set regardless of whether
     # libmosquitto is the bundled or the system copy.
-    target_compile_definitions(AetherSDR PRIVATE HAVE_MQTT)
+    target_compile_definitions(aethercore PUBLIC HAVE_MQTT) # gui MqttApplet checks it
     if (USE_SYSTEM_LIBMOSQUITTO)
         # System libmosquitto is conventionally built with TLS support on
         # distro packages — assume HAVE_MQTT_TLS unless the packager
         # explicitly opted out via -DMQTT_TLS=OFF.
         if(MQTT_TLS)
-            target_compile_definitions(AetherSDR PRIVATE HAVE_MQTT_TLS)
+            target_compile_definitions(aethercore PUBLIC HAVE_MQTT_TLS)
         endif()
     else()
-        target_include_directories(AetherSDR PRIVATE
+        target_include_directories(aethercore PRIVATE
             ${MOSQUITTO_DIR}/include
             ${MOSQUITTO_DIR}/src)
-        target_sources(AetherSDR PRIVATE ${MOSQUITTO_SOURCES})
+        target_sources(aethercore PRIVATE ${MOSQUITTO_SOURCES})
         if(OpenSSL_FOUND)
             set(MQTT_TLS_FLAG " -DWITH_TLS")
-            target_compile_definitions(AetherSDR PRIVATE HAVE_MQTT_TLS)
-            target_link_libraries(AetherSDR PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            target_compile_definitions(aethercore PUBLIC HAVE_MQTT_TLS)
+            target_link_libraries(aethercore PRIVATE OpenSSL::SSL OpenSSL::Crypto)
         else()
             set(MQTT_TLS_FLAG "")
         endif()
         if(WIN32)
             set_source_files_properties(${MOSQUITTO_SOURCES} PROPERTIES
                 COMPILE_FLAGS "-w -DLIBMOSQUITTO_STATIC -DLIBMOSQCOMMON_STATIC${MQTT_TLS_FLAG}")
-            target_compile_definitions(AetherSDR PRIVATE LIBMOSQUITTO_STATIC LIBMOSQCOMMON_STATIC)
+            target_compile_definitions(aethercore PRIVATE LIBMOSQUITTO_STATIC LIBMOSQCOMMON_STATIC)
         else()
             set_source_files_properties(${MOSQUITTO_SOURCES} PROPERTIES
                 COMPILE_FLAGS "-w -DWITH_THREADING${MQTT_TLS_FLAG}")
         endif()
     endif()
     if(NOT WIN32)
-        target_link_libraries(AetherSDR PRIVATE pthread)
+        target_link_libraries(aethercore PRIVATE pthread)
     endif()
-endif()
-
-if(AETHER_GPU_SPECTRUM)
-    target_compile_definitions(AetherSDR PRIVATE AETHER_GPU_SPECTRUM)
-    if(TARGET Qt6::GuiPrivate)
-        target_link_libraries(AetherSDR PRIVATE Qt6::GuiPrivate)
-    else()
-        # Qt6::GuiPrivate not available (macOS/skipped) — find rhi/ headers manually
-        get_target_property(_qt_gui_inc Qt6::Gui INTERFACE_INCLUDE_DIRECTORIES)
-        foreach(_dir IN LISTS _qt_gui_inc)
-            if(EXISTS "${_dir}/rhi/qrhi.h")
-                # Already in the include path via Qt6::Gui
-                break()
-            endif()
-            # Check versioned private header directory (e.g. QtGui/6.7.3/QtGui/rhi/)
-            file(GLOB _priv_dirs "${_dir}/${Qt6_VERSION}/QtGui")
-            foreach(_pd IN LISTS _priv_dirs)
-                if(EXISTS "${_pd}/rhi/qrhi.h")
-                    target_include_directories(AetherSDR PRIVATE "${_pd}/..")
-                    message(STATUS "QRhi headers found at ${_pd}/rhi/")
-                    break()
-                endif()
-            endforeach()
-        endforeach()
-    endif()
-    qt_add_shaders(AetherSDR "aether_shaders"
-        PREFIX "/shaders"
-        FILES
-            resources/shaders/texturedquad.vert
-            resources/shaders/texturedquad.frag
-            resources/shaders/overlay.vert
-            resources/shaders/overlay.frag
-            resources/shaders/spectrum.vert
-            resources/shaders/spectrum.frag
-    )
 endif()
 
 if(HAVE_PIPEWIRE)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_PIPEWIRE)
+    target_compile_definitions(aethercore PUBLIC HAVE_PIPEWIRE) # gui checks HAVE_PIPEWIRE too
     message(STATUS "Linux DAX bridge enabled (PulseAudio pipe modules)")
 endif()
 
 if(HAVE_PIPEWIRE_NATIVE)
-    target_compile_definitions(AetherSDR PRIVATE HAVE_PIPEWIRE_NATIVE)
-    target_include_directories(AetherSDR PRIVATE ${PIPEWIRE_NATIVE_INCLUDE_DIRS})
-    target_link_libraries(AetherSDR PRIVATE ${PIPEWIRE_NATIVE_LIBRARIES})
-    target_compile_options(AetherSDR PRIVATE ${PIPEWIRE_NATIVE_CFLAGS_OTHER})
+    target_compile_definitions(aethercore PUBLIC HAVE_PIPEWIRE_NATIVE)
+    target_include_directories(aethercore PRIVATE ${PIPEWIRE_NATIVE_INCLUDE_DIRS})
+    target_link_libraries(aethercore PRIVATE ${PIPEWIRE_NATIVE_LIBRARIES})
+    target_compile_options(aethercore PRIVATE ${PIPEWIRE_NATIVE_CFLAGS_OTHER})
     message(STATUS "Linux DAX RX uses native pw_stream (libpipewire-0.3 ${PIPEWIRE_NATIVE_VERSION})")
 endif()
 
-# Pass project version to code
-target_compile_definitions(AetherSDR PRIVATE
+# Pass project version to code — PUBLIC so main.cpp and gui (About dialog,
+# Ax25HfPacketDecodeDialog) see it as before.
+target_compile_definitions(aethercore PUBLIC
     AETHERSDR_VERSION="${PROJECT_VERSION}"
 )
 
-# Compiler warnings
-if(MSVC)
-    target_compile_options(AetherSDR PRIVATE /W3 /Zc:__cplusplus /permissive- /utf-8 /bigobj)
-else()
-    target_compile_options(AetherSDR PRIVATE
-        -Wall -Wextra -Wpedantic
-        $<$<CONFIG:Debug>:-g3 -fsanitize=address>
-        $<$<CONFIG:Debug>:-fno-omit-frame-pointer>
-    )
-    target_link_options(AetherSDR PRIVATE
-        $<$<CONFIG:Debug>:-fsanitize=address>
-    )
-endif()
+# Compiler warnings — same flags for both first-party targets. Vendored
+# sources compiled into aethercore keep their per-source -w COMPILE_FLAGS,
+# which land after these target options and win (unchanged from monolith).
+foreach(_aether_tgt aethercore AetherSDR)
+    if(MSVC)
+        target_compile_options(${_aether_tgt} PRIVATE /W3 /Zc:__cplusplus /permissive- /utf-8 /bigobj)
+    else()
+        target_compile_options(${_aether_tgt} PRIVATE
+            -Wall -Wextra -Wpedantic
+            $<$<CONFIG:Debug>:-g3 -fsanitize=address>
+            $<$<CONFIG:Debug>:-fno-omit-frame-pointer>
+        )
+        target_link_options(${_aether_tgt} PRIVATE
+            $<$<CONFIG:Debug>:-fsanitize=address>
+        )
+    endif()
+endforeach()
 
 
 if(ANDROID)
@@ -1713,6 +1915,13 @@ add_executable(slice_label_test
 target_include_directories(slice_label_test PRIVATE src)
 target_link_libraries(slice_label_test PRIVATE Qt6::Gui)
 add_test(NAME slice_label_test COMMAND slice_label_test)
+
+add_executable(vfo_flag_placement_test
+    tests/vfo_flag_placement_test.cpp
+)
+target_include_directories(vfo_flag_placement_test PRIVATE src)
+target_link_libraries(vfo_flag_placement_test PRIVATE Qt6::Widgets)
+add_test(NAME vfo_flag_placement_test COMMAND vfo_flag_placement_test)
 
 add_executable(slice_model_letter_test
     tests/slice_model_letter_test.cpp
@@ -1794,6 +2003,42 @@ target_include_directories(tx_mic_channel_normalizer_test PRIVATE
 target_link_libraries(tx_mic_channel_normalizer_test PRIVATE Qt6::Core)
 add_test(NAME tx_mic_channel_normalizer_test COMMAND tx_mic_channel_normalizer_test)
 
+# Pins the SkyRoof-parity WFM DSP chain: NCO offset correction removes the
+# discriminator DC term (fixed pan + Doppler-stepped slice), twin linear-phase
+# resamplers deliver exactly 48 kHz from any native DAX IQ rate, and streaming
+# state is continuous across block boundaries.
+add_executable(wfm_dsp_test
+    tests/wfm_dsp_test.cpp
+    src/core/WfmDsp.cpp
+    src/core/Resampler.cpp
+)
+target_include_directories(wfm_dsp_test PRIVATE
+    src
+    ${CMAKE_SOURCE_DIR}/third_party/r8brain
+)
+target_link_libraries(wfm_dsp_test PRIVATE Qt6::Core)
+add_test(NAME wfm_dsp_test COMMAND wfm_dsp_test)
+
+# Hardware-gated functional test for the optional NVIDIA AFX GPU denoiser.
+# Built only when the feature is enabled; SKIPs at runtime without a pack/GPU.
+if(ENABLE_NVIDIA_AFX AND ((UNIX AND NOT APPLE) OR WIN32) AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    add_executable(nvidia_afx_filter_test
+        tests/nvidia_afx_filter_test.cpp
+        src/core/NvidiaAfxFilter.cpp
+        src/core/Resampler.cpp
+    )
+    target_compile_definitions(nvidia_afx_filter_test PRIVATE HAVE_NVIDIA_AFX)
+    target_include_directories(nvidia_afx_filter_test PRIVATE
+        src
+        ${CMAKE_SOURCE_DIR}/third_party/r8brain
+    )
+    target_link_libraries(nvidia_afx_filter_test PRIVATE Qt6::Core)
+    if(UNIX)
+        target_link_libraries(nvidia_afx_filter_test PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    add_test(NAME nvidia_afx_filter_test COMMAND nvidia_afx_filter_test)
+endif()
+
 # Pure, headless, hardware-free golden matrix for the consolidated audio
 # format/rate negotiation policy (#3306). TargetOs is data, so this one binary
 # exercises the Windows/macOS/Linux ladders regardless of the CI host.
@@ -1816,6 +2061,38 @@ add_executable(audio_device_negotiator_test
 target_include_directories(audio_device_negotiator_test PRIVATE src)
 target_link_libraries(audio_device_negotiator_test PRIVATE Qt6::Core Qt6::Multimedia)
 add_test(NAME audio_device_negotiator_test COMMAND audio_device_negotiator_test)
+
+# Unit test for the AudioOutputRouter sink registry (#3306) — seeding, fan-out,
+# and the QPointer guard. Hardware-independent. AudioOutputRouter is a QObject,
+# so this relies on the project-global AUTOMOC.
+add_executable(audio_output_router_test
+    tests/audio_output_router_test.cpp
+    src/core/AudioOutputRouter.cpp
+)
+target_include_directories(audio_output_router_test PRIVATE src)
+target_link_libraries(audio_output_router_test PRIVATE Qt6::Core Qt6::Multimedia)
+add_test(NAME audio_output_router_test COMMAND audio_output_router_test)
+
+# Regression test for #4003 — QsoRecorder must not dereference a SliceModel that
+# was freed (reconnect prune) before recording starts. QPointer auto-nulls the
+# reference; the test deletes the slice and asserts the metadata is cleared.
+add_executable(qso_recorder_slice_lifetime_test
+    tests/qso_recorder_slice_lifetime_test.cpp
+    src/core/QsoRecorder.cpp
+    src/core/AppSettings.cpp
+    src/core/AudioDeviceNegotiator.cpp
+    src/core/AudioFormatNegotiator.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+    src/core/Resampler.cpp
+    src/models/SliceModel.cpp
+)
+target_include_directories(qso_recorder_slice_lifetime_test PRIVATE
+    src
+    ${CMAKE_SOURCE_DIR}/third_party/r8brain
+)
+target_link_libraries(qso_recorder_slice_lifetime_test PRIVATE Qt6::Core Qt6::Multimedia)
+add_test(NAME qso_recorder_slice_lifetime_test COMMAND qso_recorder_slice_lifetime_test)
 
 add_executable(profile_transfer_test
     tests/profile_transfer_test.cpp
@@ -1863,6 +2140,99 @@ add_executable(spectral_nr_test
 target_include_directories(spectral_nr_test PRIVATE src)
 target_link_libraries(spectral_nr_test PRIVATE Qt6::Core)
 add_test(NAME spectral_nr_test COMMAND spectral_nr_test)
+
+add_executable(adaptive_filter_test
+    tests/adaptive_filter_test.cpp
+    src/core/OccupiedRegion.cpp
+)
+target_include_directories(adaptive_filter_test PRIVATE src)
+target_link_libraries(adaptive_filter_test PRIVATE Qt6::Core)
+add_test(NAME adaptive_filter_test COMMAND adaptive_filter_test)
+
+add_executable(waveform_scope_model_test
+    tests/waveform_scope_model_test.cpp
+    src/gui/WaveformScopeModel.cpp
+)
+target_include_directories(waveform_scope_model_test PRIVATE src)
+target_link_libraries(waveform_scope_model_test PRIVATE Qt6::Core)
+add_test(NAME waveform_scope_model_test COMMAND waveform_scope_model_test)
+
+# Engine-level test: drives AdaptiveFilterEngine::processFrame through a real
+# SliceModel (signals only, no radio) with monotonic timestamps — covers the
+# wall-clock pacing / send-throttle / QSO-handoff logic the measurement test
+# can't reach. Both AdaptiveFilterEngine and SliceModel are Q_OBJECT (AUTOMOC).
+add_executable(adaptive_engine_test
+    tests/adaptive_engine_test.cpp
+    src/core/AdaptiveFilterEngine.cpp
+    src/core/OccupiedRegion.cpp
+    src/models/SliceModel.cpp
+    src/core/KiwiSdrProtocol.cpp
+)
+target_include_directories(adaptive_engine_test PRIVATE src)
+target_link_libraries(adaptive_engine_test PRIVATE Qt6::Core)
+set_target_properties(adaptive_engine_test PROPERTIES AUTOMOC ON)
+add_test(NAME adaptive_engine_test COMMAND adaptive_engine_test)
+
+add_executable(kiwi_sdr_protocol_test
+    tests/kiwi_sdr_protocol_test.cpp
+    src/core/KiwiSdrProtocol.cpp
+)
+target_include_directories(kiwi_sdr_protocol_test PRIVATE src)
+target_link_libraries(kiwi_sdr_protocol_test PRIVATE Qt6::Core)
+add_test(NAME kiwi_sdr_protocol_test COMMAND kiwi_sdr_protocol_test)
+
+add_executable(kiwi_sdr_trace_math_test
+    tests/kiwi_sdr_trace_math_test.cpp
+)
+target_include_directories(kiwi_sdr_trace_math_test PRIVATE src)
+target_link_libraries(kiwi_sdr_trace_math_test PRIVATE Qt6::Core)
+add_test(NAME kiwi_sdr_trace_math_test COMMAND kiwi_sdr_trace_math_test)
+
+add_executable(dss_renderer_test
+    tests/dss_renderer_test.cpp
+    src/gui/DssRenderer.cpp
+)
+target_include_directories(dss_renderer_test PRIVATE src)
+target_link_libraries(dss_renderer_test PRIVATE Qt6::Core Qt6::Gui)
+add_test(NAME dss_renderer_test COMMAND dss_renderer_test)
+
+add_executable(kiwi_sdr_redirect_policy_test
+    tests/kiwi_sdr_redirect_policy_test.cpp
+    src/core/KiwiSdrRedirectPolicy.cpp
+)
+target_include_directories(kiwi_sdr_redirect_policy_test PRIVATE src)
+target_link_libraries(kiwi_sdr_redirect_policy_test PRIVATE Qt6::Core)
+add_test(NAME kiwi_sdr_redirect_policy_test COMMAND kiwi_sdr_redirect_policy_test)
+
+add_executable(receive_presentation_sync_test
+    tests/receive_presentation_sync_test.cpp
+    src/core/ReceivePresentationSync.cpp
+)
+target_include_directories(receive_presentation_sync_test PRIVATE src)
+target_link_libraries(receive_presentation_sync_test PRIVATE Qt6::Core)
+add_test(NAME receive_presentation_sync_test COMMAND receive_presentation_sync_test)
+
+# Public-directory parser + external-API (ext_api) policy honoring.
+add_executable(kiwi_public_directory_test
+    tests/kiwi_public_directory_test.cpp
+    src/core/KiwiPublicDirectory.cpp
+)
+target_include_directories(kiwi_public_directory_test PRIVATE src)
+target_link_libraries(kiwi_public_directory_test PRIVATE Qt6::Core Qt6::Network)
+target_compile_definitions(kiwi_public_directory_test PRIVATE AETHERSDR_VERSION="${PROJECT_VERSION}")
+set_target_properties(kiwi_public_directory_test PROPERTIES AUTOMOC ON)
+add_test(NAME kiwi_public_directory_test COMMAND kiwi_public_directory_test)
+
+# Demonstration tool: honest, API-policy-aware read of kiwisdr.com/public
+# (proof-of-concept shown to operators — see docs/kiwisdr-public-directory.md).
+add_executable(kiwi_directory_poc
+    tools/kiwi_directory_poc.cpp
+    src/core/KiwiPublicDirectory.cpp
+)
+target_include_directories(kiwi_directory_poc PRIVATE src)
+target_link_libraries(kiwi_directory_poc PRIVATE Qt6::Core Qt6::Network)
+target_compile_definitions(kiwi_directory_poc PRIVATE AETHERSDR_VERSION="${PROJECT_VERSION}")
+set_target_properties(kiwi_directory_poc PROPERTIES AUTOMOC ON)
 
 add_executable(client_gate_test
     tests/client_gate_test.cpp
@@ -1983,6 +2353,13 @@ target_link_libraries(radio_status_ownership_test PRIVATE Qt6::Core)
 enable_testing()
 add_test(NAME radio_status_ownership_test COMMAND radio_status_ownership_test)
 
+add_executable(profile_load_command_test
+    tests/profile_load_command_test.cpp
+)
+target_include_directories(profile_load_command_test PRIVATE src)
+target_link_libraries(profile_load_command_test PRIVATE Qt6::Core)
+add_test(NAME profile_load_command_test COMMAND profile_load_command_test)
+
 # #3212 — slice recreate policy (reuse restored pan vs create new; slice freq)
 add_executable(slice_recreate_policy_test
     tests/slice_recreate_policy_test.cpp
@@ -1990,6 +2367,33 @@ add_executable(slice_recreate_policy_test
 target_include_directories(slice_recreate_policy_test PRIVATE src)
 target_link_libraries(slice_recreate_policy_test PRIVATE Qt6::Core)
 add_test(NAME slice_recreate_policy_test COMMAND slice_recreate_policy_test)
+
+# #3856 — radio-side display inventory policy (Layer B leak classification)
+add_executable(display_inventory_policy_test
+    tests/display_inventory_policy_test.cpp
+)
+target_include_directories(display_inventory_policy_test PRIVATE src)
+target_link_libraries(display_inventory_policy_test PRIVATE Qt6::Core)
+add_test(NAME display_inventory_policy_test COMMAND display_inventory_policy_test)
+
+# QRZ callsign lookup — spotter stream detection, callsign regex,
+# CallsignInfo JSON round-trip, 7-day cache TTL rule, and the QRZ XML
+# response parser (QrzClient.cpp needs Qt6::Network for QNetworkReply).
+add_executable(qrz_callsign_test
+    tests/qrz_callsign_test.cpp
+    src/core/CwCallsignSpotter.cpp
+    src/core/CallsignInfo.cpp
+    src/core/CtyDatParser.cpp
+    src/core/QrzClient.cpp
+    # LogManager provides lcQrz (spotter's qCDebug category); it drags
+    # AsyncLogWriter + AppSettings for its writer/ctor chain at link time.
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+    src/core/AppSettings.cpp
+)
+target_include_directories(qrz_callsign_test PRIVATE src)
+target_link_libraries(qrz_callsign_test PRIVATE Qt6::Core Qt6::Network Qt6::Test)
+add_test(NAME qrz_callsign_test COMMAND qrz_callsign_test)
 
 add_executable(shortcut_manager_test
     tests/shortcut_manager_test.cpp
@@ -2053,6 +2457,9 @@ add_executable(cwx_local_keyer_drift_test
 )
 target_include_directories(cwx_local_keyer_drift_test PRIVATE src)
 target_link_libraries(cwx_local_keyer_drift_test PRIVATE Qt6::Core)
+if(UNIX)
+    target_link_libraries(cwx_local_keyer_drift_test PRIVATE pthread)
+endif()
 add_test(NAME cwx_local_keyer_drift_test COMMAND cwx_local_keyer_drift_test)
 
 add_executable(ax25_frame_formatter_test
@@ -2079,7 +2486,8 @@ add_executable(ax25_libmodem_shim_test
     src/core/AppSettings.cpp
 )
 target_include_directories(ax25_libmodem_shim_test PRIVATE src)
-target_link_libraries(ax25_libmodem_shim_test PRIVATE Qt6::Core aether_libmodem_core)
+target_link_libraries(ax25_libmodem_shim_test PRIVATE Qt6::Core aether_libmodem_core
+    aether_afskdemod)
 add_test(NAME ax25_libmodem_shim_test COMMAND ax25_libmodem_shim_test)
 
 add_executable(hdlc_codec_test
@@ -2102,7 +2510,7 @@ add_executable(ax25_replay EXCLUDE_FROM_ALL
     src/core/AppSettings.cpp
 )
 target_include_directories(ax25_replay PRIVATE src)
-target_link_libraries(ax25_replay PRIVATE Qt6::Core aether_libmodem_core)
+target_link_libraries(ax25_replay PRIVATE Qt6::Core aether_libmodem_core aether_afskdemod)
 
 add_executable(ax25_session_analyze EXCLUDE_FROM_ALL
     tools/ax25_session_analyze.cpp
@@ -2116,7 +2524,7 @@ add_executable(ax25_session_analyze EXCLUDE_FROM_ALL
     src/core/AppSettings.cpp
 )
 target_include_directories(ax25_session_analyze PRIVATE src)
-target_link_libraries(ax25_session_analyze PRIVATE Qt6::Core aether_libmodem_core)
+target_link_libraries(ax25_session_analyze PRIVATE Qt6::Core aether_libmodem_core aether_afskdemod)
 
 add_executable(pms_mailbox_test
     tests/pms_mailbox_test.cpp
@@ -2128,6 +2536,33 @@ add_executable(pms_mailbox_test
 target_include_directories(pms_mailbox_test PRIVATE src)
 target_link_libraries(pms_mailbox_test PRIVATE Qt6::Core)
 add_test(NAME pms_mailbox_test COMMAND pms_mailbox_test)
+
+# APRS info-field codec (pure parsing/encoding, no DSP).
+add_executable(aprs_packet_test
+    tests/aprs_packet_test.cpp
+    src/core/aprs/AprsPacket.cpp
+    src/core/tnc/Ax25.cpp
+)
+target_include_directories(aprs_packet_test PRIVATE src)
+target_link_libraries(aprs_packet_test PRIVATE Qt6::Core)
+add_test(NAME aprs_packet_test COMMAND aprs_packet_test)
+
+# APRS messaging engine + station roster. LogManager.cpp provides lcAx25
+# (the qCWarning category used by the persistence paths); it drags in
+# AsyncLogWriter + AppSettings, same as ax25_libmodem_shim_test.
+add_executable(aprs_messenger_test
+    tests/aprs_messenger_test.cpp
+    src/core/aprs/AprsPacket.cpp
+    src/core/aprs/AprsMessenger.cpp
+    src/core/aprs/AprsStationList.cpp
+    src/core/tnc/Ax25.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+    src/core/AppSettings.cpp
+)
+target_include_directories(aprs_messenger_test PRIVATE src)
+target_link_libraries(aprs_messenger_test PRIVATE Qt6::Core)
+add_test(NAME aprs_messenger_test COMMAND aprs_messenger_test)
 
 add_executable(tnc_terminal_test
     tests/tnc_terminal_test.cpp
@@ -2177,6 +2612,31 @@ if(UNIX)
 endif()
 set_target_properties(meter_model_test PROPERTIES AUTOMOC ON)
 
+# aetherd RFC step 2.2b regression guard: FlexBackend ctor/dtor thread ownership
+# + #502 teardown ordering. FlexBackend pulls RadioConnection/PanadapterStream
+# and their deep deps, so link the engine library rather than list sources.
+add_executable(flex_backend_lifecycle_test tests/flex_backend_lifecycle_test.cpp)
+target_include_directories(flex_backend_lifecycle_test PRIVATE src)
+target_link_libraries(flex_backend_lifecycle_test PRIVATE aethercore Qt6::Core)
+set_target_properties(flex_backend_lifecycle_test PROPERTIES AUTOMOC ON)
+add_test(NAME flex_backend_lifecycle_test COMMAND flex_backend_lifecycle_test)
+
+# aetherd RFC 2.3 template — pan decode/normalize chain (incl. wnb_level guard).
+add_executable(aetherd_pan_decode_test tests/aetherd_pan_decode_test.cpp)
+target_include_directories(aetherd_pan_decode_test PRIVATE src)
+target_link_libraries(aetherd_pan_decode_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(aetherd_pan_decode_test PROPERTIES AUTOMOC ON)
+add_test(NAME aetherd_pan_decode_test COMMAND aetherd_pan_decode_test)
+
+add_executable(usb_cable_model_test
+    tests/usb_cable_model_test.cpp
+    src/models/UsbCableModel.cpp
+)
+target_include_directories(usb_cable_model_test PRIVATE src)
+target_link_libraries(usb_cable_model_test PRIVATE Qt6::Core Qt6::Test)
+set_target_properties(usb_cable_model_test PROPERTIES AUTOMOC ON)
+add_test(NAME usb_cable_model_test COMMAND usb_cable_model_test)
+
 add_executable(async_log_writer_test
     tests/async_log_writer_test.cpp
     src/core/AsyncLogWriter.cpp
@@ -2192,7 +2652,7 @@ add_executable(perf_telemetry_test
     tests/perf_telemetry_test.cpp
     src/core/PerfTelemetry.cpp
     # LogManager.cpp owns the lcPerf Q_LOGGING_CATEGORY definition (per
-    # Principle III consolidation, #2770); LogManager has AsyncLogWriter
+    # the Q_LOGGING_CATEGORY consolidation in #2770); LogManager has AsyncLogWriter
     # as a member which transitively needs AppSettings, so all three .cpp
     # files come along to satisfy the ctor/dtor chain at link time.
     src/core/LogManager.cpp
@@ -2213,6 +2673,40 @@ add_executable(memory_recall_policy_test
 )
 target_include_directories(memory_recall_policy_test PRIVATE src)
 target_link_libraries(memory_recall_policy_test PRIVATE Qt6::Core)
+add_test(NAME memory_recall_policy_test COMMAND memory_recall_policy_test)
+
+add_executable(net_recurrence_test
+    tests/net_recurrence_test.cpp
+    src/core/NetRecurrence.cpp
+)
+target_include_directories(net_recurrence_test PRIVATE src)
+target_link_libraries(net_recurrence_test PRIVATE Qt6::Core)
+add_test(NAME net_recurrence_test COMMAND net_recurrence_test)
+
+add_executable(net_schedule_store_test
+    tests/net_schedule_store_test.cpp
+    src/core/NetScheduleStore.cpp
+)
+target_include_directories(net_schedule_store_test PRIVATE src)
+target_link_libraries(net_schedule_store_test PRIVATE Qt6::Core)
+add_test(NAME net_schedule_store_test COMMAND net_schedule_store_test)
+
+add_executable(net_schedule_planner_test
+    tests/net_schedule_planner_test.cpp
+    src/core/NetSchedulePlanner.cpp
+    src/core/NetRecurrence.cpp
+)
+target_include_directories(net_schedule_planner_test PRIVATE src)
+target_link_libraries(net_schedule_planner_test PRIVATE Qt6::Core)
+add_test(NAME net_schedule_planner_test COMMAND net_schedule_planner_test)
+
+add_executable(memory_field_values_test
+    tests/memory_field_values_test.cpp
+    src/core/MemoryFieldValues.cpp
+)
+target_include_directories(memory_field_values_test PRIVATE src)
+target_link_libraries(memory_field_values_test PRIVATE Qt6::Core)
+add_test(NAME memory_field_values_test COMMAND memory_field_values_test)
 
 add_executable(transmit_model_apd_test
     tests/transmit_model_apd_test.cpp
@@ -2245,6 +2739,48 @@ target_link_libraries(help_dialog_test PRIVATE
     Qt6::Core Qt6::Widgets Qt6::Test
 )
 set_target_properties(help_dialog_test PROPERTIES AUTOMOC ON)
+
+# Regression guard for #3662: the AetherControl window must never demand a
+# minimum height taller than the screen (auto-engages compact when it would).
+add_executable(flex_control_dialog_size_test
+    tests/flex_control_dialog_size_test.cpp
+    src/gui/FlexControlDialog.cpp
+    src/gui/PersistentDialog.cpp
+    src/gui/FramelessResizer.cpp
+    src/gui/FramelessWindowTitleBar.cpp
+    src/gui/SliceLabel.cpp
+    src/gui/DragValuePopup.cpp
+    src/models/SliceModel.cpp
+    src/core/KiwiSdrProtocol.cpp
+    src/core/ThemeManager.cpp
+    src/core/AppSettings.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+)
+target_include_directories(flex_control_dialog_size_test PRIVATE src)
+target_link_libraries(flex_control_dialog_size_test PRIVATE
+    Qt6::Core Qt6::Widgets Qt6::Test
+)
+set_target_properties(flex_control_dialog_size_test PROPERTIES AUTOMOC ON)
+add_test(NAME flex_control_dialog_size_test COMMAND flex_control_dialog_size_test)
+
+add_executable(pan_layout_dialog_size_test
+    tests/pan_layout_dialog_size_test.cpp
+    src/gui/PanLayoutDialog.cpp
+    src/gui/PersistentDialog.cpp
+    src/gui/FramelessResizer.cpp
+    src/gui/FramelessWindowTitleBar.cpp
+    src/core/ThemeManager.cpp
+    src/core/AppSettings.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+)
+target_include_directories(pan_layout_dialog_size_test PRIVATE src)
+target_link_libraries(pan_layout_dialog_size_test PRIVATE
+    Qt6::Core Qt6::Widgets Qt6::Test
+)
+set_target_properties(pan_layout_dialog_size_test PROPERTIES AUTOMOC ON)
+add_test(NAME pan_layout_dialog_size_test COMMAND pan_layout_dialog_size_test)
 
 add_executable(device_diagnostics_test
     tests/device_diagnostics_test.cpp
@@ -2280,6 +2816,15 @@ target_link_libraries(transmit_model_test PRIVATE Qt6::Core)
 if(UNIX)
     target_link_libraries(transmit_model_test PRIVATE pthread)
 endif()
+add_test(NAME transmit_model_test COMMAND transmit_model_test)
+
+add_executable(transmit_inhibit_policy_test
+    tests/transmit_inhibit_policy_test.cpp
+    src/core/CommandParser.cpp
+)
+target_include_directories(transmit_inhibit_policy_test PRIVATE src)
+target_link_libraries(transmit_inhibit_policy_test PRIVATE Qt6::Core)
+add_test(NAME transmit_inhibit_policy_test COMMAND transmit_inhibit_policy_test)
 
 # Container system Phase 1 tests — needs QApplication + Widgets.
 add_executable(container_widget_test
@@ -2302,6 +2847,22 @@ target_link_libraries(container_widget_test PRIVATE
     Qt6::Core Qt6::Widgets Qt6::Test
 )
 set_target_properties(container_widget_test PROPERTIES AUTOMOC ON)
+
+add_executable(amp_applet_test
+    tests/amp_applet_test.cpp
+    src/gui/AmpApplet.cpp
+    src/gui/DragValuePopup.cpp
+    src/core/AppSettings.cpp
+    src/core/ThemeManager.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+)
+target_include_directories(amp_applet_test PRIVATE src)
+target_link_libraries(amp_applet_test PRIVATE
+    Qt6::Core Qt6::Widgets Qt6::Test
+)
+set_target_properties(amp_applet_test PROPERTIES AUTOMOC ON)
+add_test(NAME amp_applet_test COMMAND amp_applet_test)
 
 add_executable(container_manager_test
     tests/container_manager_test.cpp
@@ -2382,5 +2943,13 @@ else()
     install(FILES docs/assets/logo-circle-256.png
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/256x256/apps
         RENAME aethersdr.png
+    )
+    install(FILES packaging/linux/io.github.aethersdr.aethersdr.metainfo.xml
+        DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/metainfo
+    )
+    # Install the man page uncompressed; distro packaging compresses man pages
+    # per its own policy (Debian/Arch re-gzip, so shipping a .gz would clash).
+    install(FILES packaging/linux/aethersdr.1
+        DESTINATION ${CMAKE_INSTALL_MANDIR}/man1
     )
 endif()

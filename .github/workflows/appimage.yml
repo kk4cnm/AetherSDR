@@ -24,7 +24,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
 
       - name: Install system dependencies
         run: |
@@ -60,8 +60,23 @@ jobs:
           echo "PATH=${{ github.workspace }}/Qt/6.8.3/gcc_64/bin:$PATH" >> $GITHUB_ENV
           echo "LD_LIBRARY_PATH=${{ github.workspace }}/Qt/6.8.3/gcc_64/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
 
+      - name: Cache DeepFilterNet3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: cache-deepfilter
+        with:
+          path: third_party/deepfilter
+          key: deepfilter-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/setup/setup-deepfilter.sh') }}
+
       - name: Setup DeepFilterNet3 (DFNR)
+        if: steps.cache-deepfilter.outputs.cache-hit != 'true'
         run: bash scripts/setup/setup-deepfilter.sh
+
+      - name: Setup qtkeychain (SmartLink credential persistence)
+        # Builds qtkeychain from source against the active Qt and stages it in
+        # third_party/qtkeychain so find_package(Qt6Keychain) succeeds. Without
+        # this the AppImage shipped without credential persistence (#3639). The
+        # pure Qt-D-Bus backend talks to KDE Wallet / GNOME Keyring at runtime.
+        run: bash scripts/setup/setup-qtkeychain.sh
 
       - name: Configure
         run: |
@@ -73,7 +88,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr \
             -DREQUIRE_SERIALPORT=ON \
+            -DREQUIRE_KEYCHAIN=ON \
             -DMQTT_TLS=OFF \
+            -DENABLE_NVIDIA_AFX=ON \
             $CMAKE_EXTRA
 
       - name: Build Opus (RADE dependency)
@@ -120,15 +137,25 @@ jobs:
 
       - name: Build AppImage
         env:
-          LDAI_OUTPUT: AetherSDR-${{ github.ref_name }}-${{ matrix.arch }}.AppImage
           QT_SELECT: qt6
           EXTRA_QT_PLUGINS: multimedia
         run: |
+          # Sanitize the ref for the output filename: a workflow_dispatch on a
+          # branch like "ci/appimage-qtkeychain" puts a '/' in github.ref_name,
+          # which breaks mksquashfs ("Could not create destination file"). Tag
+          # pushes (v26.6.x) are already slash-free; this mirrors the
+          # sanitization windows-installer.yml already applies.
+          SAFE_REF="${GITHUB_REF_NAME//[^A-Za-z0-9._-]/_}"
+          export LDAI_OUTPUT="AetherSDR-${SAFE_REF}-${{ matrix.arch }}.AppImage"
           if [ "${{ matrix.use_aqt }}" = "true" ]; then
             export QMAKE=${{ github.workspace }}/Qt/6.8.3/gcc_64/bin/qmake
           else
             export QMAKE=$(which qmake6 2>/dev/null || which qmake)
           fi
+          # Let linuxdeploy resolve + bundle libqt6keychain.so (NEEDED by the
+          # binary, staged outside the standard search path). Qt6 DBus, which
+          # the keychain backend needs at runtime, is pulled in transitively.
+          export LD_LIBRARY_PATH="${{ github.workspace }}/third_party/qtkeychain/lib:${LD_LIBRARY_PATH:-}"
           ./linuxdeploy-${{ matrix.arch }}.AppImage \
             --appdir AppDir \
             --plugin qt \
@@ -137,13 +164,13 @@ jobs:
             --output appimage
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: AppImage-${{ matrix.arch }}
           path: AetherSDR-*.AppImage
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b
         with:
           files: AetherSDR-*.AppImage

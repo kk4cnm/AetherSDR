@@ -38,6 +38,11 @@ Q_LOGGING_CATEGORY(lcPerf,       "aether.perf",        QtWarningMsg)
 Q_LOGGING_CATEGORY(lcCw,         "aether.cw",          QtWarningMsg)
 Q_LOGGING_CATEGORY(lcSHistory,  "aether.shistory",    QtWarningMsg)
 Q_LOGGING_CATEGORY(lcAx25,       "aether.ax25",        QtWarningMsg)
+Q_LOGGING_CATEGORY(lcWaveform,   "aether.waveform",    QtWarningMsg)
+Q_LOGGING_CATEGORY(lcKiwiSdr,    "aether.kiwisdr",     QtDebugMsg)
+Q_LOGGING_CATEGORY(lcKiwiSdrAudio, "aether.kiwisdr.audio", QtWarningMsg)
+Q_LOGGING_CATEGORY(lcAutomation, "aether.automation",  QtInfoMsg)
+Q_LOGGING_CATEGORY(lcQrz,        "aether.qrz",         QtWarningMsg)
 
 LogManager::LogManager()
 {
@@ -68,6 +73,11 @@ LogManager::LogManager()
         {"aether.cw",         "CW / netCW",    "CW keying, MIDI paddle, iambic, and netCW timing"},
         {"aether.shistory",   "S History",     "Past-Signals voice detection: noise floor, region width, band-plan filter"},
         {"aether.ax25",       "AetherModem", "AX.25 modem lifecycle, RX/TX audio, demod, framing, and packet diagnostics"},
+        {"aether.waveform",   "Waveform",    "Docker waveform image install upload"},
+        {"aether.kiwisdr",    "KiwiSDR",     "KiwiSDR remote RX antennas: connect, handshake, audio/waterfall negotiation, reconnect, profile lifecycle"},
+        {"aether.kiwisdr.audio", "KiwiSDR Audio/DSP", "Verbose KiwiSDR receive audio: frame decode, resampler, jitter/FIFO under/overrun, mixing (high-rate; off by default)"},
+        {"aether.automation", "Automation Bridge", "Agent-drivable test bridge (#3646): QLocalServer verbs, widget snapshots, captures (AETHER_AUTOMATION only)"},
+        {"aether.qrz",        "QRZ Lookup",   "QRZ.com callsign lookups: session, cache, CW callsign spotting, photos"},
     };
 
     // QLoggingCategory objects are defined above via Q_LOGGING_CATEGORY macros.
@@ -177,8 +187,32 @@ void LogManager::enqueueMessage(QtMsgType type, const QMessageLogContext& ctx, c
         : QStringLiteral("default");
 
     m_writer.enqueue(type, QTime::currentTime(), category, msg);
+
+    // Fan out to diagnostic taps (automation event channel). Held under the
+    // tap mutex; taps are documented as cheap and non-logging, so there is no
+    // re-entrancy. The hash is empty in normal runs, so this is near-free.
+    {
+        QMutexLocker lk(&m_tapMutex);
+        for (const auto& tap : m_taps)
+            tap(type, category, msg);
+    }
+
     if (type == QtFatalMsg)
         m_writer.flush();
+}
+
+int LogManager::addTap(LogTap tap)
+{
+    QMutexLocker lk(&m_tapMutex);
+    const int id = m_nextTapId++;
+    m_taps.insert(id, std::move(tap));
+    return id;
+}
+
+void LogManager::removeTap(int id)
+{
+    QMutexLocker lk(&m_tapMutex);
+    m_taps.remove(id);
 }
 
 void LogManager::flushLog() const
@@ -248,7 +282,7 @@ void LogManager::loadSettings()
     // Default Discovery, Commands, and Status to on
     static const QStringList defaultOn = {
         "aether.discovery", "aether.connection", "aether.protocol",
-        "aether.audio.summary"
+        "aether.audio.summary", "aether.kiwisdr"
     };
     for (auto& c : m_categories) {
         QString def = defaultOn.contains(c.id) ? "True" : "False";

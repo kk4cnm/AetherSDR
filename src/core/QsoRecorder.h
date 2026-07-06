@@ -7,8 +7,10 @@
 #include <QDateTime>
 #include <QFile>
 #include <QObject>
+#include <QPointer>
 #include <QString>
 #include <QTimer>
+#include <atomic>
 #include <mutex>
 
 class QAudioSink;
@@ -21,10 +23,17 @@ class TransmitModel;
 // Records QSO audio (both RX and TX sides) to WAV files.
 //
 // Usage:
-//   - Connect feedRxAudio() to AudioEngine::feedAudioData() (or post-DSP tap)
-//   - Connect feedTxAudio() to AudioEngine::txRawPcmReady()
+//   - Connect feedRxAudio() (float32 RX) to PanadapterStream::audioDataReady
+//   - Connect feedTxAudio() (int16 post-limiter TX monitor) to
+//     AudioEngine::txFinalMonitorPcmReady — the source that carries SSB/phone TX
+//     (txRawPcmReady is RADE-only and would leave SSB recordings silent, #3556)
 //   - Connect onMoxChanged() to TransmitModel::moxChanged()
 //   - Set the active slice for frequency/mode metadata via setSlice()
+//
+// While transmitting, the radio mutes the RX stream, so feedRxAudio() would
+// otherwise write full-length silence. Writes are MOX-gated: RX is written only
+// while receiving, the TX monitor only while transmitting, producing a single
+// time-interleaved RX/TX file that matches Radio-Side recording (#3556).
 //
 // Recording triggers:
 //   - Auto: starts when MOX goes true (first TX), stops after idle timeout
@@ -53,11 +62,11 @@ public:
     QString callsign() const { return m_callsign; }
 
     // Audio output device the playback sink opens.  When null, falls back
-    // to QMediaDevices::defaultAudioOutput().  MainWindow seeds this from
-    // AudioEngine::outputDevice() at construction and refreshes it on
-    // AudioEngine::outputDeviceChanged so QSO playback follows the user's
+    // to QMediaDevices::defaultAudioOutput().  MainWindow's AudioOutputRouter
+    // seeds this from AudioEngine::outputDevice() at registration and refreshes
+    // it on AudioEngine::outputDeviceChanged so QSO playback follows the user's
     // selection in Radio Settings > Audio rather than going to the system
-    // default (#3361).
+    // default (#3361 / #3306).
     void setOutputDevice(const QAudioDevice& dev) { m_outputDevice = dev; }
 
     // Filename component toggles
@@ -72,6 +81,18 @@ public:
     bool isRecording() const { return m_recording; }
     bool isPlaying() const { return m_playing; }
     bool hasLastRecording() const { return !m_lastRecordingPath.isEmpty(); }
+
+    // Path of the in-progress recording (while recording) else the last
+    // finalized one; empty if neither. Used by the automation bridge to locate
+    // the WAV for capture-file verification.
+    QString recordingFilePath() const {
+        // Lock: m_file is mutated/deleteLater'd under m_writeMutex by the feed
+        // path and finalizeFile(); reading it unlocked races those and can hit
+        // a half-torn-down handle (UAF). All callers are external (automation),
+        // none hold the write lock, so this can't self-deadlock.
+        std::lock_guard<std::mutex> lock(m_writeMutex);
+        return m_file ? m_file->fileName() : m_lastRecordingPath;
+    }
 
     // Duration of current recording in seconds (0 if not recording)
     int recordingDurationSecs() const;
@@ -113,7 +134,8 @@ private:
     bool preparePlaybackPcm(int sinkRateHz);
 
     // Recording state
-    bool        m_recording{false};
+    std::atomic<bool> m_recording{false};  // checked lock-free on the audio feed fast path
+    std::atomic<bool> m_transmitting{false};  // MOX state; gates RX vs TX writes (#3556)
     QFile*      m_file{nullptr};
     QDateTime   m_startTime;
     quint32     m_dataBytes{0};    // PCM data bytes written (for WAV header patching)
@@ -128,8 +150,10 @@ private:
     bool        m_includeFreq{true};
     bool        m_includeMode{true};
 
-    // Slice metadata (captured at recording start)
-    SliceModel* m_slice{nullptr};
+    // Slice metadata (captured at recording start). QPointer auto-nulls when the
+    // SliceModel is destroyed (slice removal / reconnect prune), so startFile()'s
+    // guard can't dereference a freed pointer (#4003).
+    QPointer<SliceModel> m_slice;
     double      m_freqMhz{0.0};
     QString     m_mode;
 
@@ -145,7 +169,7 @@ private:
     QAudioDevice m_outputDevice;
 
     // Thread safety for audio feed paths
-    std::mutex  m_writeMutex;
+    mutable std::mutex  m_writeMutex;
 
     // WAV format constants (matching AudioEngine native format)
     static constexpr int SAMPLE_RATE = 24000;

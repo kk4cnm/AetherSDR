@@ -20,6 +20,14 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QVBoxLayout>
+#ifdef Q_OS_LINUX
+#include "core/LogManager.h"
+#include <QMessageBox>
+#include <QMetaObject>
+#include <QProcess>
+#include <QStandardPaths>
+#include <QTimer>
+#endif
 
 namespace AetherSDR {
 
@@ -45,11 +53,6 @@ static QPixmap& ulanziDialPixmap()
         }
     }
     return pm;
-}
-static QSize ulanziDialImageSize()
-{
-    const QPixmap& pm = ulanziDialPixmap();
-    return pm.isNull() ? QSize() : pm.size();
 }
 
 // Dedicated paint surface for the dial body + connector lines.  Lives
@@ -173,6 +176,18 @@ UlanziDialMapperDialog::UlanziDialMapperDialog(UlanziDialBackend* manager,
     m_statusLabel->setStyleSheet("QLabel { color: #8ea8c0; }");
     bottomRow->addWidget(m_statusLabel);
 
+#ifdef Q_OS_LINUX
+    // Shown only when a dial is detected but its evdev node can't be opened.
+    m_grantAccessBtn = new QPushButton(tr("Grant access"));
+    m_grantAccessBtn->setToolTip(
+        tr("Install a udev rule (with administrator approval) so AetherSDR can "
+           "read this dial's input. Required once per machine."));
+    m_grantAccessBtn->setVisible(false);
+    connect(m_grantAccessBtn, &QPushButton::clicked,
+            this, &UlanziDialMapperDialog::onGrantAccessClicked);
+    bottomRow->addWidget(m_grantAccessBtn);
+#endif
+
     bottomRow->addStretch(1);
 
     m_lastEventLabel = new QLabel(tr("Last event: —"));
@@ -209,6 +224,13 @@ UlanziDialMapperDialog::UlanziDialMapperDialog(UlanziDialBackend* manager,
                 this, &UlanziDialMapperDialog::onButtonEvent);
         connect(m_manager, &UlanziDialBackend::connectionChanged,
                 this, &UlanziDialMapperDialog::onConnectionChanged);
+        // Same platform condition as the UlanziDialBackend alias: Android
+        // defines Q_OS_LINUX but uses the no-op fallback backend, which has
+        // no accessRequired signal.
+#if defined(Q_OS_LINUX) && !defined(Q_OS_ANDROID)
+        connect(m_manager, &UlanziDialBackend::accessRequired,
+                this, &UlanziDialMapperDialog::onAccessRequired);
+#endif
         onConnectionChanged(m_manager->isConnected(), m_manager->deviceName());
     } else {
         m_statusLabel->setText(tr("Manager unavailable (Linux build only)"));
@@ -528,7 +550,108 @@ void UlanziDialMapperDialog::onConnectionChanged(bool connected, const QString& 
     m_statusLabel->setStyleSheet(connected
         ? "QLabel { color: #4dd87a; }"
         : "QLabel { color: #cc3333; }");
+#ifdef Q_OS_LINUX
+    // Once connected, the access problem is resolved — hide the offer.
+    if (connected && m_grantAccessBtn)
+        m_grantAccessBtn->setVisible(false);
+#endif
 }
+
+#ifdef Q_OS_LINUX
+void UlanziDialMapperDialog::onAccessRequired(const QString& deviceName)
+{
+    if (!m_statusLabel) return;
+    QString display = deviceName;
+    if (display.endsWith(QStringLiteral(" Keyboard"), Qt::CaseInsensitive))
+        display.chop(QStringLiteral(" Keyboard").size());
+    m_statusLabel->setText(tr("%1 detected — needs permission").arg(display));
+    m_statusLabel->setStyleSheet("QLabel { color: #e0a030; }");
+    if (m_grantAccessBtn) {
+        m_grantAccessBtn->setVisible(true);
+        m_grantAccessBtn->setEnabled(true);
+    }
+}
+
+void UlanziDialMapperDialog::onGrantAccessClicked()
+{
+    const QString pkexec = QStandardPaths::findExecutable(QStringLiteral("pkexec"));
+    if (pkexec.isEmpty()) {
+        QMessageBox::warning(this, tr("Grant access"),
+            tr("pkexec was not found. Install polkit, or add this user to the "
+               "'input' group manually."));
+        return;
+    }
+
+    if (m_grantAccessBtn) {
+        m_grantAccessBtn->setEnabled(false);
+        m_grantAccessBtn->setText(tr("Authorizing…"));
+    }
+
+    // Install the udev access rule and reload, as root via polkit. The rule
+    // content matches packaging/linux/70-ulanzi-dial.rules. The rule is passed
+    // as an argv element (not interpolated into the script) to avoid any
+    // quoting/injection concern.
+    static const QString kRule = QStringLiteral(
+        "# AetherSDR — Ulanzi Dial access (#3599)\n"
+        "SUBSYSTEM==\"input\", KERNEL==\"event*\", "
+        "ATTRS{name}==\"Ulanzi Dial*\", TAG+=\"uaccess\"\n");
+    static const QString kScript = QStringLiteral(
+        "set -e; "
+        "printf '%s' \"$1\" > /etc/udev/rules.d/70-ulanzi-dial.rules; "
+        "udevadm control --reload-rules; "
+        "udevadm trigger --subsystem-match=input");
+
+    auto* proc = new QProcess(this);
+    // If pkexec can't even start, QProcess emits errorOccurred and never emits
+    // finished — recover the button instead of leaving it stuck on "Authorizing…".
+    connect(proc, &QProcess::errorOccurred, this,
+            [this, proc](QProcess::ProcessError) {
+        if (proc->state() != QProcess::NotRunning) return;  // started; finished will handle it
+        proc->deleteLater();
+        if (m_grantAccessBtn) {
+            m_grantAccessBtn->setEnabled(true);
+            m_grantAccessBtn->setText(tr("Grant access"));
+        }
+        if (m_statusLabel) {
+            m_statusLabel->setText(tr("Access install failed"));
+            m_statusLabel->setStyleSheet("QLabel { color: #cc3333; }");
+        }
+    });
+    connect(proc, &QProcess::finished, this,
+            [this, proc](int code, QProcess::ExitStatus) {
+        const QByteArray err = proc->readAllStandardError();
+        proc->deleteLater();
+        if (m_grantAccessBtn) m_grantAccessBtn->setText(tr("Grant access"));
+        if (code == 0) {
+            if (m_statusLabel) {
+                m_statusLabel->setText(tr("Access granted — connecting…"));
+                m_statusLabel->setStyleSheet("QLabel { color: #4dd87a; }");
+            }
+            // The udev trigger applies the ACL asynchronously; give logind a
+            // moment, then ask the backend to rescan. If that misses, the user
+            // can re-toggle the dial's Bluetooth connection.
+            QTimer::singleShot(900, this, [this] {
+                if (m_manager)
+                    QMetaObject::invokeMethod(m_manager, &UlanziDialBackend::start,
+                                              Qt::QueuedConnection);
+            });
+        } else {
+            qCWarning(lcDevices) << "Ulanzi Dial: rule install failed code"
+                                 << code << err;
+            if (m_grantAccessBtn) m_grantAccessBtn->setEnabled(true);
+            if (m_statusLabel) {
+                // code 126/127 = polkit auth dismissed/failed.
+                m_statusLabel->setText(code == 126 || code == 127
+                    ? tr("Authorization cancelled")
+                    : tr("Access install failed"));
+                m_statusLabel->setStyleSheet("QLabel { color: #cc3333; }");
+            }
+        }
+    });
+    proc->start(pkexec, {QStringLiteral("/bin/sh"), QStringLiteral("-c"),
+                         kScript, QStringLiteral("aethersdr"), kRule});
+}
+#endif  // Q_OS_LINUX
 
 } // namespace AetherSDR
 

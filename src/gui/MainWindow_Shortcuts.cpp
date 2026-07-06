@@ -27,16 +27,19 @@
 #include "RxApplet.h"
 #include "SpectrumOverlayMenu.h"
 #include "SpectrumWidget.h"
+#include "TitleBar.h"
 #include "VfoWidget.h"
 #include "MainWindowShortcutState.h"
 #include "core/AppSettings.h"
 #include "core/CwTrace.h"
+#include "core/KiwiSdrProtocol.h"
 #include "core/LogManager.h"
 #include "models/SliceModel.h"
 
 #include <QAbstractSlider>
 #include <QToolTip>
 #include <QApplication>
+#include <QApplicationStateChangeEvent>
 #include <QComboBox>
 #include <QKeyEvent>
 #include <QLineEdit>
@@ -68,6 +71,26 @@ bool textInputCaptured()
     return qobject_cast<QLineEdit*>(w) || qobject_cast<QTextEdit*>(w)
         || qobject_cast<QPlainTextEdit*>(w) || qobject_cast<QSpinBox*>(w)
         || qobject_cast<QComboBox*>(w);
+}
+
+// Like textInputCaptured(), but for TX *keying* (Space PTT / CW keys),
+// which must fire regardless of a focused **non-editable** combo —
+// matching the app-level Space filter's stated intent that "buttons,
+// combos, etc. won't steal Space".  A non-editable QComboBox keeps
+// keyboard focus after its popup closes (#3908) but consumes no typed
+// text, so it must not swallow a keying press.  It is still treated as
+// capturing by textInputCaptured() above, so arrow shortcuts stay
+// suppressed and Up/Down/Left/Right navigate the list as usual.  An
+// editable QComboBox exposes its internal QLineEdit as the focus widget,
+// so it is caught by the QLineEdit branch and still captures text.
+bool textEntryCaptured()
+{
+    auto* w = QApplication::focusWidget();
+    if (!w) return false;
+    if (auto* combo = qobject_cast<QComboBox*>(w))
+        return combo->isEditable();
+    return qobject_cast<QLineEdit*>(w) || qobject_cast<QTextEdit*>(w)
+        || qobject_cast<QPlainTextEdit*>(w) || qobject_cast<QSpinBox*>(w);
 }
 
 bool shortcutInputCaptured()
@@ -112,20 +135,39 @@ bool MainWindow::handleCwMomentaryShortcut(QKeyEvent* keyEvent, QEvent::Type eve
     if (eventType != QEvent::KeyPress && eventType != QEvent::KeyRelease)
         return false;
 
+    enum class CwAction { None, StraightKey, LeftPaddle, RightPaddle };
+
     const QKeySequence seq = shortcutSequenceFromKeyEvent(keyEvent);
     const auto* action = m_shortcutManager.actionForKey(seq);
-    if (!action)
-        return false;
 
-    enum class CwAction { None, StraightKey, LeftPaddle, RightPaddle };
     CwAction cwAction = CwAction::None;
-    if (action->id == QLatin1String(kCwStraightKeyActionId))
-        cwAction = CwAction::StraightKey;
-    else if (action->id == QLatin1String(kCwLeftPaddleActionId))
-        cwAction = CwAction::LeftPaddle;
-    else if (action->id == QLatin1String(kCwRightPaddleActionId))
-        cwAction = CwAction::RightPaddle;
-    else
+    if (action) {
+        if (action->id == QLatin1String(kCwStraightKeyActionId))
+            cwAction = CwAction::StraightKey;
+        else if (action->id == QLatin1String(kCwLeftPaddleActionId))
+            cwAction = CwAction::LeftPaddle;
+        else if (action->id == QLatin1String(kCwRightPaddleActionId))
+            cwAction = CwAction::RightPaddle;
+    }
+
+    // Modifier-tolerant release (Principle VI): a combo binding released
+    // modifier-first delivers a KeyRelease whose `seq` no longer matches the
+    // bound `modifiers|key`, so the un-key above would miss and TX would stay
+    // keyed. On a release, if any CW momentary action is active whose bound
+    // base key matches this key, release that one — fail safe to RX.
+    if (cwAction == CwAction::None && eventType == QEvent::KeyRelease) {
+        if (m_cwStraightKeyActive
+            && keyEventMatchesActionBaseKey(kCwStraightKeyActionId, keyEvent))
+            cwAction = CwAction::StraightKey;
+        else if (m_cwLeftPaddleActive
+            && keyEventMatchesActionBaseKey(kCwLeftPaddleActionId, keyEvent))
+            cwAction = CwAction::LeftPaddle;
+        else if (m_cwRightPaddleActive
+            && keyEventMatchesActionBaseKey(kCwRightPaddleActionId, keyEvent))
+            cwAction = CwAction::RightPaddle;
+    }
+
+    if (cwAction == CwAction::None)
         return false;
 
     const bool press = eventType == QEvent::KeyPress;
@@ -134,10 +176,10 @@ bool MainWindow::handleCwMomentaryShortcut(QKeyEvent* keyEvent, QEvent::Type eve
         cwAction == CwAction::LeftPaddle ? m_cwLeftPaddleActive :
                                            m_cwRightPaddleActive;
 
-    if (press && (!m_keyboardShortcutsEnabled || textInputCaptured()))
+    if (press && (!m_keyboardShortcutsEnabled || textEntryCaptured()))
         return false;
     if (!press && !currentlyActive)
-        return m_keyboardShortcutsEnabled && !textInputCaptured();
+        return m_keyboardShortcutsEnabled && !textEntryCaptured();
 
     const quint64 sourceMs = cwTraceNowMs();
     const quint64 traceId = nextCwTraceId();
@@ -158,6 +200,115 @@ bool MainWindow::handleCwMomentaryShortcut(QKeyEvent* keyEvent, QEvent::Type eve
     }
 
     return true;
+}
+
+
+bool MainWindow::handlePttHoldShortcut(QKeyEvent* keyEvent, QEvent::Type eventType)
+{
+    // PTT (Hold) can't go through a QShortcut (no key-released signal), so it
+    // is driven here from the app-level event filter. Resolve the bound key
+    // through ShortcutManager — exactly like handleCwMomentaryShortcut — so a
+    // reassigned PTT-hold key actually keys the radio instead of staying stuck
+    // on the old Space default (#3879).
+    if (!keyEvent || keyEvent->isAutoRepeat())
+        return false;
+    if (eventType != QEvent::KeyPress && eventType != QEvent::KeyRelease)
+        return false;
+
+    const QKeySequence seq = shortcutSequenceFromKeyEvent(keyEvent);
+    const auto* action = m_shortcutManager.actionForKey(seq);
+    bool isPttHold = action && action->id == QLatin1String(kPttHoldActionId);
+
+    // Modifier-tolerant release (Principle VI): a combo binding like Ctrl+T
+    // released modifier-first delivers the `T` KeyRelease after Ctrl is already
+    // gone, so `seq` resolves to plain `T` and no longer matches `Ctrl+T` — the
+    // un-key would never fire and TX would stay keyed. While PTT-hold is active,
+    // also accept a release whose base key matches the bound key, ignoring
+    // modifiers, so releasing any part of the combo fails safe to RX.
+    if (!isPttHold && eventType == QEvent::KeyRelease && m_pttHoldActive)
+        isPttHold = keyEventMatchesActionBaseKey(kPttHoldActionId, keyEvent);
+
+    if (!isPttHold)
+        return false;
+
+    // Mirror the prior Space behavior: only key while connected and not typing
+    // into a text field. When those gates fail, do not consume the key — let it
+    // fall through (matching the old `&& m_radioModel.isConnected()` guard).
+    // Use textEntryCaptured() (not textInputCaptured()) so a focused
+    // non-editable combo — which keeps focus after its popup closes (#3908) —
+    // doesn't swallow the first Space/PTT press.
+    if (textEntryCaptured() || !m_radioModel.isConnected())
+        return false;
+
+    if (m_keyboardShortcutsEnabled) {
+        // Route through the PTT coordinator (not the raw setTransmit() path) so
+        // the Quindar intro/outro runs for keyboard PTT just like the GUI MOX
+        // button. requestPttOn/Off still terminate in an `xmit` command, so the
+        // interlock/gating in RadioModel's xmit handler is preserved; the
+        // coordinator's preflight applies the same local interlock check.
+        // (#3610)
+        if (eventType == QEvent::KeyPress && !m_pttHoldActive) {
+            m_pttHoldActive = true;
+            m_radioModel.transmitModel().requestPttOn(
+                TransmitModel::PttSource::Mox);
+        } else if (eventType == QEvent::KeyRelease && m_pttHoldActive) {
+            m_pttHoldActive = false;
+            m_radioModel.transmitModel().requestPttOff(
+                TransmitModel::PttSource::Mox);
+        }
+    }
+    return true;  // consume the bound key so it can't also activate a button
+}
+
+
+bool MainWindow::keyEventMatchesActionBaseKey(const char* actionId,
+                                              const QKeyEvent* ev)
+{
+    if (!ev)
+        return false;
+    const auto* a = m_shortcutManager.action(QLatin1String(actionId));
+    if (!a || a->currentKey.isEmpty())
+        return false;
+    // currentKey[0] is the (modifiers | key) combination; compare the key half
+    // only, so a combo binding matches on release regardless of which
+    // modifiers are still down.
+    return static_cast<int>(a->currentKey[0].key()) == ev->key();
+}
+
+
+void MainWindow::failSafeMomentaryKeyingToRx(const char* reason)
+{
+    // Principle VI fail-safe: a held momentary-keying key whose KeyRelease is
+    // lost (focus left the window) would otherwise strand the transmitter. On
+    // deactivation force the whole family back to RX. Cheap and safe to call on
+    // every deactivation: bail out unless something is actually keyed.
+    const bool anyActive = m_pttHoldActive || m_cwStraightKeyActive
+        || m_cwLeftPaddleActive || m_cwRightPaddleActive;
+    if (!anyActive)
+        return;
+
+    qCInfo(lcCw).noquote().nospace()
+        << "Fail-safe to RX on " << (reason ? reason : "deactivate")
+        << " — releasing held momentary keying (ptt=" << m_pttHoldActive
+        << " straight=" << m_cwStraightKeyActive
+        << " dit=" << m_cwLeftPaddleActive
+        << " dah=" << m_cwRightPaddleActive << ")";
+
+    if (m_pttHoldActive) {
+        m_pttHoldActive = false;
+        // Same un-key path as the normal KeyRelease branch, so the interlock
+        // gating in RadioModel's xmit handler and the Quindar outro both run.
+        m_radioModel.transmitModel().requestPttOff(TransmitModel::PttSource::Mox);
+    }
+
+    // setCw*State(false, …) clears its own flag and issues the un-key through
+    // the existing sendCwKey / paddle path; each no-ops when already released,
+    // so calling all three unconditionally is safe.
+    const quint64 sourceMs = cwTraceNowMs();
+    const quint64 traceId = nextCwTraceId();
+    setCwStraightKeyState(false, QStringLiteral("failsafe:deactivate"), traceId, sourceMs);
+    setCwLeftPaddleState(false, QStringLiteral("failsafe:deactivate"), traceId, sourceMs);
+    setCwRightPaddleState(false, QStringLiteral("failsafe:deactivate"), traceId, sourceMs);
 }
 
 
@@ -217,6 +368,16 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
             QTimer::singleShot(0, this, [this]() { close(); });
             return true;
         }
+    }
+
+    // Belt-and-suspenders for the deactivation fail-safe (#3888, Principle VI):
+    // on macOS the per-window QEvent::ActivationChange can be unreliable when
+    // the whole app is backgrounded, so also unkey any held momentary key when
+    // the application leaves the active state. Do not consume the event.
+    if (obj == qApp && event->type() == QEvent::ApplicationStateChange) {
+        auto* stateEvent = static_cast<QApplicationStateChangeEvent*>(event);
+        if (stateEvent->applicationState() != Qt::ApplicationActive)
+            failSafeMomentaryKeyingToRx("app-deactivate");
     }
 
     if (auto* slider = qobject_cast<QAbstractSlider*>(obj)) {
@@ -282,20 +443,11 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         if (handleCwMomentaryShortcut(ke, event->type()))
             return true;
 
-        if (ke->key() == Qt::Key_Space && !ke->isAutoRepeat()
-            && !textInputCaptured()
-            && m_radioModel.isConnected()) {
-            if (m_keyboardShortcutsEnabled) {
-                if (event->type() == QEvent::KeyPress && !m_spacePttActive) {
-                    m_spacePttActive = true;
-                    m_radioModel.setTransmit(true);
-                } else if (event->type() == QEvent::KeyRelease && m_spacePttActive) {
-                    m_spacePttActive = false;
-                    m_radioModel.setTransmit(false);
-                }
-            }
-            return true;  // always consume Space to prevent button activation
-        }
+        // PTT (Hold) — resolves its (rebindable) key through ShortcutManager
+        // rather than a hardcoded Space, so reassigning it actually moves the
+        // transmit key (#3879).
+        if (handlePttHoldShortcut(ke, event->type()))
+            return true;
 
         // MeterSlider (TCI/DAX gain) handles its own arrow stepping, badge,
         // and Enter-to-release inside keyPressEvent; the lease only frees the
@@ -458,7 +610,8 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
             [this, on](int code, const QString& body) {
                 if (code != 0) {
                     showPanadapterInterlockNotification(
-                        QString("FDX not available: %1").arg(body.trimmed()));
+                        QString("FDX not available: %1").arg(body.trimmed()),
+                        QStringLiteral("fdx-unavailable"));
                     return;
                 }
                 // Radio accepted; no status echo follows, so apply manually.
@@ -666,12 +819,19 @@ void MainWindow::registerShortcutActions()
     m_shortcutManager.registerAction("mox_toggle", "MOX Toggle", "TX",
         QKeySequence(Qt::Key_T), [this]() {
             if (!m_radioModel.isConnected()) return;
-            m_radioModel.setTransmit(!m_radioModel.transmitModel().isTransmitting());
+            // Route through the PTT coordinator so Quindar tones fire for the
+            // keyboard MOX toggle, matching the GUI MOX button. (#3610)
+            auto& tx = m_radioModel.transmitModel();
+            if (tx.isTransmitting())
+                tx.requestPttOff(TransmitModel::PttSource::Mox);
+            else
+                tx.requestPttOn(TransmitModel::PttSource::Mox);
         });
-    // PTT (Hold) via Space is handled by the app-level event filter
-    // because QShortcut has no "released" signal. Register with null
-    // handler so the keyboard map shows it as bound.
-    m_shortcutManager.registerAction("ptt_hold", "PTT (Hold)", "TX",
+    // PTT (Hold) is handled by the app-level event filter (handlePttHoldShortcut)
+    // because QShortcut has no "released" signal. Register with a null handler so
+    // the keyboard map shows it as bound; the event filter looks the binding up
+    // by kPttHoldActionId so a reassigned key takes effect (#3879).
+    m_shortcutManager.registerAction(kPttHoldActionId, "PTT (Hold)", "TX",
         QKeySequence(Qt::Key_Space), nullptr);
     m_shortcutManager.registerAction("atu_start", "ATU Start", "TX",
         QKeySequence(), [this]() {
@@ -701,7 +861,7 @@ void MainWindow::registerShortcutActions()
         QKeySequence(), [this]() {
             if (!m_radioModel.isConnected()) return;
             auto& tx = m_radioModel.transmitModel();
-            tx.setSpeechProcessorEnable(!tx.companderOn());
+            tx.setSpeechProcessorEnable(!tx.speechProcessorEnable());
         });
     m_shortcutManager.registerAction("dax_toggle", "DAX TX Toggle", "TX",
         QKeySequence(), [this]() {
@@ -738,10 +898,31 @@ void MainWindow::registerShortcutActions()
         QKeySequence(), [this]() {
             m_audio->setMuted(!m_audio->isMuted());
         });
+    // Master volume up/down — mirrors the Aether Control "VolumeUp"/"VolumeDown"
+    // dispatch (MainWindow_Controllers.cpp): clamp MasterVolume ±5 in [0,100],
+    // update the title-bar slider, and push to the audio path. No default key
+    // (Up/Down are taken by per-slice AF Gain); the user binds keys themselves.
+    m_shortcutManager.registerAction("master_volume_up", "Master Volume Up", "Audio",
+        QKeySequence(), [this]() {
+            const int next = std::clamp(
+                AppSettings::instance().value("MasterVolume", "100").toInt() + 5, 0, 100);
+            if (m_titleBar) m_titleBar->setMasterVolume(next);
+            applyMasterVolume(next);
+        }, /*autoRepeat=*/true);
+    m_shortcutManager.registerAction("master_volume_down", "Master Volume Down", "Audio",
+        QKeySequence(), [this]() {
+            const int next = std::clamp(
+                AppSettings::instance().value("MasterVolume", "100").toInt() - 5, 0, 100);
+            if (m_titleBar) m_titleBar->setMasterVolume(next);
+            applyMasterVolume(next);
+        }, /*autoRepeat=*/true);
     m_shortcutManager.registerAction("squelch_toggle", "Squelch Toggle", "Audio",
         QKeySequence(), [this]() {
             auto* s = activeSlice();
-            if (s) s->setSquelch(!s->squelchOn(), s->squelchLevel());
+            if (s) {
+                s->setSquelch(!s->receiveSquelchOn(),
+                              s->receiveSquelchLevel());
+            }
         });
 
     // ── Slice ───────────────────────────────────────────────────────────
@@ -933,7 +1114,7 @@ void MainWindow::registerShortcutActions()
             auto* s = activeSlice();
             if (!s) return;
             static const char* modes[] = {"off", "slow", "med", "fast"};
-            QString cur = s->agcMode().toLower();
+            QString cur = s->receiveAgcMode().toLower();
             int idx = 0;
             for (int i = 0; i < 4; ++i)
                 if (cur == modes[i]) { idx = i; break; }
@@ -950,12 +1131,26 @@ void MainWindow::registerShortcutActions()
     m_shortcutManager.registerAction("agct_up", "AGC-T Up", "AGC",
         QKeySequence(), [this]() {
             auto* s = activeSlice();
-            if (s) s->setAgcThreshold(std::min(100, s->agcThreshold() + 5));
+            if (s) {
+                const bool external = s->externalReceiveReplacementActive();
+                const int current = external ? s->receiveAgcThreshold()
+                                             : s->agcThreshold();
+                s->setAgcThreshold(std::min(
+                    external ? KiwiSdrProtocol::kAgcThresholdMaxDb : 100,
+                    current + 5));
+            }
         }, true);
     m_shortcutManager.registerAction("agct_down", "AGC-T Down", "AGC",
         QKeySequence(), [this]() {
             auto* s = activeSlice();
-            if (s) s->setAgcThreshold(std::max(0, s->agcThreshold() - 5));
+            if (s) {
+                const bool external = s->externalReceiveReplacementActive();
+                const int current = external ? s->receiveAgcThreshold()
+                                             : s->agcThreshold();
+                s->setAgcThreshold(std::max(
+                    external ? KiwiSdrProtocol::kAgcThresholdMinDb : 0,
+                    current - 5));
+            }
         }, true);
 
     // ── CW ──────────────────────────────────────────────────────────────

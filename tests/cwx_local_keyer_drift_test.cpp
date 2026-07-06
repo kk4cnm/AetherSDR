@@ -60,6 +60,10 @@ void expectStates(const std::string& name,
 
 class TestKeyer final : public CwxLocalKeyer {
 public:
+    // Drive the schedule synchronously — no real worker thread — so the
+    // drift-correction math stays deterministic under onTick()/setElapsed().
+    TestKeyer() : CwxLocalKeyer(/*spawnWorker=*/false) {}
+
     void setElapsed(qint64 elapsedMs) { m_elapsedMs = elapsedMs; }
     void tick() { onTick(); }
 
@@ -85,15 +89,20 @@ private:
 };
 
 struct Fixture {
-    TestKeyer keyer;
+    // Declaration order is load-bearing: members destruct in reverse, so
+    // `states` (declared first) outlives `keyer` (declared last). A test that
+    // ends key-down leaves the keyer's dtor to call keyUpIfDown() ->
+    // emitKeyDown(false) -> this callback, which must write into a still-live
+    // `states`. Reversing these two lines reintroduces a heap-use-after-free at
+    // teardown that only the ASan/UBSan job catches (#3740).
     std::vector<int> states;
+    TestKeyer keyer;
 
     Fixture()
     {
-        QObject::connect(&keyer, &CwxLocalKeyer::keyStateChanged,
-                         [this](bool down) {
-                             states.push_back(down ? 1 : 0);
-                         });
+        keyer.setOnKeyDownChange([this](bool down) {
+            states.push_back(down ? 1 : 0);
+        });
     }
 };
 

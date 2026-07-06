@@ -55,12 +55,9 @@ public:
     quint16 port() const;
     int clientCount() const { return m_clients.size(); }
 
-    // True if TCI currently owns or borrows a DAX RX stream on this channel
-    // (created or reused for an active audio client). Other DAX consumers —
-    // notably the DAX virtual-audio bridge — must consult this before removing
-    // a stream on the shared PanadapterStream map, so they don't silence a
-    // channel WSJT-X is decoding on (the mirror image of #3270). (#2895)
-    bool ownsDaxChannel(int channel) const { return m_tciDaxStreamIds.contains(channel); }
+    // (ownsDaxChannel() and the cross-consumer peeking it existed for were
+    // replaced by per-consumer holds in PanadapterStream's centralized DAX
+    // channel manager — see acquireDaxChannel/releaseDaxChannel. #3305)
 
     // Snapshot of all currently connected clients (endpoint + subscriptions).
     // Cheap to call; intended for the Radio Setup → TCI tab on demand and
@@ -104,6 +101,7 @@ public:
     void wireSlice(int trx, SliceModel* slice);
     void wireSpotModel();
     void notifySpotClicked(int spotIndex, SliceModel* slice = nullptr);
+    void rearmDaxForProfileLoad();
 
 public slots:
     // RX audio from main audio pipeline (float32 stereo, 24 kHz)
@@ -147,6 +145,9 @@ private slots:
 
 private:
     void sendInitBurst(QWebSocket* client);
+    // Diagnostic: log + send a text reply to one client (per-command echoes
+    // bypass the central dispatch log, so route them here for visibility).
+    void replyText(QWebSocket* ws, const QString& msg);
     void broadcastSpotClicked(const QString& callsign, long long frequencyHz,
                               int trx, int channel);
     SliceModel* sliceForPanId(const QString& panId) const;
@@ -197,15 +198,17 @@ private:
 
     void ensureDaxForTci();
     void releaseDaxForTci();
+    void scheduleDaxRelease();   // debounced releaseDaxForTci — cancel on reconnect
+    void cancelDaxRelease();
 
     QPointer<RadioModel> m_model;  // QPointer auto-clears when RadioModel is destroyed (#2385)
     AudioEngine*      m_audio{nullptr};
     QWebSocketServer* m_server{nullptr};
     QList<ClientState> m_clients;
     QSet<int>         m_tciDaxSlices;   // slice IDs where we auto-assigned DAX (#1331)
-    QMap<int, quint32> m_tciDaxStreamIds;      // DAX channel → stream ID created or borrowed by TCI
-    QSet<int>          m_tciDaxBorrowedChannels; // channels where TCI reused an existing stream
+    QMap<int, int>     m_channelTrx;            // DAX channel → last-resolved TCI TRX (routing cache, #3669)
     QTimer*           m_meterTimer{nullptr};  // 200ms status broadcast
+    QTimer*           m_daxReleaseTimer{nullptr}; // debounced DAX RX teardown
     QTimer*           m_txChronoTimer{nullptr}; // TX_CHRONO frame cadence
     QWebSocket*       m_txChronoClient{nullptr};
     int               m_txChronoTrx{0};

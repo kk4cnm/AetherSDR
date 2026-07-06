@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QJsonDocument>
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 // ── TMate 2 display helpers ────────────────────────────────────────────────
@@ -41,14 +42,82 @@ static const uint8_t kSmallLow[10] = {
     0xA0, 0x00, 0x60, 0x40, 0xC0, 0xC0, 0xE0, 0x00, 0xE0, 0xC0
 };
 
+struct MainGlyph { uint8_t high; uint8_t low; };
+struct SmallGlyph { uint8_t high; uint8_t low; };
+
+static MainGlyph tmate2MainGlyph(QChar ch)
+{
+    if (ch.isDigit()) {
+        const int digit = ch.digitValue();
+        return { kMainHigh[digit], kMainLow[digit] };
+    }
+
+    switch (ch.toLatin1()) {
+    case 'A': case 'a': return { 0x07, 0x07 };
+    case 'C': case 'c': return { 0x01, 0x0D };
+    case 'D': case 'd': return { 0x06, 0x0E };  // lowercase-d: B+C + D+E+G
+    case 'E': case 'e': return { 0x01, 0x0F };
+    case 'F': case 'f': return { 0x01, 0x07 };
+    case 'G': case 'g': return { 0x05, 0x0D };
+    case 'H': case 'h': return { 0x06, 0x07 };
+    case 'I': case 'i': return { 0x00, 0x04 };
+    case 'K': case 'k': return { 0x00, 0x0F };
+    case 'L': case 'l': return { 0x00, 0x0D };
+    case 'M': case 'm': return { 0x04, 0x06 };
+    case 'N': case 'n': return { 0x04, 0x06 };
+    case 'O': case 'o': return { 0x07, 0x0D };
+    case 'P': case 'p': return { 0x03, 0x07 };
+    case 'R': case 'r': return { 0x00, 0x06 };
+    case 'S': case 's': return { 0x05, 0x0B };
+    case 'T': case 't': return { 0x00, 0x0F };
+    case 'U': case 'u': return { 0x06, 0x0D };
+    case 'V': case 'v': return { 0x06, 0x0D };
+    case 'W': case 'w': return { 0x06, 0x0D };
+    case 'X': case 'x': return { 0x06, 0x07 };
+    case 'Y': case 'y': return { 0x06, 0x0B };
+    case '-': return { 0x00, 0x02 };
+    case ' ': return { 0x00, 0x00 };
+    default:  return { 0x00, 0x00 };
+    }
+}
+
+static SmallGlyph tmate2SmallGlyph(QChar ch)
+{
+    if (ch.isDigit()) {
+        const int digit = ch.digitValue();
+        return { kSmallHigh[digit], kSmallLow[digit] };
+    }
+
+    switch (ch.toLatin1()) {
+    case 'k':
+    case 'K':
+        // Seven-segment approximation: left strokes, center, and lower-right.
+        return { 0x20, 0xE0 };
+    case '-':
+        return { 0x00, 0x40 };
+    case ' ':
+        return { 0x00, 0x00 };
+    default:
+        return { 0x00, 0x00 };
+    }
+}
+
 // Indicator segment lookup: {byte_index, bitmask}.
 // Derived from USB captures (session_20260605_051711/segments_*.csv).
 // Byte range 0-31 only; indicator bits never overlap with digit A-G bits.
 struct SegEntry { uint8_t byte; uint8_t mask; };
 static constexpr SegEntry kSeg_RX        = {  0, 0x04 };
 static constexpr SegEntry kSeg_TX        = {  0, 0x08 };
+static constexpr SegEntry kSeg_E1        = {  0, 0x80 };
+static constexpr SegEntry kSeg_E2        = {  8, 0x10 };
 static constexpr SegEntry kSeg_S         = {  0, 0x10 };
 static constexpr SegEntry kSeg_VOL       = {  1, 0x80 };
+static constexpr SegEntry kSeg_RFG       = {  2, 0x80 };
+static constexpr SegEntry kSeg_SQL       = {  3, 0x10 };
+static constexpr SegEntry kSeg_DRV       = {  4, 0x10 };
+static constexpr SegEntry kSeg_NR2       = {  5, 0x10 };
+static constexpr SegEntry kSeg_NB2       = {  6, 0x10 };
+static constexpr SegEntry kSeg_AN2       = {  7, 0x10 };
 static constexpr SegEntry kSeg_SMETER_LINE = { 2, 0x01 };
 static constexpr SegEntry kSeg_SMETER_DB_MINUS = {28, 0x10 };
 static constexpr SegEntry kSeg_DIG_PLUS  = { 21, 0x04 };
@@ -66,8 +135,22 @@ static constexpr SegEntry kSeg_DOT1      = {  9, 0x10 };  // after digit 3 (kHz/
 static constexpr SegEntry kSeg_DOT2      = { 15, 0x10 };  // after digit 6 (MHz/kHz)
 static constexpr SegEntry kSeg_HZ        = { 23, 0x01 };
 static constexpr SegEntry kSeg_W         = { 20, 0x20 };
+static constexpr SegEntry kSeg_LOW       = { 11, 0x10 };
+static constexpr SegEntry kSeg_HIGH      = { 10, 0x10 };
+static constexpr SegEntry kSeg_SHIFT     = { 12, 0x10 };
 static constexpr SegEntry kSeg_RIT       = { 13, 0x10 };
 static constexpr SegEntry kSeg_XIT       = { 14, 0x10 };
+static constexpr SegEntry kSeg_SMETER_1      = {  1, 0x10 };
+static constexpr SegEntry kSeg_SMETER_3      = {  2, 0x10 };
+static constexpr SegEntry kSeg_SMETER_5      = {  2, 0x08 };
+static constexpr SegEntry kSeg_SMETER_7      = {  2, 0x04 };
+static constexpr SegEntry kSeg_SMETER_9      = {  2, 0x02 };
+static constexpr SegEntry kSeg_SMETER_PLUS20 = {  9, 0x20 };
+static constexpr SegEntry kSeg_SMETER_PLUS40 = { 15, 0x20 };
+static constexpr SegEntry kSeg_SMETER_PLUS60 = { 18, 0x20 };
+static constexpr SegEntry kSeg_SMETER_20     = { 10, 0x20 };
+static constexpr SegEntry kSeg_SMETER_40     = { 16, 0x20 };
+static constexpr SegEntry kSeg_SMETER_60     = { 19, 0x20 };
 // 15-segment S-meter bargraph (BAR1=weakest, BAR15=strongest)
 static constexpr SegEntry kSMeterBars[15] = {
     { 1, 0x08 }, { 1, 0x04 }, { 1, 0x02 }, // BAR1-3
@@ -90,6 +173,79 @@ static int smeterBars(float dbm)
     if (dbm < -121.0f) return 0;
     if (dbm <= -73.0f) return static_cast<int>((dbm + 121.0f) / 6.0f) + 1;
     return std::min(15, 9 + static_cast<int>((dbm + 73.0f) / 10.0f));
+}
+
+static int powerBars(float watts, float fullScaleWatts)
+{
+    if (!std::isfinite(watts) || !std::isfinite(fullScaleWatts) || fullScaleWatts <= 0.0f)
+        return 0;
+    const float clampedWatts = std::clamp(watts, 0.0f, fullScaleWatts);
+    return std::clamp(static_cast<int>(std::lround((clampedWatts / fullScaleWatts) * 15.0f)), 0, 15);
+}
+
+static void setSmeterScaleSegs(uint8_t* lcd, bool on)
+{
+    tmate2Seg(lcd, kSeg_SMETER_1, on);
+    tmate2Seg(lcd, kSeg_SMETER_3, on);
+    tmate2Seg(lcd, kSeg_SMETER_5, on);
+    tmate2Seg(lcd, kSeg_SMETER_7, on);
+    tmate2Seg(lcd, kSeg_SMETER_9, on);
+    tmate2Seg(lcd, kSeg_SMETER_PLUS20, on);
+    tmate2Seg(lcd, kSeg_SMETER_PLUS40, on);
+    tmate2Seg(lcd, kSeg_SMETER_PLUS60, on);
+    tmate2Seg(lcd, kSeg_SMETER_20, on);
+    tmate2Seg(lcd, kSeg_SMETER_40, on);
+    tmate2Seg(lcd, kSeg_SMETER_60, on);
+}
+
+static void clearTMate2EncoderActionSegs(uint8_t* lcd)
+{
+    tmate2Seg(lcd, kSeg_E1, false);
+    tmate2Seg(lcd, kSeg_E2, false);
+    tmate2Seg(lcd, kSeg_VOL, false);
+    tmate2Seg(lcd, kSeg_RFG, false);
+    tmate2Seg(lcd, kSeg_SQL, false);
+    tmate2Seg(lcd, kSeg_DRV, false);
+    tmate2Seg(lcd, kSeg_NR2, false);
+    tmate2Seg(lcd, kSeg_NB2, false);
+    tmate2Seg(lcd, kSeg_AN2, false);
+    tmate2Seg(lcd, kSeg_LOW, false);
+    tmate2Seg(lcd, kSeg_HIGH, false);
+    tmate2Seg(lcd, kSeg_SHIFT, false);
+}
+
+static void setTMate2EncoderActionSegs(uint8_t* lcd,
+                                       const QString& encoder1Action,
+                                       const QString& encoder2Action)
+{
+    clearTMate2EncoderActionSegs(lcd);
+    const bool e1Assigned = !encoder1Action.isEmpty()
+        && encoder1Action != QLatin1String("None");
+    const bool e2Assigned = !encoder2Action.isEmpty()
+        && encoder2Action != QLatin1String("None");
+    tmate2Seg(lcd, kSeg_E1, e1Assigned);
+    tmate2Seg(lcd, kSeg_E2, e2Assigned);
+
+    // E1 has the left-side function words from the TMate 2 silkscreen.
+    tmate2Seg(lcd, kSeg_VOL,
+              encoder1Action == QLatin1String("WheelVolume")
+              || encoder1Action == QLatin1String("WheelMasterAf")
+              || encoder1Action == QLatin1String("WheelSliceAudio")
+              || encoder1Action == QLatin1String("WheelHeadphoneVolume"));
+    tmate2Seg(lcd, kSeg_DRV, encoder1Action == QLatin1String("WheelPower"));
+    tmate2Seg(lcd, kSeg_SQL, encoder1Action == QLatin1String("WheelAgcT"));
+    tmate2Seg(lcd, kSeg_RFG, false);
+    tmate2Seg(lcd, kSeg_NR2, false);
+    tmate2Seg(lcd, kSeg_NB2, false);
+    tmate2Seg(lcd, kSeg_AN2, false);
+
+    // E2 has only the right-side function words.
+    tmate2Seg(lcd, kSeg_HIGH,
+              encoder2Action == QLatin1String("WheelPower")
+              || encoder2Action == QLatin1String("WheelAgcT")
+              || encoder2Action == QLatin1String("WheelApf"));
+    tmate2Seg(lcd, kSeg_LOW, false);
+    tmate2Seg(lcd, kSeg_SHIFT, encoder2Action == QLatin1String("WheelFrequency"));
 }
 
 static void applyModeSegs(uint8_t* lcd, const QString& mode)
@@ -155,6 +311,20 @@ static void tmate2WriteMainDisplay(uint8_t* v, uint32_t hz)
     }
 }
 
+static void tmate2WriteMainDisplayText(uint8_t* v, const QString& text)
+{
+    const QString clean = text.left(9).rightJustified(9, QLatin1Char(' '));
+    for (int d = 1; d <= 9; ++d) {
+        uint8_t hi = static_cast<uint8_t>(22 - 2 * d);
+        uint8_t lo = static_cast<uint8_t>(21 - 2 * d);
+        const MainGlyph glyph = tmate2MainGlyph(clean.at(9 - d));
+        v[hi] &= 0xF8u;
+        v[lo] &= 0xF0u;
+        v[hi] |= glyph.high;
+        v[lo] |= glyph.low;
+    }
+}
+
 // Write a value (mod 1000) to bytes 23..28 of the LCDVector.
 static void tmate2WriteSmallDisplay(uint8_t* v, uint32_t val)
 {
@@ -168,6 +338,20 @@ static void tmate2WriteSmallDisplay(uint8_t* v, uint32_t val)
         v[hi] |= kSmallHigh[val % 10u];
         v[lo] |= kSmallLow [val % 10u];
         val /= 10u;
+    }
+}
+
+static void tmate2WriteSmallDisplayText(uint8_t* v, const QString& text)
+{
+    const QString clean = text.left(3).rightJustified(3, QLatin1Char(' '));
+    for (int d = 1; d <= 3; ++d) {
+        uint8_t hi = static_cast<uint8_t>(21 + 2 * d);
+        uint8_t lo = static_cast<uint8_t>(22 + 2 * d);
+        const SmallGlyph glyph = tmate2SmallGlyph(clean.at(3 - d));
+        v[hi] &= 0x0Fu;
+        v[lo] &= 0x1Fu;
+        v[hi] |= glyph.high;
+        v[lo] |= glyph.low;
     }
 }
 
@@ -600,8 +784,28 @@ void HidEncoderManager::setTMate2Display(uint32_t freq_hz, uint32_t small_val)
     sendTMate2();
 }
 
+void HidEncoderManager::setTMate2DisplayText(uint32_t freq_hz, const QString& small_text)
+{
+    if (!m_device || !isTMate2()) return;
+    tmate2WriteMainDisplay(m_lcdVector, freq_hz);
+    tmate2WriteSmallDisplayText(m_lcdVector, small_text);
+    sendTMate2();
+}
+
+void HidEncoderManager::setTMate2OverlayDisplay(const QString& main_text)
+{
+    if (!m_device || !isTMate2()) return;
+    tmate2WriteMainDisplayText(m_lcdVector, main_text);
+    tmate2WriteSmallDisplayText(m_lcdVector, QString());
+    sendTMate2();
+}
+
 void HidEncoderManager::setTMate2Indicators(bool tx, const QString& mode,
-                                             float smeter_dbm, bool rit, bool xit)
+                                             float smeter_dbm, bool rit, bool xit,
+                                             const QString& encoder1Action,
+                                             const QString& encoder2Action,
+                                             float txPowerWatts,
+                                             float txPowerFullScaleWatts)
 {
     if (!m_device || !isTMate2()) return;
 
@@ -611,9 +815,10 @@ void HidEncoderManager::setTMate2Indicators(bool tx, const QString& mode,
     tmate2Seg(m_lcdVector, kSeg_W,   tx);
     tmate2Seg(m_lcdVector, kSeg_DBM, !tx);
     tmate2Seg(m_lcdVector, kSeg_S,   !tx);
-    tmate2Seg(m_lcdVector, kSeg_VOL, true);
-    tmate2Seg(m_lcdVector, kSeg_SMETER_LINE, true);
+    tmate2Seg(m_lcdVector, kSeg_SMETER_LINE, !tx);
     tmate2Seg(m_lcdVector, kSeg_SMETER_DB_MINUS, !tx && smeter_dbm < 0.0f);
+    setSmeterScaleSegs(m_lcdVector, !tx);
+    setTMate2EncoderActionSegs(m_lcdVector, encoder1Action, encoder2Action);
 
     // Static frequency-display decorations (decimal dots + Hz unit). These are
     // always on in the normal view; re-assert them here — not only in open() —
@@ -626,47 +831,62 @@ void HidEncoderManager::setTMate2Indicators(bool tx, const QString& mode,
     applyModeSegs(m_lcdVector, mode);
 
     // S-meter bargraph — set bars 1..N on, rest off
-    const int bars = smeterBars(smeter_dbm);
+    const int bars = tx
+        ? powerBars(txPowerWatts, txPowerFullScaleWatts)
+        : smeterBars(smeter_dbm);
     for (int i = 0; i < 15; ++i)
         tmate2Seg(m_lcdVector, kSMeterBars[i], i < bars);
 
-    // RIT / XIT
-    tmate2Seg(m_lcdVector, kSeg_RIT, rit);
-    tmate2Seg(m_lcdVector, kSeg_XIT, xit);
+    // RIT / XIT double as function-label segments for the E1/E2 encoders.
+    const bool ritMapped = encoder1Action == QLatin1String("WheelRit")
+        || encoder2Action == QLatin1String("WheelRit");
+    const bool xitMapped = encoder1Action == QLatin1String("WheelXit")
+        || encoder2Action == QLatin1String("WheelXit");
+    tmate2Seg(m_lcdVector, kSeg_RIT, rit || ritMapped);
+    tmate2Seg(m_lcdVector, kSeg_XIT, xit || xitMapped);
 
     sendTMate2();
 }
 
 void HidEncoderManager::setTMate2OverlayIndicators(const QString& overlayType,
                                                     int overlayValue,
-                                                    const QString& mode)
+                                                    const QString& /* mode */)
 {
     if (!m_device || !isTMate2()) return;
 
     const bool isVolume = overlayType == QLatin1String("volume");
     const bool isPower  = overlayType == QLatin1String("power");
     const bool isSpeed  = overlayType == QLatin1String("speed");
-    const bool isWpm    = overlayType == QLatin1String("wpm");
     const bool isRit    = overlayType == QLatin1String("rit");
+    const bool isXit    = overlayType == QLatin1String("xit");
+    const bool isShift  = overlayType == QLatin1String("shift");
+    const bool isLevel  = overlayType == QLatin1String("agc")
+        || overlayType == QLatin1String("apf");
+    const bool isHzValue = isSpeed || isRit || isXit || isShift;
 
     tmate2Seg(m_lcdVector, kSeg_SMETER_LINE, false);
+    setSmeterScaleSegs(m_lcdVector, false);
+    clearTMate2EncoderActionSegs(m_lcdVector);
     tmate2Seg(m_lcdVector, kSeg_DOT1, false);
     tmate2Seg(m_lcdVector, kSeg_DOT2, false);
     tmate2Seg(m_lcdVector, kSeg_VOL, isVolume);
     tmate2Seg(m_lcdVector, kSeg_W, isPower);
-    tmate2Seg(m_lcdVector, kSeg_HZ, isSpeed || isRit);
+    tmate2Seg(m_lcdVector, kSeg_HZ, isHzValue);
     tmate2Seg(m_lcdVector, kSeg_RIT, isRit);
-    tmate2Seg(m_lcdVector, kSeg_SMETER_DB_MINUS, isRit && overlayValue < 0);
+    tmate2Seg(m_lcdVector, kSeg_XIT, isXit);
+    tmate2Seg(m_lcdVector, kSeg_SHIFT, isShift);
+    tmate2Seg(m_lcdVector, kSeg_SMETER_DB_MINUS,
+              (isRit || isXit || isShift) && overlayValue < 0);
     tmate2Seg(m_lcdVector, kSeg_DBM, false);
     tmate2Seg(m_lcdVector, kSeg_S, false);
     tmate2Seg(m_lcdVector, kSeg_RX, false);
     tmate2Seg(m_lcdVector, kSeg_TX, false);
-    tmate2Seg(m_lcdVector, kSeg_XIT, false);
 
-    // Keep the current mode visible; for WPM force CW as an additional cue.
-    applyModeSegs(m_lcdVector, isWpm ? QStringLiteral("CW") : mode);
+    // Overlays are transient numeric readouts; blank normal mode labels
+    // (USB/LSB/DIG+/...) so they do not visually mix with the feedback value.
+    applyModeSegs(m_lcdVector, QString());
 
-    const int bars = (isVolume || isPower)
+    const int bars = (isVolume || isPower || isLevel)
         ? std::clamp((std::clamp(overlayValue, 0, 100) * 15 + 99) / 100, 0, 15)
         : 0;
     for (int i = 0; i < 15; ++i)
@@ -685,6 +905,8 @@ void HidEncoderManager::clearTMate2Indicators()
     tmate2Seg(m_lcdVector, kSeg_VOL, false);
     tmate2Seg(m_lcdVector, kSeg_SMETER_LINE, false);
     tmate2Seg(m_lcdVector, kSeg_SMETER_DB_MINUS, false);
+    setSmeterScaleSegs(m_lcdVector, false);
+    clearTMate2EncoderActionSegs(m_lcdVector);
     tmate2Seg(m_lcdVector, kSeg_DOT1, false);
     tmate2Seg(m_lcdVector, kSeg_DOT2, false);
     tmate2Seg(m_lcdVector, kSeg_HZ, false);

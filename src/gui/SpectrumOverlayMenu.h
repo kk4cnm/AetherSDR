@@ -15,10 +15,14 @@ class QPushButton;
 class QComboBox;
 class QSlider;
 class QLabel;
+class QCheckBox;
+class QDoubleSpinBox;
+class QScrollArea;
 
 namespace AetherSDR {
 
 class MemoryBrowsePanel;
+class KiwiSdrManager;
 class SliceModel;
 
 // Floating overlay menu anchored to the top-left of the SpectrumWidget.
@@ -36,6 +40,7 @@ public:
 
     // Set the antenna list (from RadioModel::antListChanged).
     void setAntennaList(const QStringList& ants);
+    void setKiwiSdrManager(KiwiSdrManager* manager);
     void setRadioModel(RadioModel* model);
 
     // Sync Display sub-panel controls with saved settings.  The Black slider
@@ -48,8 +53,13 @@ public:
                              int floorPos = 75, bool floorEnable = false,
                              bool heatMap = true, int colorScheme = 0,
                              bool showGrid = true,
-                             float lineWidth = 2.0f);
+                             float lineWidth = 2.0f,
+                             bool autoBlackRadioSide = false,
+                             int renderMode = 0,
+                             int dssFloorDepth = 6,
+                             int dssGain = 70);
     void syncWfLineDuration(int rate);
+    void syncKiwiWaterfallSettings(int cellDb, int floorDb, int rate);
     // Sync blanker/cursor/opacity controls not covered by syncDisplaySettings.
     void syncExtraDisplaySettings(bool blankerOn, float blankerThresh,
                                   int bgOpacity,
@@ -73,6 +83,7 @@ public:
     void setRfGainRange(int low, int high, int step);
     void setLoopState(bool loopA, bool loopB);
     void syncNoiseFloorPosition(int pos);
+    void syncDssFloorDepth(int dB);
 
     // Populate XVTR band sub-panel
     struct XvtrBand { QString name; double rfFreqMhz; QString stackKey; };
@@ -84,6 +95,10 @@ public:
     // VHF row will disappear.  Triggers a band-panel rebuild. (#695)
     void setRadioCapabilities(ModelCapabilities caps);
     void syncDaxIqChannel(int channel);
+    // Reflect the real WFM demodulator state onto the DAX-panel WFM toggle
+    // WITHOUT re-emitting wfmToggleRequested. Self-gated on this menu's slice,
+    // so a state change on another slice is ignored. (#3853)
+    void setWfmActive(bool on, int sliceId);
     // DSP button accessors and the DSP sub-panel were removed — radio-
     // side DSP lives on VfoWidget only, client-side DSP lives on the
     // AetherDSP applet only.
@@ -100,6 +115,9 @@ signals:
     void memoryActivated(int memoryIndex, const QString& panId);
     void quickAddMemoryRequested(const QString& panId);
     void daxIqChannelChanged(int channel);  // 0=Off, 1-4
+    // WFM software-demod toggle in the DAX panel. Acts on this menu's slice;
+    // WFM is mode-independent (raw IQ from this pan's DAX stream). (#3853)
+    void wfmToggleRequested(bool on, int sliceId);
     void addPanClicked();
     void daxClicked();
     // DSP-related signals (nr2Toggled / rn2Toggled / bnrToggled /
@@ -122,8 +140,16 @@ signals:
     // Auto-black target offset (0-100, 50 = at noise floor).  Emitted when
     // the Black slider moves while AUTO is engaged.
     void wfAutoBlackOffsetChanged(int offset);
+    // Auto-black source: false = client-side estimate (default), true = radio.
+    void wfAutoBlackSourceChanged(bool radioSide);
     void wfLineDurationChanged(int ms);
+    void kiwiWaterfallCellChanged(int cellDb);
+    void kiwiWaterfallFloorChanged(int floorDb);
+    void kiwiWaterfallRateChanged(int rate);
     void wfColorSchemeChanged(int scheme);
+    void spectrumRenderModeChanged(int mode);
+    void dssFloorDepthChanged(int dB);
+    void dssGainChanged(int pct);
     void noiseFloorPositionChanged(int pos);
     void noiseFloorEnableChanged(bool on);
     // Emitted when user selects a band from the sub-panel.  stackKeyHint is
@@ -141,13 +167,24 @@ signals:
     void wnbLevelChanged(int level);
     // Emitted when RF gain slider changes (panadapter-level).
     void rfGainChanged(int gain);
-    void swrSweepStartRequested(int sliceId, int sweepPowerWatts);
+    // customLowMhz/customHighMhz bound the sweep when the operator has ticked
+    // "Limit range" (else both 0 = sweep the full band). The values are clamped
+    // to the in-region band edges receiver-side, so they can only ever narrow
+    // the sweep, never widen it past what the band plan already permits.
+    void swrSweepStartRequested(int sliceId, int sweepPowerWatts,
+                                double customLowMhz, double customHighMhz);
     void swrSweepClearRequested();
+    void swrSweepSaveCsvRequested();
+    void kiwiRxAntennaSelected(int sliceId, const QString& profileId);
+    void flexRxAntennaSelected(int sliceId);
     // NB Waterfall Blanker (#277)
     void wfBlankerEnabledChanged(bool on);
     void wfBlankerThresholdChanged(float threshold);
     void backgroundImageRequested();
     void backgroundImageCleared();
+    // Right-click "Clear": turn the background off entirely (no image, just the
+    // fill colour) and persist it.
+    void backgroundImageDisabled();
     void backgroundOpacityChanged(int pct);
     void backgroundFillColorChanged(const QColor& color);
     void displaySettingsReset();
@@ -159,6 +196,7 @@ private:
     QPointer<PanadapterModel> m_panadapter;
     QMetaObject::Connection m_panRxAntennaConnection;
     QMetaObject::Connection m_panLoopConnection;
+    void setKiwiWaterfallControlMode(bool kiwiMode);
     void toggle();
     void updateLayout();
     void toggleBandPanel();
@@ -179,6 +217,7 @@ private:
     void refreshAntennaCombo();
     void setRxAntennaComboToken(const QString& token);
     QString currentRxAntennaToken() const;
+    QString antennaComboLabel(const QString& token, const QStringList& options) const;
     void updateLoopButtonVisibility();
 
     static constexpr int kBtnAddRx = 0;
@@ -222,11 +261,16 @@ private:
     QLabel*      m_wnbLabel{nullptr};
     QPushButton* m_swrStartBtn{nullptr};
     QPushButton* m_swrClearBtn{nullptr};
+    QPushButton* m_swrSaveBtn{nullptr};
+    QCheckBox* m_swrRangeCheck{nullptr};
+    QDoubleSpinBox* m_swrLowSpin{nullptr};
+    QDoubleSpinBox* m_swrHighSpin{nullptr};
 
     // DAX sub-panel
-    QWidget*   m_daxPanel{nullptr};
-    bool       m_daxPanelVisible{false};
-    QComboBox* m_daxIqCmb{nullptr};
+    QWidget*     m_daxPanel{nullptr};
+    bool         m_daxPanelVisible{false};
+    QComboBox*   m_daxIqCmb{nullptr};
+    QPushButton* m_wfmBtn{nullptr};   // WFM software-demod toggle (#3853)
 
     // Memory browse sub-panel
     MemoryBrowsePanel* m_memoryPanel{nullptr};
@@ -234,6 +278,7 @@ private:
 
     // Display sub-panel
     QWidget*     m_displayPanel{nullptr};
+    QScrollArea* m_displayScroll{nullptr};
     bool         m_displayPanelVisible{false};
     QSlider*     m_avgSlider{nullptr};
     QLabel*      m_avgLabel{nullptr};
@@ -253,14 +298,25 @@ private:
     QSlider*     m_blackSlider{nullptr};
     QLabel*      m_blackLabel{nullptr};
     QPushButton* m_autoBlackBtn{nullptr};
+    // Auto-black is a 3-way cycle on one button: 0 = Off, 1 = Auto-C (client
+    // noise-floor estimate), 2 = Auto-R (radio per-tile level).
+    int m_autoBlackMode{1};
+    void applyAutoBlackMode(int mode, bool emitSignals);
     // Two values backing the single Black slider; the slider shows whichever
     // matches the current AUTO state.  Toggling AUTO swaps the displayed
     // value, edits route to the matching member + matching signal.
     int          m_blackManualValue{15};
     int          m_blackAutoOffsetValue{50};
     QComboBox*   m_colorSchemeCmb{nullptr};
+    QComboBox*   m_renderModeCmb{nullptr};
+    QSlider*     m_dssFloorSlider{nullptr};  // 3DSS floor depth (dB below floor)
+    QLabel*      m_dssFloorLabel{nullptr};
+    QSlider*     m_dssGainSlider{nullptr};  // 3DSS colour floor (0-100)
+    QLabel*      m_dssGainLabel{nullptr};
+    QComboBox*   m_gpuCombo{nullptr};   // render-GPU selector (multi-GPU only)
     QSlider*     m_rateSlider{nullptr};
     QLabel*      m_rateLabel{nullptr};
+    bool         m_kiwiWaterfallControlMode{false};
     // NB Waterfall Blanker (#277)
     QPushButton* m_wfBlankerBtn{nullptr};
     QSlider*     m_wfBlankerThreshSlider{nullptr};
@@ -277,6 +333,7 @@ private:
 
     QStringList  m_antList;
     RadioModel*  m_radioModel{nullptr};
+    QPointer<KiwiSdrManager> m_kiwiSdrManager;
     QPointer<SliceModel> m_slice;
     bool         m_updatingFromModel{false};
     int          m_lastEmittedRfGain{INT_MIN};  // dedupe rfgain emits across drag snap ticks (#1498)

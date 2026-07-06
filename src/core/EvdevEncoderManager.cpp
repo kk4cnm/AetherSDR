@@ -51,6 +51,18 @@ QString bareKeySignature(int keycode)
     }
 }
 
+// Read an input device's name from sysfs (e.g. "Ulanzi Dial Keyboard").  The
+// sysfs `name` attribute is world-readable, so this works even when we lack
+// permission to open the /dev/input/event* node itself — which is exactly how
+// we detect a present-but-inaccessible dial.
+QString sysfsInputName(const QString& eventNode)
+{
+    QFile f(QStringLiteral("/sys/class/input/%1/device/name").arg(eventNode));
+    if (f.open(QIODevice::ReadOnly))
+        return QString::fromUtf8(f.readAll()).trimmed();
+    return {};
+}
+
 QString chordSignature(int keycode, bool withPreviousSong)
 {
     QString letter;
@@ -105,8 +117,24 @@ void EvdevEncoderManager::stop()
 void EvdevEncoderManager::onInputDirChanged()
 {
     if (m_fd >= 0) return;  // already attached
-    const QString path = findMatchingDevice();
-    if (path.isEmpty()) return;
+    QString blockedName;
+    const QString path = findMatchingDevice(&blockedName);
+    if (path.isEmpty()) {
+        // A recognized dial is present but we can't open its node — the udev
+        // access rule isn't installed.  Surface it once so the UI can offer to
+        // install the rule, rather than silently reading as "disconnected".
+        if (!blockedName.isEmpty() && !m_accessRequiredEmitted) {
+            m_accessRequiredEmitted = true;
+            qCWarning(lcDevices)
+                << "EvdevEncoderManager:" << blockedName
+                << "detected but its /dev/input node is not accessible (EACCES)."
+                << "Install the udev access rule (Ulanzi Dial mapper → Grant"
+                << "access) or add this user to the 'input' group.";
+            emit accessRequired(blockedName);
+        }
+        return;
+    }
+    m_accessRequiredEmitted = false;
     if (openAndGrab(path)) {
         qCInfo(lcDevices) << "EvdevEncoderManager: attached"
                           << m_deviceName << "at" << m_devicePath;
@@ -114,25 +142,28 @@ void EvdevEncoderManager::onInputDirChanged()
     }
 }
 
-QString EvdevEncoderManager::findMatchingDevice() const
+QString EvdevEncoderManager::findMatchingDevice(QString* blockedName) const
 {
     QDir dir(QStringLiteral("/dev/input"));
     const auto entries = dir.entryList({QStringLiteral("event*")}, QDir::System);
     for (const QString& name : entries) {
+        // Match on the sysfs name first (always readable), so a dial we lack
+        // permission to open is still recognized as "present".
+        const QString devName = sysfsInputName(name);
+        bool supported = false;
+        for (const QString& pattern : supportedNames()) {
+            if (devName == pattern) { supported = true; break; }
+        }
+        if (!supported) continue;
+
         const QString path = dir.filePath(name);
         int fd = ::open(path.toLocal8Bit().constData(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) continue;
-        char devName[256] = {};
-        if (ioctl(fd, EVIOCGNAME(sizeof(devName) - 1), devName) >= 0) {
-            const QString s = QString::fromUtf8(devName);
-            for (const QString& pattern : supportedNames()) {
-                if (s == pattern) {
-                    ::close(fd);
-                    return path;
-                }
-            }
+        if (fd >= 0) {
+            ::close(fd);
+            return path;
         }
-        ::close(fd);
+        if ((errno == EACCES || errno == EPERM) && blockedName)
+            *blockedName = devName;
     }
     return {};
 }

@@ -7,6 +7,7 @@
 #include <QHostAddress>
 #include <QVector>
 #include <QMap>
+#include <QHash>
 #include <QSet>
 #include <QTimer>
 #include <QElapsedTimer>
@@ -83,11 +84,88 @@ public:
     void unregisterWfStream(quint32 streamId);
     void clearRegisteredStreams();
 
+    // ── Layer A: radio-side UDP-orphan leak detector (#3856) ────────────────
+    // The client view always looks clean after a close because the "removed"
+    // echo unregisters both streams locally. But if the radio was never told to
+    // free a stream (e.g. a panafall closed without "display panafall remove")
+    // it KEEPS transmitting tiles for an id we no longer own. processDatagram()
+    // records any FFT/waterfall packet whose stream id was EVER registered this
+    // session AND is no longer registered — a stream we once owned and let go of
+    // that the radio still streams. (A never-yet-registered id in its
+    // registration-lag window is deliberately ignored.) A growing orphan packet
+    // count with a small age is direct, radio-authoritative proof of a leaked,
+    // still-streaming display stream — the kind seen on older firmware (#268).
+    struct OrphanStream {
+        quint32 streamId{0};
+        bool    waterfall{false};  // true = waterfall tile stream, false = FFT
+        quint64 packets{0};        // packets seen since the stream went orphan
+        qint64  ageMs{0};          // ms since the most recent orphan packet
+    };
+    QVector<OrphanStream> orphanStreams() const;
+    QVector<quint32>      registeredPanStreams() const;
+    QVector<quint32>      registeredWfStreams() const;
+    void                  resetOrphanStreams();   // clear the orphan tally
+
     // DAX stream routing
     void registerDaxStream(quint32 streamId, int channel);
     void unregisterDaxStream(quint32 streamId);
     QList<quint32> daxStreamIds() const;
     quint32 daxStreamIdForChannel(int channel) const;
+
+    // ---- Centralized DAX RX channel ownership (#3305) ----
+    //
+    // Every in-process consumer of a dax_rx channel (the virtual-audio bridge,
+    // TCI, RADE) acquires/releases the channel here instead of tracking stream
+    // ids and peeking at each other's state. PanadapterStream keeps the
+    // channel → (streamId, holders) table and is the ONLY place that decides
+    // when a radio-side stream must exist:
+    //
+    //   acquire, first holder  → emit daxStreamCreateNeeded(ch)
+    //   release, last holder   → deferred (grace + revalidate) →
+    //                            emit daxStreamRemoveNeeded(id, ch)
+    //   radio removed a stream we still hold (profile load, slice teardown)
+    //                           → deferred → re-emit daxStreamCreateNeeded(ch)
+    //
+    // The actual `stream create` / `stream remove` commands are sent by
+    // RadioModel (the command plane), wired to these signals. Decisions are
+    // NEVER made on status-echo edges (the #4009 storm class): acquire/release
+    // are idempotent per holder, and the grace window absorbs the radio's
+    // transient unbind/rebind dax=0/dax=<ch> pairs (#3626) — see
+    // docs/architecture/flex-protocol/state-machines.md §7.
+    enum class DaxConsumer : quint8 {
+        Bridge = 0,   // DAX virtual-audio bridge (macOS CoreAudio / PipeWire)
+        Tci    = 1,   // TCI server audio clients (WSJT-X etc.)
+        Rade   = 2,   // RADE digital-voice engine
+    };
+    static const char* daxConsumerName(DaxConsumer who);
+
+    // Add `who` as a holder of `channel` (1-4). Requests stream creation when
+    // the channel gains its first holder. Idempotent per holder. Returns the
+    // channel's current stream id (0 while creation is in flight).
+    quint32 acquireDaxChannel(int channel, DaxConsumer who);
+    // Command plane reports a failed/dropped `stream create` (radio error
+    // reply, or emitted while disconnected). Clears the create latch and — if
+    // the channel is still held — arms a deferred retry, so a transient
+    // failure (DAX slots busy, connect-gap drop) cannot wedge the channel
+    // with `createPending` stuck true (the #3669 wedge class).
+    void notifyDaxCreateFailed(int channel);
+    // Drop `who` as a holder. When the last holder leaves, stream removal is
+    // requested after a grace window (cancelled by a re-acquire).
+    void releaseDaxChannel(int channel, DaxConsumer who);
+    void releaseAllDaxChannels(DaxConsumer who);
+    bool daxChannelHeldBy(int channel, DaxConsumer who) const;
+    // Drop the whole table without emitting removals — the radio reaps all of
+    // a client's streams itself on TCP disconnect (state-machines.md §4.2).
+    void resetDaxChannelsForDisconnect();
+    // Read-only snapshot of the ownership table for diagnostics and the
+    // automation bridge (`get dax`). Safe from any thread.
+    struct DaxChannelSnapshot {
+        int         channel{0};
+        quint32     streamId{0};
+        bool        createPending{false};
+        QStringList holders;   // daxConsumerName() strings
+    };
+    QVector<DaxChannelSnapshot> daxChannelSnapshot() const;
 
     // DAX IQ stream routing
     void registerIqStream(quint32 streamId, int channel);
@@ -105,7 +183,26 @@ public:
     Q_INVOKABLE void setPacketLossConcealment(bool on);
     bool packetLossConcealment() const { return m_plcEnabled.load(); }
 
+    // Live-set the VITA-49 socket receive buffer (SO_RCVBUF) request, in bytes.
+    // Re-applies immediately if the socket is bound. Q_INVOKABLE: must run on
+    // the network worker thread (the socket lives there). Persistence is the
+    // caller's responsibility (NetworkSettings, on the GUI thread). (#3810)
+    Q_INVOKABLE void setReceiveBufferSizeBytes(int bytes);
+    // Kernel-granted SO_RCVBUF after the last apply (may be < requested when
+    // capped by net.core.rmem_max). 0 until the first bind. Safe from any thread.
+    int grantedReceiveBufferBytes() const { return m_grantedRcvBufBytes.load(); }
+
 signals:
+    // Centralized DAX ownership (#3305): command-plane requests, connected to
+    // RadioModel which sends `stream create type=dax_rx dax_channel=<ch>` /
+    // `stream remove 0x<id>` (plus the one-shot #1439 re-assert on create).
+    // RadioModel reports create failures back via notifyDaxCreateFailed().
+    void daxStreamCreateNeeded(int channel);
+    void daxStreamRemoveNeeded(quint32 streamId, int channel);
+    // A channel's radio-side stream went away (our removal or radio-initiated).
+    // TCI uses this to invalidate its channel→trx routing cache.
+    void daxStreamUnregistered(int channel, quint32 streamId);
+
     void daxAudioReady(int channel, const QByteArray& pcm);
     void iqDataReady(int channel, const QByteArray& rawPayload, int sampleRate);
     void spectrumReady(quint32 streamId, const QVector<float>& binsDbm, qint64 emittedNs);
@@ -120,12 +217,20 @@ signals:
     void audioDataReady(const QByteArray& pcm);
     // Meter data: parallel arrays of (meter_index, raw_int16_value).
     void meterDataReady(const QVector<quint16>& ids, const QVector<qint16>& vals);
+    // Emitted after the receive buffer is (re)applied on a bind or a live
+    // setReceiveBufferSizeBytes(). granted < requested ⇒ capped by rmem_max.
+    void receiveBufferApplied(int requestedBytes, int grantedBytes);
 
 private slots:
     void onDatagramReady();
 
 private:
     void processDatagram(const QByteArray& data);
+    // Raise the kernel receive buffer (SO_RCVBUF) on the bound VITA-49 socket so
+    // bursts / brief drain stalls don't overflow it and surface as false
+    // sequence-loss (which the adaptive throttle would react to). Logs the
+    // granted size — the kernel caps the request at net.core.rmem_max. (#3810)
+    void applyReceiveBufferSize();
     void decodeFFT(const uchar* raw, int totalBytes, bool hasTrailer, quint32 streamId);
     void decodeWaterfallTile(const uchar* raw, int totalBytes, bool hasTrailer, quint32 streamId);
     void decodeNarrowAudio(const uchar* raw, int totalBytes, bool hasTrailer, quint32 streamId);
@@ -138,6 +243,12 @@ private:
     // declared above.
     QMap<quint32, AudioPlcState> m_audioPlc;
     std::atomic<bool> m_plcEnabled{true};
+
+    // VITA-49 receive-buffer (SO_RCVBUF) request + last kernel-granted size.
+    // m_desiredRcvBufBytes is seeded from NetworkSettings at init and updated by
+    // setReceiveBufferSizeBytes(); applyReceiveBufferSize() requests it on bind.
+    int m_desiredRcvBufBytes{4 * 1024 * 1024};
+    std::atomic<int> m_grantedRcvBufBytes{0};
 
     // PacketClassCodes (from FlexLib VitaFlex.cs)
     static constexpr quint16 PCC_IF_NARROW         = 0x03E3u; // float32 stereo, big-endian
@@ -229,6 +340,22 @@ private:
     mutable QMutex  m_streamMutex;
     QSet<quint32>   m_knownPanStreams;     // registered pan stream IDs
     QSet<quint32>   m_knownWfStreams;     // registered wf stream IDs
+
+    // Stream ids that have EVER been registered this session (never pruned on
+    // unregister; cleared only on disconnect). The orphan detector keys off
+    // these, not the live known-sets: a leaked stream is one we ONCE owned and
+    // have since let go of but the radio keeps sending — which stays detectable
+    // after the live set empties (e.g. `pan close all`), while a never-yet-
+    // registered stream in its registration-lag window is never mis-flagged.
+    QSet<quint32>   m_everRegisteredPanStreams;   // (#3856)
+    QSet<quint32>   m_everRegisteredWfStreams;
+
+    // Orphan (radio-side-leaked) display streams — see OrphanStream above (#3856).
+    // Guarded by m_streamMutex. Bounded to kMaxOrphanStreams to cap memory.
+    struct OrphanRec { bool waterfall{false}; quint64 packets{0}; qint64 lastSeenMs{0}; };
+    static constexpr int kMaxOrphanStreams = 32;
+    QHash<quint32, OrphanRec> m_orphanStreams;
+    QElapsedTimer             m_orphanClock;   // monotonic source for lastSeenMs
     QUdpSocket*     m_socket{nullptr};
     quint16         m_localPort{0};
     QMap<quint32, QPair<float,float>> m_dbmRanges;  // streamId → (min, max)
@@ -290,6 +417,23 @@ private:
 
     // DAX stream routing: stream ID → DAX channel (1-4)
     QMap<quint32, int> m_daxStreamIds;
+    // Centralized DAX RX channel ownership (#3305), guarded by m_streamMutex.
+    // `generation` invalidates in-flight deferred removal/recreate lambdas
+    // whenever the channel's state changes (re-acquire cancels a pending
+    // removal; disconnect reset cancels everything).
+    struct DaxChannelState {
+        quint32 streamId{0};
+        bool    createPending{false};
+        quint8  holders{0};       // bitmask of DaxConsumer
+        quint32 generation{0};
+    };
+    QHash<int, DaxChannelState> m_daxChannelStates;
+    quint32 m_daxGenCounter{0};   // monotonic; entries never reuse a generation
+    static constexpr int kDaxRemovalGraceMs  = 1500;  // ≫ the ~80 ms transient rebroadcast cycle (#3626)
+    static constexpr int kDaxRecreateDelayMs = 500;   // radio-removed-but-still-held re-create backoff (#3476)
+    static constexpr int kDaxCreateRetryMs   = 2000;  // failed-create retry cadence while the channel stays held
+    void scheduleDaxRemovalLocked(int channel);       // call with m_streamMutex held
+    void scheduleDaxRecreateLocked(int channel);      // call with m_streamMutex held
     // DAX IQ stream routing: stream ID → IQ channel (1-4)
     QMap<quint32, int> m_iqStreamIds;
     QSet<quint32> m_loggedDaxPacketStreams;

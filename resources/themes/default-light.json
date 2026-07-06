@@ -44,6 +44,12 @@
           "accent.warning": "{color.amber.500}",
           "accent.danger":  "{color.red.500}",
           "accent.success": "{color.green.500}",
+          "waterfall.live":    "{color.red.500}",
+          "waterfall.history": "{color.gray.300}",
+          "tx.mox.border":       "#d08020",
+          "tx.mox.text":         "#f0c890",
+          "tx.mox.border.hover": "#e09030",
+          "tx.mox.text.hover":   "#ffd8a0",
           "text": {
             "primary":   "{color.gray.50}",
             "secondary": "{color.gray.100}",
@@ -62,6 +68,9 @@
             "thresh": "{color.amber.500}",
             "peak":   "{color.gray.50}",
             "gainReduction": "#a06010",
+            "pivot.fill": "#14181c",
+            "pivot.rim":  "#3a4250",
+            "pivot.glow": "#ff9a40",
             "bar.fill": "{color.gray.700}",
             "bar.fillGradient": {
               "type": "linear-gradient",
@@ -135,6 +144,19 @@
                 { "at": 0.75, "color": "#f07800" },
                 { "at": 1.00, "color": "#ffff50" }
               ]
+            },
+            "purple": {
+              "type": "linear-gradient",
+              "angle": 180,
+              "stops": [
+                { "at": 0.00, "color": "#000000" },
+                { "at": 0.15, "color": "#0000ff" },
+                { "at": 0.30, "color": "#00ff00" },
+                { "at": 0.45, "color": "#ffff00" },
+                { "at": 0.60, "color": "#ff0000" },
+                { "at": 0.75, "color": "#800080" },
+                { "at": 1.00, "color": "#ffffff" }
+              ]
             }
           },
           "slice": {
@@ -190,6 +212,20 @@
             "warning.background.checked": "#f5e8d0",
             "warning.foreground.checked": "{color.amber.500}",
             "warning.border.checked":     "{color.amber.500}"
+          },
+          "highlight": {
+            "tx":      "#fc4500",
+            "rx":      "#379baf",
+            "message": "#e58be5",
+            "fg":      "#000000"
+          },
+          "button": {
+            "background.disabled":        "{color.gray.700}",
+            "foreground.disabled":        "{color.gray.500}",
+            "border.disabled":            "{color.gray.600}",
+            "danger.background.disabled": "#f0d8d8",
+            "danger.foreground.disabled": "#b08080",
+            "danger.border.disabled":     "#d0a8a8"
           }
         },
         "font": {

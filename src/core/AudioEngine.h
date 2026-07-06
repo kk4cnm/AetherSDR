@@ -7,8 +7,10 @@
 #include <QAudioFormat>
 #include <QIODevice>
 #include <QJsonArray>
+#include <QJsonObject>
 #include <QUdpSocket>
 #include <QTimer>
+#include <QVector>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -16,6 +18,8 @@
 #include <QByteArray>
 #include <QElapsedTimer>
 #include <QPointer>
+#include <QString>
+#include <QStringList>
 
 #include "TxMicChannelNormalizer.h"
 #include "SpectralNR.h"
@@ -23,7 +27,9 @@
 class QMediaDevices;
 
 #include <functional>
+#include <algorithm>
 #include <memory>
+#include <deque>
 #include <vector>
 #include <cstdint>
 
@@ -31,8 +37,8 @@ namespace AetherSDR {
 
 class SpecbleachFilter;
 class RNNoiseFilter;
-class NvidiaBnrFilter;
 class DeepFilterFilter;
+class NvidiaAfxFilter;
 class Resampler;
 class ClientEq;
 class ClientComp;
@@ -70,6 +76,28 @@ class AudioEngine : public QObject {
 
 public:
     static constexpr int DEFAULT_SAMPLE_RATE = 24000;
+
+    struct ReceivePresentationAudioQueues {
+        int playbackQueuedMs{0};
+        int flexRawBufferMs{0};
+        int flexOutputBufferMs{0};
+        int kiwiSdrRawBufferMs{0};
+        int kiwiSdrOutputBufferMs{0};
+        int externalKiwiRawBufferMs{0};
+        int externalKiwiOutputBufferMs{0};
+
+        int flexTotalQueuedMs() const
+        {
+            return flexRawBufferMs + flexOutputBufferMs + playbackQueuedMs;
+        }
+
+        int kiwiTotalQueuedMs() const
+        {
+            return std::max(kiwiSdrRawBufferMs + kiwiSdrOutputBufferMs,
+                            externalKiwiRawBufferMs + externalKiwiOutputBufferMs)
+                   + playbackQueuedMs;
+        }
+    };
 
     explicit AudioEngine(QObject* parent = nullptr);
     ~AudioEngine() override;
@@ -120,16 +148,28 @@ public:
     int  rxPan() const { return m_rxPan.load(); }
     void  setRxBufferCapMs(int ms) { m_rxBufferCapMs.store(qBound(50, ms, 1000)); }
     int   rxBufferCapMs() const { return m_rxBufferCapMs.load(); }
+    void setReceivePresentationDelays(
+        int flexDelayMs,
+        int kiwiDelayMs,
+        const QString& externalKiwiDelaySourceId = QString());
+    void resetReceivePresentationAudioBuffers();
+    void resetReceivePresentationAudioBuffersForKiwiSource(
+        const QString& sourceId);
 
     bool isMuted() const       { return m_muted.load(); }
     void setMuted(bool m);
     bool isRxStreaming() const { return m_audioSink != nullptr; }
     bool isTxStreaming() const { return m_audioSource != nullptr; }
+    bool kiwiSdrAudioTransmitMuted() const;
     int  txInputSampleRate() const { return m_txInputRate; }
     int  txInputChannelCount() const { return m_txInputChannels; }
     bool txInputResamplingTo24k() const { return m_txNeedsResample; }
     bool rxOutputResamplingActive() const { return m_rxOutputRate.load() != DEFAULT_SAMPLE_RATE; }
     QJsonArray audioEndpointDiagnostics() const;
+    QJsonObject startAutomationAudioCapture(int durationMs,
+                                            const QStringList& points);
+    QJsonObject stopAutomationAudioCapture();
+    QJsonObject automationAudioCaptureSnapshot(bool includePcm) const;
 
     // Client-side PC mic gain (0-100 → 0.0-1.0, applied before Opus encoding)
     void setPcMicGain(int level) { m_pcMicGain.store(qBound(0, level, 100) / 100.0f); }
@@ -199,21 +239,17 @@ public:
     void setMnrStrength(float normalized);
     float mnrStrength() const;
 
-    // Client-side BNR (NVIDIA NIM GPU noise removal)
-    Q_INVOKABLE void setBnrEnabled(bool on);
-    bool bnrEnabled() const { return m_bnrEnabled.load(); }
-    void setBnrAddress(const QString& addr);
-    QString bnrAddress() const { return m_bnrAddress; }
-    void setBnrIntensity(float ratio);
-    float bnrIntensity() const;
-    bool bnrConnected() const;
-
     // Client-side DFNR (DeepFilterNet3 neural noise reduction)
     Q_INVOKABLE void setDfnrEnabled(bool on);
     bool dfnrEnabled() const { return m_dfnrEnabled.load(); }
     void setDfnrAttenLimit(float db);
     float dfnrAttenLimit() const;
     void setDfnrPostFilterBeta(float beta);
+
+    // Optional NVIDIA Maxine AFX GPU denoiser (runtime-loaded; NVIDIA RTX/GeForce).
+    Q_INVOKABLE void setNvAfxEnabled(bool on);
+    bool nvAfxEnabled() const { return m_nvAfxEnabled.load(); }
+    void setNvAfxIntensity(float ratio);
 
     // Client-side parametric EQ. Two instances: one on the RX audio path
     // (post-NR, pre-write to sink), one on the TX path (post-mic, pre-
@@ -449,10 +485,27 @@ public:
     qsizetype rxBufferPeakBytes() const { return m_rxBufferPeakBytes.load(); }
     quint64 rxBufferUnderrunCount() const { return m_rxBufferUnderrunCount.load(); }
     int rxBufferSampleRate() const { return m_rxBufferSampleRate.load(); }
+    int rxPlaybackQueuedMs() const
+    {
+        return m_rxPlaybackQueuedMs.load(std::memory_order_relaxed);
+    }
+    ReceivePresentationAudioQueues receivePresentationAudioQueues() const;
 
     // Local CW sidetone generator — accessor used by RadioModel signal
     // routing and PhoneCwApplet UI bindings.
     CwSidetoneGenerator* cwSidetone() { return m_cwSidetone.get(); }
+
+    // Key BOTH the audible sidetone and the recorder-sidetone generator from one
+    // call so every local CW source (manual keyer, CWX macros, iambic paddle)
+    // drives them in lockstep. The recorder copy is what lets a Client-Side QSO
+    // recording capture the operator's own sent CW/CWX side-tone (#2539).
+    void setCwKeyDown(bool down);
+
+    // Start the CW-sidetone record pump (#2539). CW has no mic-driven
+    // onTxAudioReady, so a free-running timer on the audio thread feeds the
+    // recorder the local sidetone while the radio is keyed for CW. Idempotent;
+    // must be invoked on the audio thread (queued) after moveToThread().
+    void startCwRecordPump();
 
     // Enable/disable the TX-side CW-decode tap (#2417).  When enabled,
     // the sidetone generator's mono signal is mirrored — downsampled
@@ -481,6 +534,18 @@ public:
 public slots:
     // Receives stripped PCM from PanadapterStream::audioDataReady().
     void feedAudioData(const QByteArray& pcm);
+    // Receives decoded KiwiSDR PCM after a clean protocol decoder exists.
+    // Same format as feedAudioData(): 24 kHz stereo float32.
+    void feedKiwiSdrAudioData(const QByteArray& pcm24kStereoFloat);
+    void feedKiwiSdrAudioData(const QString& sourceId,
+                              const QByteArray& pcm24kStereoFloat);
+    void setKiwiSdrAudioEnabled(bool on);
+    void setKiwiSdrAudioSourceEnabled(const QString& sourceId, bool on);
+    void setKiwiSdrAudioSourceGain(const QString& sourceId, float gainPercent);
+    void setKiwiSdrAudioSourceMuted(const QString& sourceId, bool muted);
+    void setKiwiSdrAudioSourcePan(const QString& sourceId, int pan);
+    void setKiwiSdrAudioTransmitMuted(bool muted);
+    void removeKiwiSdrAudioSource(const QString& sourceId);
 
 signals:
     void rxStarted();
@@ -491,10 +556,24 @@ signals:
     void mnrEnabledChanged(bool on);
     void rn2EnabledChanged(bool on);
     void rn2TxEnabledChanged(bool on);   // RN2 on the TX mic pre-amp (#2813)
-    void bnrEnabledChanged(bool on);
-    void bnrConnectionChanged(bool connected);
     void dfnrEnabledChanged(bool on);
+    void nvAfxEnabledChanged(bool on);
     void txRawPcmReady(const QByteArray& pcm);  // raw 24kHz stereo int16 PCM for RADEEngine
+    // Post-final-limiter TX monitor PCM (24 kHz stereo int16) — the exact stream
+    // packetised to the radio. Fires for all phone/SSB TX (unlike txRawPcmReady,
+    // which is RADE-only), so it is the source for Client-Side TX recording:
+    // connect to QsoRecorder::feedTxAudio (#3556). Emitted from the audio thread;
+    // receivers connect via Qt::AutoConnection (queued across threads).
+    void txFinalMonitorPcmReady(const QByteArray& int16Stereo);
+    // Local CW/CWX sidetone for the Client-Side QSO recorder (#2539), 24 kHz
+    // stereo int16 — the recorder's native WAV format. Pumped on the audio
+    // thread while the radio is keyed for CW (no mic-driven onTxAudioReady in
+    // CW). Connect to QsoRecorder::feedTxAudio.
+    void cwSidetoneRecordPcmReady(const QByteArray& int16Stereo);
+    // True while WE are sending CW (radio keyed + our keyer active), so the
+    // recorder opens its TX gate for CW the same way moxChanged does for voice.
+    // Ownership-correct: driven by our local keyer, not any-owner interlock.
+    void cwRecordingActiveChanged(bool active);
     void txPacketReady(const QByteArray& vitaPacket);  // VITA-49 TX packet for PanadapterStream
     // Sidetone-tapped audio for the TX-side CW decoder (#2417).  Emitted
     // from the audio thread; receivers should connect via Qt::AutoConnection
@@ -503,6 +582,14 @@ signals:
     // RX panStream::audioDataReady() path so CwDecoder::feedAudio()
     // accepts it without a separate adapter.
     void txDecodeAudioReady(const QByteArray& pcm24kStereoFloat);
+    void receivePresentationPostDspAudioReady(const QString& source,
+                                              const QString& sourceId,
+                                              const QByteArray& pcmStereoFloat,
+                                              int sampleRate);
+    void receivePresentationOutputAudioReady(const QString& source,
+                                             const QString& sourceId,
+                                             const QByteArray& pcmStereoFloat,
+                                             int sampleRate);
 
     void pcMicLevelChanged(float peakDbfs, float avgDbfs);  // client-side PC mic metering
     void scopeSamplesReady(const QByteArray& monoFloat32Pcm, int sampleRate, bool tx);
@@ -531,8 +618,50 @@ signals:
 
 private slots:
     void onTxAudioReady();
+    // CW-sidetone record pump tick (#2539): while the radio is keyed for CW,
+    // render the local sidetone and feed it to the QSO recorder.
+    void onCwRecordPump();
 
 private:
+    enum class RxAudioBuffer {
+        Main,
+        KiwiSdr,
+    };
+
+    enum class RxDspSource {
+        Main,
+        KiwiSdr,
+    };
+
+    struct ExternalRxAudioSourceState {
+        QString id;
+        QByteArray rxBuffer;
+        std::deque<QByteArray> rxPackets;
+        QByteArray outputBuffer;
+        std::vector<float> nr2Mono;
+        std::vector<float> nr2Processed;
+        QByteArray nr2Output;
+        std::unique_ptr<SpectralNR> nr2;
+        std::unique_ptr<Resampler> rxResampler;
+        std::unique_ptr<Resampler> rxResamplerR;
+        float gain{1.0f};
+        int pan{50};
+        int presentationDelayMs{0};
+        bool enabled{false};
+        bool muted{false};
+        bool prebuffering{false};
+    };
+
+    struct AutomationAudioCaptureChunk {
+        QString point;
+        QString source;
+        QString sourceId;
+        int sampleRate{DEFAULT_SAMPLE_RATE};
+        int channels{2};
+        qint64 startNs{0};
+        QByteArray pcm;
+    };
+
     QAudioFormat makeFormat() const;
     float computeRMS(const QByteArray& pcm) const;
     QByteArray applyBoost(const QByteArray& pcm, float gain) const;
@@ -544,9 +673,31 @@ private:
     void emitTxPostChainScopeFromFloat32Stereo(const QByteArray& pcm, int sampleRate);
     void emitRxPostChainScopeFromFloat32Stereo(const QByteArray& pcm, int sampleRate);
     void emitTncRxTapFromFloat32Stereo(const QByteArray& pcm, int sampleRate);
-    QByteArray resampleStereo(const QByteArray& pcm);
-    void processNr2(const QByteArray& stereoPcm);
+    QByteArray resampleStereo(const QByteArray& pcm,
+                              RxDspSource source = RxDspSource::Main,
+                              ExternalRxAudioSourceState* externalSource = nullptr);
+    void processRxAudioData(const QByteArray& pcm, bool emitTncTap,
+                            RxAudioBuffer targetBuffer = RxAudioBuffer::Main);
+    void processMixedRxAudioData(const QByteArray& pcm,
+                                 RxDspSource source = RxDspSource::Main,
+                                 ExternalRxAudioSourceState* externalSource = nullptr);
+    void captureAutomationAudio(const QString& point,
+                                const QString& source,
+                                const QString& sourceId,
+                                const QByteArray& pcm,
+                                int sampleRate,
+                                int channels);
+    void processNr2(const QByteArray& stereoPcm,
+                    RxDspSource source = RxDspSource::Main,
+                    ExternalRxAudioSourceState* externalSource = nullptr);
     void updateRxBufferStats();
+    ExternalRxAudioSourceState* externalKiwiSource(const QString& sourceId,
+                                                   bool create);
+    bool kiwiSdrAudioActive() const;
+    bool externalKiwiSourceAudible(const ExternalRxAudioSourceState& source) const;
+    bool anyExternalKiwiAudioEnabled() const;
+    bool anyExternalKiwiBufferQueued() const;
+    qsizetype externalKiwiOutputBufferBytes() const;
     // Apply client-side TX EQ in-place. No-op if disabled. Caller owns data.
     void applyClientEqTxInt16(QByteArray& int16stereo);
     void applyClientEqTxFloat32(QByteArray& float32);
@@ -599,7 +750,7 @@ private:
     QPointer<QIODevice> m_audioDevice;   // sink-owned device, may vanish on hot-unplug
 
     // Dedicated low-latency sink for the local CW sidetone — kept separate
-    // from the RX sink so the RX path keeps its 200 ms jitter cushion.
+    // from the RX sink so the RX path keeps its 100 ms jitter cushion.
     // Backend chosen at start time: PortAudio when HAVE_PORTAUDIO and not
     // disabled by AppSettings["CwSidetoneBackend"]=="QAudioSink"; QAudioSink
     // (push mode, 2 ms timer, 50 ms buffer) otherwise.  See CwSidetoneSinkBackend.h.
@@ -668,7 +819,7 @@ private:
     std::atomic<bool>  m_rxBoost{false};  // 50% software gain boost (#1445)
     std::atomic<float> m_rxOutputTrimDb{0.0f};  // ±12 dB linear trim, post-boost
     std::atomic<int>   m_rxPan{50};       // 0=left, 50=centre, 100=right (#1460)
-    std::atomic<int>   m_rxBufferCapMs{200}; // RX buffer cap in ms (#1505)
+    std::atomic<int>   m_rxBufferCapMs{100}; // RX buffer cap in ms (#1505; default lowered 200->100 for #3193)
     std::atomic<bool>  m_muted{false};
     // RX sink device rate (negotiated via AudioFormatNegotiator). Audio is
     // resampled from the 24k canonical rate up to this when they differ (#3306).
@@ -680,6 +831,23 @@ private:
     std::unique_ptr<Resampler> m_rxResamplerR;      // 24k→device rate, R channel — kept in sync with m_rxResampler
     std::unique_ptr<Resampler> m_radeRxResampler;   // separate 24k→device rate for RADE decoded speech
     std::unique_ptr<CwSidetoneGenerator> m_cwSidetone;  // local CW sidetone, mixed into RX drain
+    // Second, recorder-only CW sidetone generator at the 24 kHz recorder rate.
+    // Keyed in lockstep with m_cwSidetone via setCwKeyDown(); the CW record pump
+    // (onCwRecordPump) renders it to the QSO recorder while the radio is keyed
+    // for CW, so a Client-Side recording carries the operator's sent CW/CWX
+    // (#2539). Always enabled at a fixed level so it records even when the
+    // audible sidetone is off/low (operator monitoring CW via the radio).
+    std::unique_ptr<CwSidetoneGenerator> m_cwRecordSidetone;
+    std::vector<float> m_cwRecordSidetoneScratch;       // int16<->float render scratch
+    // CW record pump state (#2539). The pump free-runs on the audio thread;
+    // m_cwKeyedThisOver latches when our keyer fires (set in setCwKeyDown, reset
+    // on the radio TX→RX edge) so the pump excludes voice/DAX/tune overs that
+    // never key the sidetone. m_cwPumpElapsed drives wall-clock-accurate frame
+    // counts so morse timing in the recording matches real time.
+    QTimer*            m_cwRecordPump{nullptr};
+    QElapsedTimer      m_cwPumpElapsed;
+    bool               m_cwPumpActive{false};            // audio-thread only
+    std::atomic<bool>  m_cwKeyedThisOver{false};
     // Atomic gate for the TX-side CW decode tap (#2417).  Flipped from
     // MainWindow on MOX / CwDecodeTxEnabled changes; checked on the
     // sidetone audio thread so the mirror lambda can return cheaply
@@ -706,6 +874,7 @@ private:
 
     // Client-side NR2 (spectral)
     std::unique_ptr<SpectralNR> m_nr2;
+    std::unique_ptr<SpectralNR> m_kiwiSdrNr2;
     std::atomic<bool> m_nr2Enabled{false};
     // Client-side NR4 (libspecbleach)
 #ifdef HAVE_SPECBLEACH
@@ -733,21 +902,18 @@ private:
     // Audio-thread only — grows once to steady state, then alloc-free.
     QByteArray m_rn2TxF32In;
 
-    // Client-side BNR (NVIDIA NIM)
-    std::unique_ptr<NvidiaBnrFilter> m_bnr;
-    std::unique_ptr<Resampler> m_bnrUp;    // 24k→48k mono
-    std::unique_ptr<Resampler> m_bnrDown;  // 48k→24k mono
-    std::atomic<bool> m_bnrEnabled{false};
-    QString m_bnrAddress{"localhost:8001"};
-    QByteArray m_bnrOutBuf;  // jitter buffer: denoised 24kHz stereo int16
-    bool m_bnrPrimed{false}; // true after enough denoised data accumulated
-    void processBnr(const QByteArray& stereoPcm);
-
     // Client-side DFNR (DeepFilterNet3)
 #ifdef HAVE_DFNR
     std::unique_ptr<DeepFilterFilter> m_dfnr;
 #endif
     std::atomic<bool> m_dfnrEnabled{false};
+
+    // Optional NVIDIA AFX GPU denoiser (runtime-loaded; flag always present so
+    // mutual-exclusion in the other NR setters compiles regardless of the build).
+#ifdef HAVE_NVIDIA_AFX
+    std::unique_ptr<NvidiaAfxFilter> m_nvAfx;
+#endif
+    std::atomic<bool> m_nvAfxEnabled{false};
 
     // Client-side parametric EQ, independent instances for RX and TX.
     std::unique_ptr<ClientEq> m_clientEqRx;
@@ -845,6 +1011,9 @@ private:
     std::vector<float> m_nr2Mono;
     std::vector<float> m_nr2Processed;
     QByteArray m_nr2Output;
+    std::vector<float> m_kiwiSdrNr2Mono;
+    std::vector<float> m_kiwiSdrNr2Processed;
+    QByteArray m_kiwiSdrNr2Output;
 
     // Zombie sink watchdog: tracks consecutive RX timer ticks where we have
     // data to write but bytesFree() == 0, indicating a stale WASAPI handle.
@@ -878,12 +1047,51 @@ private:
 
     // RX audio buffer handling
     QTimer*       m_rxTimer{nullptr};
-    QByteArray    m_rxBuffer;
-    QByteArray    m_radeRxBuffer;  // decoded RADE speech; mixed into drain output, never appended to m_rxBuffer
+    QByteArray    m_rxBuffer;  // normal Flex RX source audio at 24 kHz, pre-DSP
+    std::deque<QByteArray> m_rxPackets;  // whole Flex packets for NR2 packet-mode
+    QByteArray    m_kiwiSdrRxBuffer;  // decoded Kiwi source audio at 24 kHz, pre-DSP
+    std::deque<QByteArray> m_kiwiSdrRxPackets;  // whole Kiwi packets for NR2 packet-mode
+    QByteArray    m_rxOutputBuffer;  // post-DSP speaker audio at output device rate
+    QByteArray    m_kiwiSdrOutputBuffer;  // post-DSP Kiwi speaker audio at output device rate
+    QByteArray    m_radeRxBuffer;  // decoded RADE speech at output device rate
+    std::atomic<bool> m_kiwiSdrAudioEnabled{false};
+    std::atomic<bool> m_kiwiSdrAudioTransmitMuted{false};
+    std::atomic<int>  m_flexReceivePresentationDelayMs{0};
+    std::atomic<int>  m_kiwiReceivePresentationDelayMs{0};
+    QString           m_externalKiwiReceivePresentationDelaySourceId;
+    int               m_externalKiwiReceivePresentationDelayMs{0};
+    std::atomic<bool> m_rxPresentationPrebuffering{false};
+    std::atomic<bool> m_kiwiSdrPrebuffering{false};
+    std::vector<std::unique_ptr<ExternalRxAudioSourceState>> m_externalKiwiSources;
     std::atomic<qsizetype> m_rxBufferBytes{0};
     std::atomic<qsizetype> m_rxBufferPeakBytes{0};
     std::atomic<quint64>   m_rxBufferUnderrunCount{0};
     std::atomic<int>       m_rxBufferSampleRate{DEFAULT_SAMPLE_RATE};
+    std::atomic<int>       m_rxPlaybackQueuedMs{0};
+    // Cached on the audio thread; diagnostics may read from GUI/automation.
+    std::atomic<int>       m_receivePresentationPlaybackQueuedMs{0};
+    std::atomic<int>       m_receivePresentationFlexRawBufferMs{0};
+    std::atomic<int>       m_receivePresentationFlexOutputBufferMs{0};
+    std::atomic<int>       m_receivePresentationKiwiSdrRawBufferMs{0};
+    std::atomic<int>       m_receivePresentationKiwiSdrOutputBufferMs{0};
+    std::atomic<int>       m_receivePresentationExternalKiwiRawBufferMs{0};
+    std::atomic<int>       m_receivePresentationExternalKiwiOutputBufferMs{0};
+    mutable std::mutex     m_automationAudioCaptureMutex;
+    std::atomic<bool>      m_automationAudioCaptureActive{false};
+    bool                   m_automationCaptureRaw{false};
+    bool                   m_automationCapturePost{false};
+    bool                   m_automationCaptureOutput{false};
+    bool                   m_automationCaptureFinal{false};
+    qint64                 m_automationCaptureStartNs{0};
+    qint64                 m_automationCaptureEndNs{0};
+    qsizetype              m_automationCaptureBytes{0};
+    qsizetype              m_automationCaptureMaxBytes{0};
+    QVector<AutomationAudioCaptureChunk> m_automationCaptureChunks;
+    static constexpr int   kKiwiSdrJitterTargetMs = 360;
+    static constexpr int   kKiwiSdrBufferCapMs = 1000;
+    void resetRxChainStateForSourceSwitch();
+    std::unique_ptr<Resampler> m_kiwiSdrRxResampler;
+    std::unique_ptr<Resampler> m_kiwiSdrRxResamplerR;
 
     // VITA-49 TX constants
     static constexpr int    TX_SAMPLES_PER_PACKET = 128;  // audio frames per packet

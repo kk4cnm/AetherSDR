@@ -24,19 +24,25 @@
 #include "MemoryEntry.h"
 #include "ModelCapabilities.h"
 #include "RadioStatusOwnership.h"
+#include "DisplayInventoryPolicy.h"
 
 #include <QObject>
 #include <QString>
 #include <QList>
 #include <QJsonObject>
+#include <QHash>
 #include <QMap>
 #include <QSet>
 #include <functional>
+#include <memory>
 
 #include <QTimer>
 #include <QElapsedTimer>
 
 namespace AetherSDR {
+
+class IRadioBackend;   // aetherd RFC §5.5 radio-facing seam (owned via unique_ptr below)
+class FlexBackend;     // transitional concrete alias for 2.3 status-decode driving
 
 // RadioModel is the central data model for a connected radio.
 // It owns the RadioConnection, processes incoming status messages,
@@ -145,26 +151,35 @@ public:
     }
 
     // Returns true for BigBend/DragonFire-platform radios (8400, 8600,
-    // AU-series, ML-series, CL-series, RT-series) that support the extended
+    // AU-/ML-/MLS-/CL-/CLS- series, RT-2122) that support the extended
     // firmware DSP filters (NRL, NRS, RNN, NRF).  6000-series radios don't
     // expose these filters and the UI hides them when this returns false. (#2177)
+    //
+    // Delegates to the FlexLib-sourced ModelCapabilities platform table
+    // (Principle I) instead of ad-hoc substring checks — the old prefix form
+    // silently missed the "S" server variants (MLS-9601 doesn't contain "ML-";
+    // CLS-9301 doesn't contain "CL-") and was case-sensitive.
     bool hasExtendedDspFilters() const {
-        return m_model.contains("8400") || m_model.contains("8600")
-            || m_model.contains("AU-")  || m_model.contains("ML-")
-            || m_model.contains("CL-")  || m_model.contains("RT-");
+        return capabilitiesFor(m_model).hasExtendedDsp();
     }
 
-    // Max panadapters supported by this radio model.
-    // FLEX-6700: 8 (dual SCU, high-capacity)
-    // FLEX-6600 / FLEX-6500 / FLEX-8600 / AU-520: 4 (dual SCU)
-    // All single-SCU models (6300, 6400, etc.): 2
+    // True for 2-SCU radios that support diversity RX, from the FlexLib-sourced
+    // ModelCapabilities table (Principle I).  Replaces the hand-maintained
+    // contains("6500")|... checks, which wrongly enabled diversity on the
+    // single-SCU FLEX-6500 and omitted the ML-/MLS-/CL-/CLS- dual-SCU models.
+    bool isDiversityAllowed() const {
+        return capabilitiesFor(m_model).isDiversityAllowed;
+    }
+
+    // Max panadapters supported by this radio model.  Panadapter capacity
+    // tracks the radio's SCU/slice capacity (identical across every current
+    // model), so this comes from the same FlexLib-sourced ModelCapabilities
+    // table (Principle I) rather than an ad-hoc contains() list — the old list
+    // omitted the dual-SCU ML-/MLS-/CL-/CLS- models, capping them at 2 pans
+    // instead of 4.  Examples: FLEX-6700 -> 8; 6600/6500/8600/AU-520/ML/CL -> 4;
+    // 6300/6400/8400/AU-510/RT-2122 -> 2.
     int maxPanadapters() const {
-        if (m_model.contains("6700"))
-            return 8;
-        if (m_model.contains("6600") || m_model.contains("6500")
-                || m_model.contains("8600") || m_model.contains("AU-520"))
-            return 4;
-        return 2;
+        return capabilitiesFor(m_model).maxSlices;
     }
 
     // Panadapter bandwidth limits by radio model (MHz).
@@ -194,10 +209,16 @@ public:
     bool    extPresent()   const { return m_extPresent; }
     bool    gpsdoPresent() const { return m_gpsdoPresent; }
 
-    // Returns true for FLEX-8000 class (8400, 8600) and Aurora, which have GPS hardware.
+    // True when the radio delivers GPS data: FLEX-8000 class (8400, 8600) and
+    // Aurora by model, or any radio whose "gps" status object has arrived — a
+    // 6000-series with the optional GPSDO reports the same object (and sends
+    // no gpsdo_present oscillator flag, so presence is only detectable from
+    // the data itself).
     bool hasGpsHardware() const {
         return m_model.contains("8400") || m_model.contains("8600")
-               || m_model.startsWith("AU-");
+               || m_model.startsWith("AU-")
+               || (!m_gpsStatus.isEmpty()
+                   && m_gpsStatus != QLatin1String("Not Present"));
     }
     bool    tcxoPresent()  const { return m_tcxoPresent; }
     bool    binauralRx()   const { return m_binauralRx; }
@@ -250,6 +271,7 @@ public:
     const QMap<quint32, QString>& clientStations() const { return m_clientStations; }
     quint32 txClientHandle() const { return m_txClientHandle; }
     quint32 ourClientHandle() const;
+    bool sliceMayBelongToUs(int sliceId) const;
 
     struct ClientInfo {
         QString station;
@@ -260,6 +282,23 @@ public:
         double txFreqMhz{0};
     };
     const QMap<quint32, ClientInfo>& clientInfoMap() const { return m_clientInfoMap; }
+    // #3977: per-source-handle tally of dBm-range writes made by OTHER
+    // clients against pans we own — the #3951 zombie signature. Exposed via
+    // the bridge `get clients` verb; feeds the evidence-based eviction.
+    struct ForeignPanWrite {
+        int count{0};
+        QString panId;   // last pan written
+        qint64 lastMs{0};
+    };
+    const QMap<quint32, ForeignPanWrite>& foreignPanWrites() const { return m_foreignPanWrites; }
+    // Confirmed evictions only — a handle enters this set when the radio
+    // acknowledges the `client disconnect`, never before (#3977).
+    const QSet<quint32>& evictedPredecessorHandles() const { return m_evictedPredecessorHandles; }
+    // #3977: force-disconnecting another client is opt-in
+    // (AppSettings["StaleSessionDefense"].EvictionEnabled, default false);
+    // detection and forensics always run.
+    bool staleSessionEvictionEnabled() const;
+    QString ourStationName() const;
     void    setKnownGuiClients(const QStringList& handles,
                                const QStringList& programs,
                                const QStringList& stations,
@@ -281,9 +320,28 @@ public:
     PanadapterModel* panadapter(const QString& panId) const;
     QList<PanadapterModel*> panadapters() const { return m_panadapters.values(); }
 
+    // Radio-authoritative display inventory vs what we own (#3856 Layer B).
+    // Built from the accumulated "display pan"/"display waterfall" status maps;
+    // surfaces leaked waterfalls (parent pan gone), foreign and orphan objects.
+    DisplayInventory::Report displayInventoryReport() const;
+
+    // Force the radio to re-dump every currently-allocated display object by
+    // re-subscribing to the pan/display domain. The status replies refresh the
+    // Layer-B inventory maps (m_radioDisplayPans/Waterfalls) to the radio's
+    // authoritative present-tense set — re-adding a resource-level lingering
+    // waterfall that stopped emitting UDP and whose client view we already tore
+    // down. Async: callers re-poll displayInventoryReport() after the re-dump
+    // settles (#3856). Returns true if the re-subscribe was sent.
+    bool resyncDisplayInventory();
+
     QList<SliceModel*> slices() const { return m_slices; }
     SliceModel* slice(int id) const;
     int activeTxSliceNum() const;
+    void setPanTransmitInhibited(const QString& panId,
+                                 bool inhibited,
+                                 const QString& reason = {});
+    bool panTransmitInhibited(const QString& panId) const;
+    QString panTransmitInhibitReason(const QString& panId) const;
 
     // Multi-Flex slot occupancy.  These let UI distinguish three slot
     // states for any global slice index: ours (we have a SliceModel for
@@ -356,6 +414,10 @@ public:
     void setWaterfallColorGain(int gain);
     void setWaterfallBlackLevel(int level);
     void setWaterfallAutoBlack(bool on);
+    // Auto-black source: false = client-side estimate (radio auto_black off),
+    // true = radio's per-tile level (radio auto_black on). The radio only
+    // receives auto_black=1 when auto-black is on AND radio-side is selected.
+    void setWaterfallAutoBlackSource(bool radioSide);
     void setWaterfallLineDuration(int ms);
 
     // Display controls — Noise floor
@@ -386,6 +448,8 @@ signals:
     void panadapterInfoChanged(double centerMhz, double bandwidthMhz);
     // Emitted when the radio reports the panadapter's dBm display range.
     void panadapterLevelChanged(float minDbm, float maxDbm);
+    // Emitted when the radio reports FFT pixel height for a panadapter.
+    void panadapterFftScaleChanged(const QString& panId, int yPixels);
     void panadapterAdded(PanadapterModel* pan);
     // Emitted when a previous-session pan model is reclaimed on reconnect
     // instead of created fresh. The applet/widget wiring from the original
@@ -437,6 +501,10 @@ signals:
                           const QString& grid, const QString& altitude,
                           const QString& lat, const QString& lon,
                           const QString& utcTime);
+    // Emitted when the station callsign becomes known or changes (from the
+    // radio "info"/status feed). Lets features like the PSK Reporter map pick
+    // up a late-arriving or edited callsign without a reconnect.
+    void callsignChanged(const QString& callsign);
     // Emitted when the radio reports 10 MHz reference oscillator state.
     void oscillatorChanged();
     // Emitted when network quality assessment changes.
@@ -452,11 +520,23 @@ signals:
     // Raw interlock TX state (regardless of ownership — for DAX passthrough).
     void radioTransmittingChanged(bool transmitting);
     // Short operator-facing interlock warnings for the panadapter overlay.
-    void interlockNotificationRequested(const QString& message);
+    // `key` is the stable, translation-invariant dedup key (e.g. "radio:...",
+    // "pan-tx-inhibit:...") so the UI can classify the notice without sniffing
+    // the localized message text.
+    void interlockNotificationRequested(const QString& message,
+                                        const QString& key,
+                                        const QString& panId);
     // Emitted when global profile list or active profile changes.
     void globalProfilesChanged();
     void profileDatabaseImportingChanged(bool importing);
     void profileDatabaseExportingChanged(bool exporting);
+    // Emitted when a profile load command is sent, before the radio tears down
+    // and rebuilds profile-owned slices/pans.
+    void profileLoadStarted(const QString& profileType, const QString& profileName);
+    // Emitted after the radio accepts a profile load command. Profile recall can
+    // tear down per-session streams; GUI/session code should re-arm client-owned
+    // state from this signal instead of guessing from later status churn.
+    void profileLoadCompleted(const QString& profileType, const QString& profileName);
 
     // Emitted when the radio reports a change to the global Auto-Save
     // profile setting (radio status field "auto_save").  UI consumers
@@ -524,6 +604,7 @@ private:
     void handleProfileStatus(const QString& object, const QMap<QString, QString>& kvs);
     void handleProfileStatusRaw(const QString& profileType, const QString& rawBody);
     void traceDaxStreamStatus(const QString& object, const QMap<QString, QString>& kvs);
+    void handleDaxRxStreamRegistry(const QString& object, const QMap<QString, QString>& kvs);
     bool handleRemoteAudioRxStreamStatus(const QString& object,
                                          const QMap<QString, QString>& kvs);
     void scheduleRxAudioStreamEnsure(const QString& reason);
@@ -531,6 +612,12 @@ private:
 
     void configurePan(const QString& panId);
     void configureWaterfall(const QString& waterfallId);
+    // Sends the radio auto_black flag from the combined auto-black on/off +
+    // client/radio-source state (auto_black=1 only when both select radio-side).
+    void applyWaterfallAutoBlack();
+    bool m_wfAutoBlackOn{true};         // mirrors the client auto-black on/off
+    bool m_wfAutoBlackRadioSide{false}; // false = client-side, true = radio-side
+    bool profileLoadRadioStateWritesHeld() const;
     void registerAsGuiClient(const QString& clientId);
     void disconnectPendingClientsThen(std::function<void()> continuation);
     // LAN-only: subscribe to radio+client topics early, wait 400 ms for
@@ -583,14 +670,23 @@ private:
     void stageSessionModelsForReconnect();
     void pruneStaleSessionModels(quint64 generation);
 
-    RadioConnection*  m_connection{nullptr};
-    QThread*          m_connThread{nullptr};
+    // aetherd RFC step 2 (§5.5): the radio-facing seam. Held via std::unique_ptr
+    // (owned via unique_ptr below). As of 2.2b it OWNS the RadioConnection +
+    // PanadapterStream and their worker threads; RadioModel keeps the two
+    // NON-OWNING pointers below, obtained from the backend at construction.
+    std::unique_ptr<IRadioBackend> m_backend;
+    // Transitional (aetherd RFC 2.3): RadioModel drives the backend's Flex
+    // status decode from its status choke points while touchpoints convert
+    // one at a time. Non-owning alias of m_backend; goes away once the backend
+    // owns status ingress (the protocol step). Concrete type because the decode
+    // input is vendor-specific; the outputs are normalized interface signals.
+    FlexBackend* m_flexBackend{nullptr};
+    RadioConnection*  m_connection{nullptr};   // non-owning — owned by m_backend
     // Sequence counter and callback map — owned by RadioModel on main thread.
     // RadioConnection no longer manages callbacks. (#502)
     std::atomic<quint32> m_seqCounter{1};
     QMap<quint32, ResponseCallback> m_pendingCallbacks;
-    PanadapterStream* m_panStream{nullptr};
-    QThread*          m_networkThread{nullptr};
+    PanadapterStream* m_panStream{nullptr};    // non-owning — owned by m_backend
     // Sub-models — value members on main thread (#502)
     MeterModel       m_meterModel;
     TunerModel       m_tunerModel;
@@ -688,7 +784,30 @@ private:
 
     QMap<QString, PanadapterModel*> m_panadapters;  // panId → model
     QMap<QString, PanadapterModel*> m_stalePanadapters;  // previous session, kept alive for UI reuse
+    // #3977: eviction bookkeeping, all cleared on disconnect (handles are
+    // radio-boot-scoped and recycled). m_evictedPredecessorHandles holds
+    // radio-CONFIRMED disconnects; m_evictionsInFlight guards double-sends
+    // while a `client disconnect` reply is pending.
+    QSet<quint32> m_evictedPredecessorHandles;
+    QSet<quint32> m_evictionsInFlight;
+    QMap<quint32, ForeignPanWrite> m_foreignPanWrites;
+    void noteForeignPanWriteIfAny(const QString& object,
+                                  const QMap<QString, QString>& kvs,
+                                  quint32 sourceHandle);
+    void evictStaleSession(quint32 handle, const QString& reason);
     QString m_activePanId;       // currently active panadapter
+
+    // Radio-authoritative display inventory (#3856 Layer B). Accumulated from
+    // ALL "display pan"/"display waterfall" status (ours, foreign, and orphan),
+    // pruned on the matching "removed" — independent of m_panadapters, which only
+    // holds objects WE own. A leaked waterfall (panafall closed without
+    // "display panafall remove") therefore lingers here after its pan is pruned,
+    // making it detectable even when the radio has stopped streaming it.
+    // Main-thread only (written in onStatusReceived, read in the bridge).
+    struct RadioDisplayPan { quint32 clientHandle{0}; QString waterfallId; };
+    struct RadioDisplayWf  { quint32 clientHandle{0}; QString parentPanId; };
+    QMap<QString, RadioDisplayPan> m_radioDisplayPans;        // panId → entry
+    QMap<QString, RadioDisplayWf>  m_radioDisplayWaterfalls;  // wfId  → entry
     // Deferred "display pan" status pending ownership confirmation. Paired
     // with QDateTime::currentSecsSinceEpoch() at insert so a sweep on insert
     // can drop entries that the radio never resolved with a client_handle
@@ -730,6 +849,7 @@ private:
         bool    tx3{false};
     };
     QMap<int, TxBandInfo> m_txBandSettings;
+    QHash<QString, QString> m_panTransmitInhibitReasons;
     int  m_tuneInhibitBandId{-1};  // band ID whose TX outputs were inhibited during tune
     bool m_tuneInhibitActive{false};
 
@@ -737,12 +857,20 @@ private:
     void applyTuneInhibit();    // suppress selected TX outputs before tune
     void restoreTuneInhibit();  // re-enable TX outputs after tune
     SliceModel* txSlice() const;
+    QString transmitInhibitMessageForSlice(const SliceModel* slice) const;
+    QString transmitInhibitMessageForTxSlice() const;
+    void enforceTransmitInhibitForPan(const QString& panId);
+    void enforceTransmitInhibitForSlice(SliceModel* slice);
+    bool transmitStartBlockedByInhibit(const QString& key);
+    void sendSliceCommand(SliceModel* slice, const QString& cmd);
     QString localPttInterlockMessage(TransmitModel::PttSource source) const;
     QString txFilterFrequencyLimitMessage(int lowHz, int highHz) const;
     QString radioInterlockNotificationMessage(const QMap<QString, QString>& kvs) const;
     void armInterlockNotification(TransmitModel::PttSource source = TransmitModel::PttSource::Mox);
     bool interlockNotificationArmed() const;
-    void emitInterlockNotification(const QString& message, const QString& key);
+    void emitInterlockNotification(const QString& message,
+                                   const QString& key,
+                                   const QString& panId = QString());
 
 public:
     const QMap<int, TxBandInfo>& txBandSettings() const { return m_txBandSettings; }
@@ -796,6 +924,14 @@ private:
     // Reclaim-by-ID is only valid against the same radio — slice indexes and
     // stream IDs collide near-certainly across different radios.
     QString m_staleSessionSerial;
+    // #3977: OUR handle from the PREVIOUS session (captured at registration
+    // into m_ownSessionHandle, consumed at stage time). Reclaim eviction must
+    // only fire when the staged pan still records THIS handle — pan status
+    // parsing (client_handle) can legitimately rewrite a pan's owner to
+    // another live client before we disconnect (ownership transfer), and
+    // evicting that client would kick a healthy session, not a zombie.
+    quint32 m_staleSessionOwnHandle{0};
+    quint32 m_ownSessionHandle{0};   // this session's handle, set at registration
     QMap<int, MemoryEntry> m_memories;
     QStringList m_globalProfiles;
     QString     m_activeGlobalProfile;
@@ -833,6 +969,7 @@ private:
     bool               m_fullDuplex{false};
     int                m_rttyMarkDefault{2125};
     quint32            m_txClientHandle{0};  // handle of the client that owns TX
+    qint64             m_profileLoadRadioStateWriteHoldUntilMs{0};
     QMap<quint32, ClientInfo> m_clientInfoMap; // handle → full client info
     std::function<void()> m_multiFlexContinuation; // saved continuation during conflict pause
     QMap<quint32, QString> m_clientStations;   // handle → station name (legacy, kept in sync)
@@ -891,11 +1028,14 @@ private:
     NetState      m_netState{NetState::Off};
     int           m_pingMissCount{0};          // consecutive unanswered pings
     bool          m_pingDisconnectTriggered{false};
+    qint64        m_lastMultiFlexClientConnectMs{0};
+    qint64        m_multiFlexPingGraceUntilMs{0};
     // Normal: disconnect after 5 unanswered pings (~5 s).
     // Poor: allow 15 (~15 s) — adaptive throttle has already cut UDP load, so
     // brief TCP stalls are more likely to be transient congestion than a dead link.
     static constexpr int PING_MISS_DISCONNECT      = 5;
     static constexpr int PING_MISS_DISCONNECT_POOR = 15;
+    static constexpr qint64 MULTIFLEX_CLIENT_CONNECT_PING_GRACE_MS = 5000;
     // Minimum time at a throttled state before the throttle is allowed to lift.
     // Prevents Good<->VeryGood oscillation: reducing fps lowers UDP load which
     // improves the score, which would immediately lift the throttle and restart

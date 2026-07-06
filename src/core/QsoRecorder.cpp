@@ -1,5 +1,6 @@
 #include "QsoRecorder.h"
 #include "AppSettings.h"
+#include "AudioDeviceNegotiator.h"
 #include "LogManager.h"
 #include "Resampler.h"
 #include "../models/SliceModel.h"
@@ -124,28 +125,52 @@ static QByteArray float32ToInt16(const QByteArray& pcm)
 
 void QsoRecorder::feedRxAudio(const QByteArray& pcm)
 {
+    // Lock-free fast path off the real-time audio thread: skip the mutex when
+    // we're not recording an RX over, so a GUI thread holding m_writeMutex
+    // during finalize/stop can't stall audio. The post-lock check stays
+    // authoritative (m_recording/m_transmitting can flip after this read).
+    if (!m_recording.load(std::memory_order_acquire)
+        || m_transmitting.load(std::memory_order_acquire))
+        return;
     std::lock_guard<std::mutex> lock(m_writeMutex);
-    if (!m_recording || !m_file) return;
+    // While transmitting the radio mutes RX (this stream would be silence), and
+    // the TX monitor is recorded instead — skip RX so the two don't double-write
+    // and the file stays a clean time-interleaved RX/TX stream (#3556).
+    if (!m_recording || !m_file || m_transmitting.load(std::memory_order_acquire)) return;
     QByteArray converted = float32ToInt16(pcm);
     m_file->write(converted);
     m_dataBytes += static_cast<quint32>(converted.size());
 }
 
-void QsoRecorder::feedTxAudio(const QByteArray& pcm)
+void QsoRecorder::feedTxAudio(const QByteArray& int16Stereo)
 {
+    // Lock-free fast path: the CW record pump calls this ~100×/s from the
+    // real-time audio thread. Skip the mutex when we're not recording a TX over
+    // so a GUI thread holding m_writeMutex during finalize/stop can't stall
+    // audio (xrun). The post-lock check stays authoritative.
+    if (!m_recording.load(std::memory_order_acquire)
+        || !m_transmitting.load(std::memory_order_acquire))
+        return;
     std::lock_guard<std::mutex> lock(m_writeMutex);
-    if (!m_recording || !m_file) return;
-    QByteArray converted = float32ToInt16(pcm);
-    m_file->write(converted);
-    m_dataBytes += static_cast<quint32>(converted.size());
+    // Only capture the TX monitor while actually transmitting (the tap can fire
+    // whenever mic capture runs), so RX and TX never both write.
+    if (!m_recording || !m_file || !m_transmitting.load(std::memory_order_acquire)) return;
+    // The post-limiter TX monitor is already 24 kHz stereo int16 — the WAV's
+    // native format — so write it directly, no float32 conversion (#3556).
+    m_file->write(int16Stereo);
+    m_dataBytes += static_cast<quint32>(int16Stereo.size());
 }
 
 // ── TX state tracking ───────────────────────────────────────────────────────
 
 void QsoRecorder::onMoxChanged(bool mox)
 {
+    // Gate RX vs TX writes (#3556). Set before any early-return so the feed
+    // slots see the correct state immediately on the TX/RX edge.
+    m_transmitting.store(mox, std::memory_order_release);
+
     // Only auto-record when in client-side recording mode
-    bool clientSide = AppSettings::instance().value("RecordingMode", "Radio").toString() == "Client";
+    bool clientSide = AppSettings::instance().value("RecordingMode", "Client").toString() == "Client";
     if (mox) {
         // TX started — begin recording if auto-record is on and not already recording
         if (clientSide && m_autoRecord && !m_recording)
@@ -380,28 +405,50 @@ void QsoRecorder::startPlayback()
     }
     if (dev.isNull()) return;
 
+    // Negotiate the playback format via the shared factory (#3306, Phase 6b).
+    // The recording is Int16, so prefer Int16 (no conversion on a normal device)
+    // and fall back to Float for Float-only WASAPI mixers — the Int16->Float
+    // conversion below handles that (#3231). The factory supplies the per-OS
+    // preferred rate (Win/Mac 48k to dodge the WASAPI 24k resampler artifacts
+    // #2120; Linux native 24k) plus the 44.1k and preferredFormat fallbacks.
+    // Previously QSO playback bailed on a Float-only device; now it works.
+    // Walk with isFormatSupported (trusted), mirroring ClientPuduMonitor.
     QAudioFormat fmt;
-    fmt.setChannelCount(NUM_CHANNELS);
-    fmt.setSampleFormat(QAudioFormat::Int16);
-    fmt.setSampleRate(SAMPLE_RATE);
     int sinkRate = SAMPLE_RATE;
-
-    if (!dev.isFormatSupported(fmt)) {
-        fmt.setSampleRate(48000);
-        sinkRate = 48000;
-        if (!dev.isFormatSupported(fmt)) {
-            // Try 44.1 kHz Int16 before giving up on Int16 — some Windows
-            // output devices (HFP/SCO routes, certain USB DACs) reject 48 kHz
-            // outright but accept 44.1 kHz.  Mirrors ClientPuduMonitor's
-            // 24/48/44.1 ladder so QSO recording playback doesn't bail on
-            // devices where monitor playback succeeds (#3385).
-            fmt.setSampleRate(44100);
-            sinkRate = 44100;
-            if (!dev.isFormatSupported(fmt)) return;
+    bool haveFormat = false;
+    const QList<QAudioFormat> ladder = AudioDeviceNegotiator::formatLadder(
+        dev, AudioFormatNegotiator::Direction::Output,
+        AudioFormatNegotiator::ResamplerPolicy::PreservePan,
+        AudioFormatNegotiator::hostTargetOs(),
+        AudioFormatNegotiator::kInternalRate,
+        /*bluetoothHfp=*/false, /*preferredRateOverride=*/0,
+        AudioFormatNegotiator::FormatPreference::Int16First);
+    for (const QAudioFormat& cand : ladder) {
+        QAudioFormat c = cand;
+        c.setChannelCount(NUM_CHANNELS);
+        if (dev.isFormatSupported(c)) {
+            fmt = c;
+            sinkRate = c.sampleRate();
+            haveFormat = true;
+            break;
         }
     }
+    if (!haveFormat) return;
 
     if (!preparePlaybackPcm(sinkRate)) return;
+
+    // Float-only WASAPI mixers reject Int16 — convert the Int16 playback PCM to
+    // Float32 to match the negotiated sink format (#3231 / Phase 6b), mirroring
+    // ClientPuduMonitor. Only Float32 is handled (the only non-Int16 format
+    // preferredFormat() returns in practice on WASAPI/CoreAudio).
+    if (fmt.sampleFormat() == QAudioFormat::Float) {
+        const int samples = m_playPcm.size() / static_cast<int>(sizeof(int16_t));
+        QByteArray floatPcm(samples * static_cast<int>(sizeof(float)), '\0');
+        const auto* src = reinterpret_cast<const int16_t*>(m_playPcm.constData());
+        auto*       dst = reinterpret_cast<float*>(floatPcm.data());
+        for (int i = 0; i < samples; ++i) dst[i] = src[i] / 32768.0f;
+        m_playPcm = std::move(floatPcm);
+    }
 
     m_playBuffer.close();
     m_playBuffer.setBuffer(&m_playPcm);
@@ -415,6 +462,24 @@ void QsoRecorder::startPlayback()
     connect(m_playSink, &QAudioSink::stateChanged,
             this, &QsoRecorder::onPlaybackSinkState);
     m_playSink->start(&m_playBuffer);
+
+    // Detect an immediate open failure (e.g. a WASAPI/CoreAudio device that
+    // false-positives isFormatSupported() then refuses at start()) BEFORE we
+    // mute live RX. If start() failed synchronously, the stateChanged handler
+    // already ran stopPlayback() but it no-op'd (m_playing was still false), so
+    // we must clean up here. Crucially we return *before* emitting
+    // muteRxRequested(true), so a failed playback can never strand live RX in a
+    // muted state (#3230 invariant) — mirrors ClientPuduMonitor::startPlayback().
+    if (m_playSink->state() == QAudio::StoppedState
+        && m_playSink->error() != QAudio::NoError) {
+        qCWarning(lcAudio) << "QsoRecorder: playback sink failed to start (error"
+                           << m_playSink->error() << ") — aborting, RX left live";
+        m_playSink->disconnect(this);
+        m_playSink->deleteLater();
+        m_playSink = nullptr;
+        if (m_playBuffer.isOpen()) m_playBuffer.close();
+        return;
+    }
 
     m_playing = true;
     emit muteRxRequested(true);

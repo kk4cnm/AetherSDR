@@ -1,22 +1,28 @@
 #include "gui/MainWindow.h"
+#include "gui/ConnectionPanel.h"
 #include "gui/SliceColorManager.h"
 #include "core/AppSettings.h"
+#include "core/GpuSelector.h"
 #include "core/LogManager.h"
 #include "core/MacMicPermission.h"
 #ifdef Q_OS_ANDROID
 #include "core/AndroidMulticastLock.h"
 #include <QPermissions>
 #endif
+#include "core/AutomationServer.h"
 
 #include <QApplication>
 #include <QSurfaceFormat>
+#include <memory>
 #include <QStyleFactory>
 #include <QDir>
 #include <QDebug>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFontDatabase>
 #include <QDateTime>
 #include <QStandardPaths>
+#include <QTimer>
 
 #ifdef _WIN32
 #include <io.h>
@@ -66,8 +72,10 @@ static int aetherTolerantX11ErrorHandler(AetherX11Display*, AetherX11ErrorEvent*
 #include <windows.h>
 // Request discrete GPU on hybrid laptops (NVIDIA Optimus / AMD PowerXpress).
 // Intel iGPU D3D11 driver corrupts its stack during QRhiWidget reparenting (#1921).
-extern "C" __declspec(dllexport) DWORD NvOptimusEnablement             = 1;
-extern "C" __declspec(dllexport) int   AmdPowerXpressRequestHighPerformance = 1;
+extern "C" {
+__declspec(dllexport) DWORD NvOptimusEnablement             = 1;
+__declspec(dllexport) int   AmdPowerXpressRequestHighPerformance = 1;
+}
 #endif // Q_OS_WIN
 
 static void messageHandler(QtMsgType type, const QMessageLogContext& ctx, const QString& msg)
@@ -85,6 +93,11 @@ int main(int argc, char* argv[])
     if (qEnvironmentVariableIsSet("AETHER_NO_GPU")) {
         qputenv("QT_OPENGL", "software");
     }
+
+    // Render-adapter selection on multi-GPU systems.  Must run before the GL/D3D
+    // context is created (i.e. before QApplication): sets PRIME offload (Linux)
+    // or QT_D3D_ADAPTER_INDEX (Windows) from the persisted Display-menu choice.
+    AetherSDR::GpuSelector::applyAtStartup();
 
     // Prefer native Wayland when running under a Wayland session (#1233).
     // Without this, Qt may fall back to XWayland (xcb platform) where GLX
@@ -181,6 +194,31 @@ int main(int argc, char* argv[])
             qWarning("Microphone permission not granted — TX audio unavailable");
     });
 #endif
+
+    // ── Main-thread stall watchdog (diagnostic, log-only) ─────────────────
+    // 250 ms heartbeat on the GUI event loop. If a tick arrives late by more
+    // than the threshold, the main thread was blocked — e.g. the ~2 s
+    // band-change+ATU stall that delays the TCI `vfo:` echo past WSJT-X's
+    // 2000 ms timeout ("TCI failed set rxfreq" → disconnect → dead RX).
+    // The warning fires immediately after the loop unblocks, so the stall's
+    // start ≈ (log timestamp − reported gap), and whatever logs right after
+    // it is what the loop was waiting to do. qWarning → visible at default
+    // log levels.
+    {
+        static QElapsedTimer s_lastBeat;
+        s_lastBeat.start();
+        auto* heartbeat = new QTimer(&app);
+        QObject::connect(heartbeat, &QTimer::timeout, &app, []() {
+            const qint64 gapMs = s_lastBeat.restart();
+            if (gapMs > 600) {
+                qWarning().nospace()
+                    << "MainThreadWatchdog: event loop stalled ~" << gapMs
+                    << " ms (heartbeat is 250 ms; stall began ~" << gapMs
+                    << " ms before this line)";
+            }
+        });
+        heartbeat->start(250);
+    }
 
     // ── Bundled DSEG fonts (SIL OFL 1.1) ──────────────────────────────────
     // Register the 13 TTFs into QFontDatabase so themes can resolve
@@ -345,6 +383,11 @@ int main(int argc, char* argv[])
     if (logManager.startLogging(logPath, stderrIsTty)) {
         qInstallMessageHandler(messageHandler);
 
+        // Record the GPU-selection decision now the log handler exists
+        // (GpuSelector::applyAtStartup() ran before logging was available).
+        qInfo().noquote() << "GpuSelector: render GPU ->"
+                          << AetherSDR::GpuSelector::appliedSummary();
+
         // Symlink aethersdr.log → latest timestamped file (for Support dialog)
         const QString symlink = logDir + "/aethersdr.log";
 #ifdef Q_OS_UNIX
@@ -395,6 +438,42 @@ int main(int argc, char* argv[])
 #else
         window.show();
 #endif
+
+        // Agent-drivable automation bridge (#3646, Phase 0). Off in production;
+        // starts only when AETHER_AUTOMATION is set. AETHER_AUTOMATION_SOCKET
+        // overrides the QLocalServer name verbatim (explicit, for a driver that
+        // wants a known endpoint). Otherwise the default name is PID-suffixed so
+        // two concurrent automation instances don't steal each other's socket
+        // (QLocalServer::removeServer() unlinks a sibling's live socket on a
+        // shared name); drivers find the right one via the discovery file/dir.
+        std::unique_ptr<AetherSDR::AutomationServer> automation;
+        if (qEnvironmentVariableIsSet("AETHER_AUTOMATION")) {
+            const QString sockName = qEnvironmentVariableIsSet("AETHER_AUTOMATION_SOCKET")
+                ? qEnvironmentVariable("AETHER_AUTOMATION_SOCKET")
+                : QStringLiteral("aethersdr-automation-%1").arg(QCoreApplication::applicationPid());
+            automation = std::make_unique<AetherSDR::AutomationServer>();
+            automation->setRadioModel(&window.radioModel());  // for the get() verb
+            automation->setAudioEngine(window.audioEngine());
+            automation->setQsoRecorder(window.qsoRecorder());  // for the record() verb
+            automation->setConnectionDialogHost(&window);
+            automation->setConnectionAutomation(
+                window.findChild<AetherSDR::ConnectionPanel*>(QStringLiteral("connectionPanel")));
+            automation->setSliceReceiveSourceHandler(
+                [&window](const QString& arg) {
+                    return window.automationSetSliceReceiveSource(arg);
+                });
+            automation->setReceiveSyncSnapshotHandler(
+                [&window]() {
+                    return window.automationReceiveSyncSnapshot();
+                });
+            automation->setKiwiSdrSnapshotHandler(
+                [&window]() {
+                    return window.automationKiwiSdrSnapshot();
+                });
+            if (!automation->start(sockName))
+                automation.reset();
+        }
+
         exitCode = app.exec();
     }
 

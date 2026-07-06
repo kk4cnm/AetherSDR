@@ -7,7 +7,7 @@ as direction changes.
 
 For *what shipped*, see [`CHANGELOG.md`](CHANGELOG.md).
 
-## Current cycle: post-v26.5.2.1
+## Current cycle: post-v26.7.1
 
 ### In flight
 
@@ -19,38 +19,127 @@ For *what shipped*, see [`CHANGELOG.md`](CHANGELOG.md).
   Mechanical migration tooling is the prerequisite work.
 - **TX DSP chain visual rebuild** — stage-per-applet chain with the
   visual `CHAIN` widget as the primary entry point.
-- **H1 Phase 2** ([#2951](https://github.com/aethersdr/AetherSDR/issues/2951))
-  — WAN cert-mismatch dialog + Pinned Certificates settings UI.
-  Phase 1 ships warn-only TOFU capture; Phase 2 makes it enforce.
+- **Flathub submission** — the AppStream metainfo and manpage landed in
+  v26.6.4; the actual Flathub PR + manifest is the remaining step.
 
 ### Queued (next cycle)
 
-- **AetherModem Phase 1** — 1200 baud VHF AX.25 packet TX (data-mode
-  transmit pipeline using the existing DAX TX path).
-- **L1–L4 audit follow-ups** — four low-severity items from the
-  2026-05-09 security pass, tracked as
-  [#2954](https://github.com/aethersdr/AetherSDR/issues/2954)–[#2957](https://github.com/aethersdr/AetherSDR/issues/2957).
+- **KiwiSDR follow-ups** — audio-quality / AGC polish on top of the
+  v26.6.4 public-receiver browser; potential WebSDR / OpenWebRX support.
 - **Extended region band plans** — DXCC entities outside IARU R1/R2/R3.
-- **macOS shmem + RigctlPty audit** ([#2940](https://github.com/aethersdr/AetherSDR/issues/2940))
-  — focused security review of VirtualAudioBridge (macOS) and
-  RigctlPty (Linux + macOS), follow-up to the audit that found H2.
+- **macOS VirtualAudioBridge audit** ([#2940](https://github.com/aethersdr/AetherSDR/issues/2940))
+  — focused security review of the macOS shared-memory audio bridge.
+  (The RigctlPty side is resolved — RigctlPty was removed in #3380.)
+
+### Larger feature requests (community backlog)
+
+Substantial features requested on the
+[issue tracker](https://github.com/aethersdr/AetherSDR/issues?q=is%3Aopen+label%3A%22New+Feature%22)
+— captured here for visibility, **not yet scheduled**. 👍 the issue to signal demand.
+
+**Extensibility**
+
+- **Plugin subsystem** — loadable decoder/DSP extensions, e.g. FT8/FT4/WSPR
+  ([#3474](https://github.com/aethersdr/AetherSDR/issues/3474)).
+- **TX-audio VST plugin host**
+  ([#662](https://github.com/aethersdr/AetherSDR/issues/662)).
+
+**Multi-radio & remote operation**
+
+- **Single instance, two radios** — multi-radio operation; the `RadioSession`
+  aggregate landed as the foundation
+  ([#3445](https://github.com/aethersdr/AetherSDR/issues/3445)).
+- **AetherLink** — integrated mobile remote server with low-bandwidth transport
+  and an Android client
+  ([#3128](https://github.com/aethersdr/AetherSDR/issues/3128)).
+
+**Client-side DSP**
+
+- **AM co-channel canceller** for MW/SW DX
+  ([#578](https://github.com/aethersdr/AetherSDR/issues/578)).
+- **Beat-cancel** — heterodyne/carrier interference canceller
+  ([#529](https://github.com/aethersdr/AetherSDR/issues/529)).
+- **CQUAM AM-stereo decoder**
+  ([#176](https://github.com/aethersdr/AetherSDR/issues/176)).
+
+**Operating modes & spotting**
+
+- **Band-traffic / band-opening monitor**
+  ([#3114](https://github.com/aethersdr/AetherSDR/issues/3114)).
+- **Advanced spot colouring** — DXCC status, LoTW activity, per-callsign worked
+  status ([#2809](https://github.com/aethersdr/AetherSDR/issues/2809)).
+- **Contest-optimized high-contrast GUI**
+  ([#2893](https://github.com/aethersdr/AetherSDR/issues/2893)).
+- **Client-side digital voice keyer (DVK)** with local audio playback
+  ([#957](https://github.com/aethersdr/AetherSDR/issues/957)).
+
+**Packet / APRS / mapping** (building on the new map engine + AFSK demod)
+
+- **APRS digipeater** tab (MVP: WIDE1-1 fill-in)
+  ([#3571](https://github.com/aethersdr/AetherSDR/issues/3571)).
+- **Live NEXRAD / weather-radar tile overlay** on the map
+  ([#3574](https://github.com/aethersdr/AetherSDR/issues/3574)).
+- **IQ-stream transmission over TCI** for CW/RTTY skimmers
+  ([#999](https://github.com/aethersdr/AetherSDR/issues/999)).
+
+**Amplifier & tuner integrations**
+
+- **RF2K+ / RF2K-S** PA ([#1902](https://github.com/aethersdr/AetherSDR/issues/1902)),
+  **Palstar HF-Auto** ([#97](https://github.com/aethersdr/AetherSDR/issues/97)),
+  **LDG** USB-serial tuner ([#2092](https://github.com/aethersdr/AetherSDR/issues/2092)),
+  and **Icom AH4** tuner protocol ([#542](https://github.com/aethersdr/AetherSDR/issues/542)).
 
 ### Recently shipped
 
 Highlights from the last 30 days — full list in
 [`CHANGELOG.md`](CHANGELOG.md):
 
-- Constitution v1.1.0 — 14 numbered principles, multi-agent
-  contribution model, signed-commit enforcement.
-- Six security fixes shipped against the 2026-05 audit
-  (H1, H2, M1, M2, M3+L5, M4 — all advisories will publish on the
-  next release tag).
-- Repo structure cleanup — root and `docs/` directories brought to
-  portfolio-quality OSS shape across 9 sequential PRs
-  ([#2933](https://github.com/aethersdr/AetherSDR/issues/2933)).
-- TCI TX audio regression fix — restored full power to WSJT-X over TCI
-  by reverting the device-identity change that triggered K2 scaling.
-- Aetherial Tube Pre-Amp — RNNoise toggle on the TX mic pre-amp area.
+- **3D stacked-trace spectrum** — a perspective stacked-trace panadapter render
+  mode (rolling FFT history, floor-anchored ridges, 3D Floor depth) with the
+  right-edge dBm scale carried into 3D (v26.7.1).
+- **NVIDIA BNR — in-process AI noise removal** — the Maxine AFX denoiser running
+  in-process on a local NVIDIA GPU, download-on-demand, no container; the
+  NIM/gRPC microservice backend was removed (v26.7.1).
+- **60 fps GPU panadapters** — a per-pixel GPU FFT trace (no per-frame CPU vertex
+  bake) plus present coalescing lift the FFT ceiling from 30 to 60 fps at flat
+  CPU cost (v26.7.1).
+- **TX meter mouse-over readouts** — exact numeric badges on the SWR / power /
+  ALC / mic-level / compression meters (v26.7.1).
+- **FlexLib-sourced model capabilities** — extended-DSP, diversity, and slice/pan
+  counts now come from the FlexLib `ModelInfo` platform table, fixing the AU-510
+  and ML/CL/S-variant gaps (v26.7.1).
+- **KiwiSDR receive sync** — GCC-PHAT Auto-Assist that time-aligns the Flex
+  and a public KiwiSDR receiver in both audio and the spectrum/waterfall
+  (v26.6.5).
+- **SmartMTR TX meters** — selectable SWR, forward-power, and compression
+  gauges with analog ballistics for the VFO flag, including VOX-keyed
+  transmit (v26.6.5).
+- **PROF profile-switcher applet** — live Global / TX / Mic profile
+  selection from a sidebar applet (v26.6.5).
+- **Agent automation bridge expansion** — radio connect/disconnect,
+  display-stream leak detection (`streams`), custom context-menu inspection,
+  and a panadapter/waterfall control surface (v26.6.5).
+- **KiwiSDR public-receiver browser** — an API-policy-aware directory to
+  find and connect to public KiwiSDR receivers worldwide, with diversity
+  receive and receive-only TX inhibit (v26.6.4).
+- **SmartMTR meter view** — a selectable, analog-ballistics meter for the
+  VFO flag (extremes markers, value labels, TX mic level), opt-in with the
+  S-meter pixel-identical by default (v26.6.4).
+- **Agent automation / test bridge** — an in-app, agent-drivable bridge to
+  drive and verify the GUI without pixels (`AETHER_AUTOMATION`).
+- **GPU-composite slice flags + multi-GPU selector** — flags composited on
+  the GPU instead of raster siblings, plus a render-GPU picker.
+- **Accessibility pass** — `QAccessibleInterface` for custom-painted widgets,
+  backed by a CI accessibility static-analysis check.
+- **CAT / rigctld parity** — a large round of SmartSDR Flex / TS-2000 /
+  rigctld behavior fixes (split VFO, VFO-B dialect capability, the `ZZTX;`
+  uncommanded-TX fix).
+- **Net Reminder Scheduler** — recurring net reminders with one-click tuning.
+- Constitution **v2.0.0** — trims domain conventions (relocated to
+  `AGENTS.md`) and adds governance principles; net 14 principles.
+- Packaging — SHA256-pinned `third_party` downloads, AppStream metainfo +
+  manpage (Flathub prep), and qtkeychain bundled for SmartLink on the
+  AppImage and Windows builds.
 
 ## How to influence the roadmap
 

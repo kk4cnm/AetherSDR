@@ -1,4 +1,5 @@
 #include "CwxPanel.h"
+#include "core/TxKeyingMarker.h"
 #include "models/CwxModel.h"
 
 #include <QVBoxLayout>
@@ -126,10 +127,6 @@ static const char* kBtnStyle =
     "QPushButton:checked { background: #00b4d8; color: #000; border: 1px solid #00d4f8; }"
     "QPushButton:hover { background: #203040; }";
 
-static const char* kEditStyle =
-    "QLineEdit { background: #ffffff; color: #000000; border: 1px solid #304050; "
-    "border-radius: 2px; padding: 4px; font-size: 11px; }";
-
 static const char* kTextStyle =
     "QTextEdit { background: #0a0a14; color: #c8d8e8; border: none; "
     "font-family: monospace; font-size: 13px; padding: 8px; }";
@@ -170,6 +167,7 @@ CwxPanel::CwxPanel(CwxModel* model, QWidget* parent)
     barLayout->setSpacing(4);
 
     m_sendBtn = new QPushButton("Send");
+    markTxKeying(m_sendBtn);   // sends CW → keys TX; label "Send" matches no keyword (#3646 review)
     m_sendBtn->setStyleSheet(kBtnStyle);
     barLayout->addWidget(m_sendBtn);
 

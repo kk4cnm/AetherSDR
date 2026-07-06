@@ -40,11 +40,30 @@ public:
     QStringList modeList() const { return m_modeList; }
     int     filterLow()  const { return m_filterLow; }   // Hz offset
     int     filterHigh() const { return m_filterHigh; }
+    // Monotonic counter bumped ONLY by setFilterWidth() (operator preset/drag),
+    // never by applyAdaptiveFilter() or status echoes. Lets the adaptive engine
+    // recognise a genuine manual filter edit without value-guessing. RFC #3878.
+    quint64 userFilterEpoch() const { return m_userFilterEpoch; }
+    // Getters — Adaptive RX filter (client-side ESSB auto-fit; RFC #3878)
+    bool    adaptiveFilterEnabled() const { return m_adaptiveFilterEnabled; }
+    int     adaptiveMinLowCut()     const { return m_adaptiveMinLowCut; }  // Hz
+    int     adaptiveMaxHighCut()    const { return m_adaptiveMaxHighCut; } // Hz
+    int     adaptiveMinSnr()        const { return m_adaptiveMinSnr; }   // 0=Sensitive,1=Normal,2=Strong
+    int     adaptiveResponse()      const { return m_adaptiveResponse; } // 0=Fast,1=Normal,2=Slow
+    int     adaptiveSplatter()      const { return m_adaptiveSplatter; } // 0=Tight,1=Normal,2=Wide
+    bool    adaptiveHetReject()     const { return m_adaptiveHetReject; } // opt-in edge-het cut
+    bool    adaptiveActive()        const { return m_adaptiveActive; }
     bool    isActive()   const { return m_active; }
     bool    isTxSlice()  const { return m_txSlice; }
     float   rfGain()     const { return m_rfGain; }
-    float   audioGain()  const { return m_audioGain; }
-    int     audioPan()   const { return m_audioPan; }
+    float   audioGain()  const { return m_externalReceiveAudioReplacement
+                                      ? m_externalReceiveAudioGain
+                                      : m_audioGain; }
+    float   flexAudioGain() const { return m_audioGain; }
+    int     audioPan()   const { return m_externalReceiveAudioReplacement
+                                      ? m_externalReceiveAudioPan
+                                      : m_audioPan; }
+    int     flexAudioPan() const { return m_audioPan; }
 
     // Getters — RX DSP state
     QString rxAntenna()   const { return m_rxAntenna; }
@@ -72,11 +91,38 @@ public:
     int     nrfLevel()    const { return m_nrfLevel; }
     int     anflLevel()   const { return m_anflLevel; }
     QString agcMode()      const { return m_agcMode; }
+    QString flexAgcMode()  const { return m_agcMode; }
+    QString receiveAgcMode() const { return m_externalReceiveAudioReplacement
+                                          ? m_externalReceiveAgcMode
+                                          : m_agcMode; }
     int     agcThreshold() const { return m_agcThreshold; }
+    int     flexAgcThreshold() const { return m_agcThreshold; }
+    int     receiveAgcThreshold() const { return m_externalReceiveAudioReplacement
+                                              ? m_externalReceiveAgcThreshold
+                                              : m_agcThreshold; }
     int     agcOffLevel()  const { return m_agcOffLevel; }
-    bool    audioMute()   const { return m_audioMute; }
+    int     flexAgcOffLevel() const { return m_agcOffLevel; }
+    int     receiveAgcOffLevel() const { return m_externalReceiveAudioReplacement
+                                             ? m_externalReceiveAgcOffLevel
+                                             : m_agcOffLevel; }
+    bool    audioMute()   const { return m_externalReceiveAudioReplacement
+                                      ? m_externalReceiveAudioMute
+                                      : m_audioMute; }
+    bool    flexAudioMute() const { return m_audioMute; }
     bool    squelchOn()   const { return m_squelchOn; }
+    bool    flexSquelchOn() const { return m_squelchOn; }
+    bool    receiveSquelchOn() const { return m_externalReceiveAudioReplacement
+                                           ? m_externalReceiveSquelchOn
+                                           : m_squelchOn; }
+    bool    externalReceiveAutoSquelchOn() const
+    {
+        return m_externalReceiveAutoSquelch;
+    }
     int     squelchLevel()const { return m_squelchLevel; }
+    int     flexSquelchLevel() const { return m_squelchLevel; }
+    int     receiveSquelchLevel() const { return m_externalReceiveAudioReplacement
+                                              ? m_externalReceiveSquelchLevel
+                                              : m_squelchLevel; }
     bool    ritOn()       const { return m_ritOn; }
     int     ritFreq()     const { return m_ritFreq; }
     bool    xitOn()       const { return m_xitOn; }
@@ -108,10 +154,31 @@ public:
     void tuneAndRecenter(double mhz);      // slice tune — recenters pan (band changes)
     void setMode(const QString& mode);
     void setFilterWidth(int low, int high);
+    // Adaptive RX filter (client-side; the toggle/bounds send no radio
+    // command — the engine drives the passband via applyAdaptiveFilter()).
+    void setAdaptiveFilterEnabled(bool on);
+    void setAdaptiveMinLowCut(int hz);
+    void setAdaptiveMaxHighCut(int hz);
+    void setAdaptiveMinSnr(int level);     // 0=Sensitive,1=Normal,2=Strong
+    void setAdaptiveResponse(int level);   // 0=Fast,1=Normal,2=Slow
+    void setAdaptiveSplatter(int level);   // 0=Tight,1=Normal,2=Wide
+    void setAdaptiveHetReject(bool on);    // opt-in edge-het cut
+    void setAdaptiveActive(bool on);
+    // Engine-driven passband write: same wire command as setFilterWidth, but
+    // a distinct entry point so the engine can recognise its own writes (vs
+    // a user preset/drag) when tracking the manual baseline. RFC #3878.
+    void applyAdaptiveFilter(int low, int high);
     void setAudioGain(float gain);
     void setRfGain(float gain);
     void setAudioPan(int pan);
     void setAudioMute(bool mute);
+    void setExternalReceiveAudioReplacementMute(bool active,
+                                                bool restoreMute = false);
+    void setExternalReceiveAutoSquelch(bool on);
+    bool externalReceiveReplacementActive() const
+    {
+        return m_externalReceiveAudioReplacement;
+    }
     void setDiversity(bool on);
     bool diversity() const { return m_diversity; }
     bool isDiversityChild() const { return m_diversityChild; }
@@ -199,6 +266,14 @@ signals:
     void panIdChanged(const QString& panId);
     void modeChanged(const QString& mode);
     void filterChanged(int low, int high);
+    void adaptiveFilterEnabledChanged(bool on);
+    void adaptiveMinLowCutChanged(int hz);
+    void adaptiveMaxHighCutChanged(int hz);
+    void adaptiveMinSnrChanged(int level);
+    void adaptiveResponseChanged(int level);
+    void adaptiveSplatterChanged(int level);
+    void adaptiveHetRejectChanged(bool on);
+    void adaptiveActiveChanged(bool on);
     void activeChanged(bool active);
     void txSliceChanged(bool tx);
     void audioGainChanged(float gain);
@@ -238,7 +313,12 @@ signals:
     void escGainChanged(float gain);
     void escPhaseShiftChanged(float deg);
     void rfGainChanged(float gain);
+    void externalReceiveAgcModeChanged(const QString& mode);
+    void externalReceiveAgcThresholdChanged(int value);
+    void externalReceiveAgcOffLevelChanged(int value);
+    void externalReceiveAutoSquelchChanged(bool on);
     void squelchChanged(bool on, int level);
+    void externalReceiveSquelchChanged(bool on, int level);
     void stepChanged(int hz, const QVector<int>& stepList);
     void ritChanged(bool on, int hz);
     void xitChanged(bool on, int hz);
@@ -261,6 +341,11 @@ signals:
     void playOnChanged(bool on);
     void playEnabledChanged(bool enabled);
     void commandReady(const QString& cmd);  // ready to send to radio
+    // aetherd RFC 2.3 encode template: express intent instead of building the
+    // wire string. RadioModel routes this to FlexBackend::setSliceMode, whose
+    // output goes through the TX-inhibit-guarded slice sink. (The other slice
+    // commands still use commandReady until they convert.)
+    void modeChangeRequested(const QString& mode);
 
 private:
     int     m_id{0};
@@ -271,6 +356,18 @@ private:
     QStringList m_modeList;
     int     m_filterLow{-1500};
     int     m_filterHigh{1500};
+    quint64 m_userFilterEpoch{0};   // bumped only by setFilterWidth() (RFC #3878)
+    // Adaptive RX filter — client-side config + runtime state (RFC #3878).
+    // The filter edges themselves stay radio-authoritative (never persisted);
+    // only enabled + the two bounds are persisted by the GUI.
+    bool    m_adaptiveFilterEnabled{false};
+    int     m_adaptiveMinLowCut{0};      // Hz, one of {0,50,100,200}
+    int     m_adaptiveMaxHighCut{4000};  // Hz, one of {3000,3500,4000,6000}
+    int     m_adaptiveMinSnr{1};         // 0=Sensitive,1=Normal,2=Strong
+    int     m_adaptiveResponse{1};       // 0=Fast,1=Normal,2=Slow
+    int     m_adaptiveSplatter{1};       // 0=Tight,1=Normal,2=Wide
+    bool    m_adaptiveHetReject{false};  // opt-in edge-het cut
+    bool    m_adaptiveActive{false};     // a confident live fit is applied
     bool    m_active{false};
     bool    m_txSlice{false};
     float   m_rfGain{0.0f};
@@ -285,6 +382,18 @@ private:
     bool    m_locked{false};
     bool    m_qsk{false};
     bool    m_audioMute{false};
+    bool    m_externalReceiveAudioReplacement{false};
+    bool    m_externalReceiveAudioMute{false};
+    float   m_externalReceiveAudioGain{70.0f};
+    int     m_externalReceiveAudioPan{50};
+    QString m_externalReceiveAgcMode{"med"};
+    int     m_externalReceiveAgcThreshold{-100};
+    int     m_externalReceiveAgcOffLevel{50};
+    bool    m_externalReceiveAutoSquelch{false};
+    bool    m_externalReceiveSquelchOn{false};
+    // KiwiSDR does not report an initial squelch threshold. Start at the
+    // lowest manual UI level so first-enable cannot unexpectedly close audio.
+    int     m_externalReceiveSquelchLevel{0};
     bool    m_diversity{false};
     bool    m_diversityChild{false};
     bool    m_diversityParent{false};

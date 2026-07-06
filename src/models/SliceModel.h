@@ -6,6 +6,8 @@
 #include <QMap>
 #include <QTimer>
 
+#include "core/backends/SliceDelta.h"
+
 namespace AetherSDR {
 
 // A "slice" in SmartSDR terminology is an independent receive channel.
@@ -248,8 +250,11 @@ public:
     void setTxOffsetFreq(double mhz);
     void setFmDeviation(int hz);
 
-    // Apply a batch of KV pairs from a status message.
-    void applyStatus(const QMap<QString, QString>& kvs);
+    // Apply a normalized, typed slice delta from the backend
+    // (IRadioBackend::sliceChanged). Vendor-neutral fields only — the Flex wire
+    // decode lives in FlexBackend::decodeSliceStatus. Applies only the fields the
+    // delta has engaged (present-only). (aetherd RFC 2.3.)
+    void applyChanges(const SliceDelta& delta);
 
     // Force a re-emit of letterChanged() with the current letter — used
     // when a global display preference (e.g. AppSettings
@@ -437,7 +442,7 @@ private:
     // Flex firmware's `profile global` snapshot does not persist
     // speex_nr_level — on recall the radio reports the firmware default of
     // 50, even when the user set a different value before saving. Cache the
-    // user's explicit choice so applyStatus() can re-push it when the radio
+    // user's explicit choice so applyChanges() can re-push it when the radio
     // comes back at 50 with no user-initiated change to that value.
     int     m_nrsLevelUser{50};
     bool    m_nrsLevelUserOverride{false};

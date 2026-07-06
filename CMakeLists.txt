@@ -2628,6 +2628,27 @@ target_link_libraries(aetherd_pan_decode_test PRIVATE aethercore Qt6::Core Qt6::
 set_target_properties(aetherd_pan_decode_test PROPERTIES AUTOMOC ON)
 add_test(NAME aetherd_pan_decode_test COMMAND aetherd_pan_decode_test)
 
+# aetherd RFC 2.3 — MeterModel touchpoint: meter-status wire decode.
+add_executable(aetherd_meter_decode_test tests/aetherd_meter_decode_test.cpp)
+target_include_directories(aetherd_meter_decode_test PRIVATE src)
+target_link_libraries(aetherd_meter_decode_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(aetherd_meter_decode_test PROPERTIES AUTOMOC ON)
+add_test(NAME aetherd_meter_decode_test COMMAND aetherd_meter_decode_test)
+
+# aetherd RFC 2.3 — SliceModel touchpoint: slice-status wire → canonical decode.
+add_executable(aetherd_slice_decode_test tests/aetherd_slice_decode_test.cpp)
+target_include_directories(aetherd_slice_decode_test PRIVATE src)
+target_link_libraries(aetherd_slice_decode_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(aetherd_slice_decode_test PROPERTIES AUTOMOC ON)
+add_test(NAME aetherd_slice_decode_test COMMAND aetherd_slice_decode_test)
+
+# aetherd RFC 2.3 — TransmitModel touchpoint: transmit-family wire → typed delta.
+add_executable(aetherd_transmit_decode_test tests/aetherd_transmit_decode_test.cpp)
+target_include_directories(aetherd_transmit_decode_test PRIVATE src)
+target_link_libraries(aetherd_transmit_decode_test PRIVATE aethercore Qt6::Core Qt6::Test)
+set_target_properties(aetherd_transmit_decode_test PROPERTIES AUTOMOC ON)
+add_test(NAME aetherd_transmit_decode_test COMMAND aetherd_transmit_decode_test)
+
 add_executable(usb_cable_model_test
     tests/usb_cable_model_test.cpp
     src/models/UsbCableModel.cpp
@@ -2722,6 +2743,7 @@ if(UNIX)
     target_link_libraries(transmit_model_apd_test PRIVATE pthread)
 endif()
 set_target_properties(transmit_model_apd_test PROPERTIES AUTOMOC ON)
+add_test(NAME transmit_model_apd_test COMMAND transmit_model_apd_test)
 
 # Help guide search tests - needs QApplication + Widgets.
 add_executable(help_dialog_test

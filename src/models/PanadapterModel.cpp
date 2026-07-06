@@ -2,6 +2,7 @@
 #include "core/PerfTelemetry.h"
 #include <QDebug>
 #include <algorithm>
+#include <cmath>
 
 namespace AetherSDR {
 
@@ -87,6 +88,25 @@ void PanadapterModel::setCenterBandwidth(double centerMhz, double bandwidthMhz)
     }
 }
 
+bool PanadapterModel::setRange(double minDbm, double maxDbm)
+{
+    bool changed = false;
+    // NaN means "leave unchanged" — the radio may report one bound without the
+    // other, and dBm is signed so a numeric sentinel would be ambiguous.
+    if (!std::isnan(minDbm) && float(minDbm) != m_minDbm) {
+        m_minDbm = float(minDbm);
+        changed = true;
+    }
+    if (!std::isnan(maxDbm) && float(maxDbm) != m_maxDbm) {
+        m_maxDbm = float(maxDbm);
+        changed = true;
+    }
+    if (changed) {
+        emit levelChanged(m_minDbm, m_maxDbm);
+    }
+    return changed;
+}
+
 void PanadapterModel::applyWnbExtension(const QVariantMap& fields)
 {
     bool dirty = false;
@@ -108,86 +128,77 @@ void PanadapterModel::applyWnbExtension(const QVariantMap& fields)
     }
 }
 
-void PanadapterModel::applyPanStatus(const QMap<QString, QString>& kvs)
+void PanadapterModel::setRfGain(int gain)
 {
-    bool levelChanged = false;
+    if (gain != m_rfGain) {
+        m_rfGain = gain;
+        emit rfGainChanged(m_rfGain);
+    }
+}
 
-    // #3977: ownership is radio-authoritative. When another session reclaims
-    // this pan (MultiFlex reconnect), the radio broadcasts the new
-    // client_handle; tracking it here lets a superseded session stop
-    // adjusting a pan it no longer owns.
-    if (kvs.contains("client_handle")) {
-        const quint32 parsed = parseHandleHex(kvs.value("client_handle"));
-        if (parsed != 0 && parsed != m_ownerHandle) {
-            m_ownerHandle = parsed;
-            m_clientHandle = QString::number(parsed, 16);
-        }
+void PanadapterModel::setRxAntenna(const QString& ant)
+{
+    if (ant != m_rxAntenna) {
+        m_rxAntenna = ant;
+        emit rxAntennaChanged(m_rxAntenna);
     }
+}
 
-    // center/bandwidth now decode in FlexBackend → panCenterBandwidthChanged →
-    // setCenterBandwidth() (aetherd RFC 2.3, the first converted pan touchpoint).
-    if (kvs.contains("min_dbm")) {
-        float v = kvs["min_dbm"].toFloat();
-        if (v != m_minDbm) { m_minDbm = v; levelChanged = true; }
+void PanadapterModel::setAntList(const QStringList& ants)
+{
+    if (ants != m_antList) {
+        m_antList = ants;
+        emit antListChanged(m_antList);
     }
-    if (kvs.contains("max_dbm")) {
-        float v = kvs["max_dbm"].toFloat();
-        if (v != m_maxDbm) { m_maxDbm = v; levelChanged = true; }
+}
+
+void PanadapterModel::setWaterfallLineDuration(int ms)
+{
+    // PerfTelemetry is fed every report (even when unchanged), and
+    // waterfallLineDurationReported likewise always fires; the change-gated
+    // signal is waterfallLineDurationChanged. Semantics preserved verbatim from
+    // the old applyWaterfallStatus.
+    PerfTelemetry::instance().setWaterfallLineDurationMs(ms);
+    if (ms != m_waterfallLineDuration) {
+        m_waterfallLineDuration = ms;
+        emit waterfallLineDurationChanged(m_waterfallLineDuration);
     }
-    if (kvs.contains("rfgain")) {
-        int g = kvs["rfgain"].toInt();
-        if (g != m_rfGain) {
-            m_rfGain = g;
-            emit rfGainChanged(m_rfGain);
-        }
-    }
-    if (kvs.contains("pre")) {
-        QString pre = kvs["pre"];
-        if (pre != m_preamp) {
-            // Preamp is internal state only — no UI listeners, no emit.
-            m_preamp = pre;
-        }
-    }
-    // WNB decode moved to FlexBackend → extensionStatus("flex","panWnb") →
-    // applyWnbExtension() (aetherd RFC 2.3 extension template).
-    if (kvs.contains("wide")) {
-        bool wide = kvs["wide"].toInt() != 0;
+    emit waterfallLineDurationReported(ms);
+}
+
+void PanadapterModel::applyStateExtension(const QVariantMap& fields)
+{
+    // The Flex-specific display-pan fields, applied from the backend's
+    // namespaced extensionStatus("flex","panState",…). Each key applies only
+    // when present, with the exact per-field semantics the old applyPanStatus
+    // had (aetherd RFC 2.3 — the decode lives in FlexBackend, not here).
+    if (fields.contains(QStringLiteral("wide"))) {
+        const bool wide = fields.value(QStringLiteral("wide")).toInt() != 0;
         if (wide != m_wideActive) {
             m_wideActive = wide;
             emit wideChanged(m_wideActive);
         }
     }
-    if (kvs.contains("loopa") || kvs.contains("loopb")) {
+    if (fields.contains(QStringLiteral("loopa"))
+        || fields.contains(QStringLiteral("loopb"))) {
         bool changed = false;
-        if (kvs.contains("loopa")) {
-            const bool loopA = kvs["loopa"].toInt() != 0;
-            if (loopA != m_loopA) {
-                m_loopA = loopA;
-                changed = true;
-            }
-            if (loopA && m_loopB) {
-                m_loopB = false;
-                changed = true;
-            }
+        if (fields.contains(QStringLiteral("loopa"))) {
+            const bool loopA = fields.value(QStringLiteral("loopa")).toInt() != 0;
+            if (loopA != m_loopA) { m_loopA = loopA; changed = true; }
+            if (loopA && m_loopB) { m_loopB = false; changed = true; }
         }
-        if (kvs.contains("loopb")) {
-            const bool loopB = kvs["loopb"].toInt() != 0;
-            if (loopB != m_loopB) {
-                m_loopB = loopB;
-                changed = true;
-            }
-            if (loopB && m_loopA) {
-                m_loopA = false;
-                changed = true;
-            }
+        if (fields.contains(QStringLiteral("loopb"))) {
+            const bool loopB = fields.value(QStringLiteral("loopb")).toInt() != 0;
+            if (loopB != m_loopB) { m_loopB = loopB; changed = true; }
+            if (loopB && m_loopA) { m_loopA = false; changed = true; }
         }
         if (changed) {
             emit loopChanged(m_loopA, m_loopB);
         }
     }
-    if (kvs.contains("fps")) {
+    if (fields.contains(QStringLiteral("fps"))) {
         bool ok = false;
-        const int fps = kvs["fps"].toInt(&ok);
+        const int fps = fields.value(QStringLiteral("fps")).toInt(&ok);
         if (ok) {
             if (fps != m_fps) {
                 m_fps = fps;
@@ -196,63 +207,32 @@ void PanadapterModel::applyPanStatus(const QMap<QString, QString>& kvs)
             emit fpsReported(fps);
         }
     }
-    if (kvs.contains("ant_list")) {
-        QStringList ants = kvs["ant_list"].split(',', Qt::SkipEmptyParts);
-        if (ants != m_antList) {
-            m_antList = ants;
-            emit antListChanged(m_antList);
-        }
+    if (fields.contains(QStringLiteral("pre"))) {
+        const QString pre = fields.value(QStringLiteral("pre")).toString();
+        // Preamp is internal state only — no UI listeners, no emit (#1498).
+        if (pre != m_preamp) { m_preamp = pre; }
     }
-    if (kvs.contains("rxant")) {
-        const QString ant = kvs["rxant"];
-        if (ant != m_rxAntenna) {
-            m_rxAntenna = ant;
-            emit rxAntennaChanged(m_rxAntenna);
-        }
-    }
-    if (kvs.contains("waterfall")) {
-        setWaterfallId(kvs["waterfall"]);
-    }
-    if (kvs.contains("daxiq_channel")) {
-        int ch = kvs["daxiq_channel"].toInt();
+    if (fields.contains(QStringLiteral("daxiq_channel"))) {
+        const int ch = fields.value(QStringLiteral("daxiq_channel")).toInt();
         if (ch != m_daxiqChannel) {
             m_daxiqChannel = ch;
             emit daxiqChannelChanged(ch);
         }
     }
-
-    if (levelChanged)
-        emit this->levelChanged(m_minDbm, m_maxDbm);
-}
-
-void PanadapterModel::applyWaterfallStatus(const QMap<QString, QString>& kvs)
-{
-    if (kvs.contains("line_duration")) {
-        bool ok = false;
-        const int ms = kvs["line_duration"].toInt(&ok);
-        if (ok) {
-            PerfTelemetry::instance().setWaterfallLineDurationMs(ms);
-            if (ms != m_waterfallLineDuration) {
-                m_waterfallLineDuration = ms;
-                emit waterfallLineDurationChanged(m_waterfallLineDuration);
-            }
-            emit waterfallLineDurationReported(ms);
+    // #3977: ownership is radio-authoritative. When another session reclaims
+    // this pan (MultiFlex reconnect), the radio broadcasts the new
+    // client_handle; tracking it lets a superseded session stop adjusting a pan
+    // it no longer owns. Semantics preserved verbatim (parsed != 0 && changed).
+    if (fields.contains(QStringLiteral("client_handle"))) {
+        const quint32 parsed =
+            parseHandleHex(fields.value(QStringLiteral("client_handle")).toString());
+        if (parsed != 0 && parsed != m_ownerHandle) {
+            m_ownerHandle = parsed;
+            m_clientHandle = QString::number(parsed, 16);
         }
     }
-
-    // Waterfall status shares center/bandwidth with pan — sync if present
-    if (kvs.contains("center") || kvs.contains("bandwidth")) {
-        bool changed = false;
-        if (kvs.contains("center")) {
-            double c = kvs["center"].toDouble();
-            if (c != m_centerMhz) { m_centerMhz = c; changed = true; }
-        }
-        if (kvs.contains("bandwidth")) {
-            double b = kvs["bandwidth"].toDouble();
-            if (b != m_bandwidthMhz) { m_bandwidthMhz = b; changed = true; }
-        }
-        if (changed)
-            emit infoChanged(m_centerMhz, m_bandwidthMhz);
+    if (fields.contains(QStringLiteral("waterfall"))) {
+        setWaterfallId(fields.value(QStringLiteral("waterfall")).toString());
     }
 }
 

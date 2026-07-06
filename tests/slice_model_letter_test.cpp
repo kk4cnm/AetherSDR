@@ -1,7 +1,7 @@
 #include "models/SliceModel.h"
+#include "core/backends/SliceDelta.h"
 
 #include <QCoreApplication>
-#include <QMap>
 #include <QSignalSpy>
 #include <QString>
 #include <cstdio>
@@ -23,11 +23,15 @@ static int g_failures = 0;
     } \
 } while (0)
 
-static QMap<QString, QString> kv(std::initializer_list<std::pair<QString, QString>> pairs)
+// aetherd RFC 2.3: SliceModel::applyChanges now takes a typed SliceDelta (the Flex
+// wire decode lives in FlexBackend::decodeSliceStatus, covered by
+// aetherd_slice_decode_test). This helper builds a delta from a field-setter.
+template <class F>
+static SliceDelta delta(F&& build)
 {
-    QMap<QString, QString> m;
-    for (const auto& p : pairs) m.insert(p.first, p.second);
-    return m;
+    SliceDelta d;
+    build(d);
+    return d;
 }
 
 int main(int argc, char** argv)
@@ -46,7 +50,7 @@ int main(int argc, char** argv)
     {
         SliceModel s(3);
         QSignalSpy spy(&s, &SliceModel::letterChanged);
-        s.applyStatus(kv({{"index_letter", "A"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.letter = QStringLiteral("A"); }));
         EXPECT_EQ(s.letter(), QString("A"));
         EXPECT_EQ(spy.count(), 1);
         EXPECT_EQ(spy.takeFirst().at(0).toString(), QString("A"));
@@ -55,18 +59,18 @@ int main(int argc, char** argv)
     // ── Re-applying the same letter does NOT re-emit letterChanged.
     {
         SliceModel s(1);
-        s.applyStatus(kv({{"index_letter", "B"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.letter = QStringLiteral("B"); }));
         QSignalSpy spy(&s, &SliceModel::letterChanged);
-        s.applyStatus(kv({{"index_letter", "B"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.letter = QStringLiteral("B"); }));
         EXPECT_EQ(spy.count(), 0);
     }
 
     // ── Letter change emits exactly once and the resolved value follows.
     {
         SliceModel s(2);
-        s.applyStatus(kv({{"index_letter", "A"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.letter = QStringLiteral("A"); }));
         QSignalSpy spy(&s, &SliceModel::letterChanged);
-        s.applyStatus(kv({{"index_letter", "C"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.letter = QStringLiteral("C"); }));
         EXPECT_EQ(s.letter(), QString("C"));
         EXPECT_EQ(spy.count(), 1);
         EXPECT_EQ(spy.takeFirst().at(0).toString(), QString("C"));
@@ -76,7 +80,7 @@ int main(int argc, char** argv)
     // (used when a display preference changes).
     {
         SliceModel s(0);
-        s.applyStatus(kv({{"index_letter", "A"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.letter = QStringLiteral("A"); }));
         QSignalSpy spy(&s, &SliceModel::letterChanged);
         s.emitLetterRefresh();
         EXPECT_EQ(spy.count(), 1);
@@ -87,9 +91,9 @@ int main(int argc, char** argv)
     // letter or emit on letterChanged.
     {
         SliceModel s(2);
-        s.applyStatus(kv({{"index_letter", "A"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.letter = QStringLiteral("A"); }));
         QSignalSpy spy(&s, &SliceModel::letterChanged);
-        s.applyStatus(kv({{"in_use", "1"}, {"RF_frequency", "14.250"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.inUse = true; d.frequency = 14.250; }));
         EXPECT_EQ(s.letter(), QString("A"));
         EXPECT_EQ(spy.count(), 0);
     }
@@ -102,7 +106,7 @@ int main(int argc, char** argv)
         QStringList commands;
         QObject::connect(&s, &SliceModel::commandReady,
                          [&commands](const QString& cmd) { commands.append(cmd); });
-        s.applyStatus(kv({{"audio_pan", "25"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.audioPan = 25; }));
         EXPECT_EQ(s.audioPan(), 25);
         EXPECT_EQ(s.flexAudioPan(), 25);
 
@@ -122,7 +126,7 @@ int main(int argc, char** argv)
         EXPECT_EQ(panSpy.count(), 1);
         EXPECT_EQ(panSpy.takeFirst().at(0).toInt(), 80);
 
-        s.applyStatus(kv({{"audio_pan", "10"}}));
+        s.applyChanges(delta([](SliceDelta& d){ d.audioPan = 10; }));
         EXPECT_EQ(s.audioPan(), 80);
         EXPECT_EQ(s.flexAudioPan(), 10);
         EXPECT_EQ(panSpy.count(), 0);
@@ -150,11 +154,9 @@ int main(int argc, char** argv)
         QStringList commands;
         QObject::connect(&s, &SliceModel::commandReady,
                          [&commands](const QString& cmd) { commands.append(cmd); });
-        s.applyStatus(kv({{"agc_mode", "slow"},
-                          {"agc_threshold", "40"},
-                          {"agc_off_level", "12"},
-                          {"squelch", "1"},
-                          {"squelch_level", "35"}}));
+        s.applyChanges(delta([](SliceDelta& d){
+            d.agcMode = QStringLiteral("slow"); d.agcThreshold = 40;
+            d.agcOffLevel = 12; d.squelchOn = true; d.squelchLevel = 35; }));
         EXPECT_EQ(s.agcMode(), QString("slow"));
         EXPECT_EQ(s.agcThreshold(), 40);
         EXPECT_EQ(s.agcOffLevel(), 12);
@@ -250,11 +252,9 @@ int main(int argc, char** argv)
         EXPECT_EQ(externalSquelchSpy.takeFirst().at(0).toBool(), false);
         commands.clear();
 
-        s.applyStatus(kv({{"agc_mode", "fast"},
-                          {"agc_threshold", "90"},
-                          {"agc_off_level", "8"},
-                          {"squelch", "1"},
-                          {"squelch_level", "12"}}));
+        s.applyChanges(delta([](SliceDelta& d){
+            d.agcMode = QStringLiteral("fast"); d.agcThreshold = 90;
+            d.agcOffLevel = 8; d.squelchOn = true; d.squelchLevel = 12; }));
         EXPECT_EQ(s.agcMode(), QString("fast"));
         EXPECT_EQ(s.receiveAgcMode(), QString("off"));
         EXPECT_EQ(s.flexAgcMode(), QString("fast"));
@@ -317,6 +317,18 @@ int main(int argc, char** argv)
                                  "slice set 5 agc_off_level=30|"
                                  "slice set 5 squelch=0|"
                                  "slice set 5 squelch_level=22"));
+    }
+
+    // ── step_list: a malformed token is dropped (fail-closed), not admitted as
+    // a bogus 0-Hz step. (#4068 review — rfoust.)
+    {
+        SliceModel s(6);
+        s.applyChanges(delta([](SliceDelta& d){ d.stepList = QStringLiteral("10,abc,1000"); }));
+        EXPECT_EQ(s.stepList().size(), 2);
+        if (s.stepList().size() == 2) {
+            EXPECT_EQ(s.stepList()[0], 10);
+            EXPECT_EQ(s.stepList()[1], 1000);
+        }
     }
 
     if (g_failures == 0) {

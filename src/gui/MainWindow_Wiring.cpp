@@ -2334,8 +2334,8 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
             this, applyWaterfallLineDuration);
     connect(sw, &SpectrumWidget::waterfallLineDurationChangeRequested,
             this, applyWaterfallLineDuration);
-    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallCellChanged,
-            this, [this, applet, sw](int cellDb) {
+    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallMaxChanged,
+            this, [this, applet, sw](int maxDbm) {
         if (!m_kiwiSdrManager) {
             return;
         }
@@ -2345,15 +2345,22 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         }
         const KiwiSdrAntennaProfile profile =
             m_kiwiSdrManager->profile(profileId);
-        m_kiwiSdrManager->setProfileWaterfallSettings(
-            profileId, cellDb, profile.waterfallFloorDb,
-            profile.waterfallRate);
-        sw->setKiwiSdrWaterfallAdjustments(cellDb,
-                                           profile.waterfallFloorDb);
+        const KiwiSdrWaterfallDisplayRange displayRange =
+            m_kiwiSdrManager->waterfallDisplayRange(profileId);
+        const int currentMin = displayRange.valid
+            ? static_cast<int>(std::lround(displayRange.minDbm))
+            : profile.waterfallMinDbm;
+        const int clampedMax = std::max(maxDbm, currentMin + 1);
+        m_kiwiSdrManager->setProfileWaterfallDisplayRange(
+            profileId, currentMin, clampedMax,
+            false, profile.waterfallRate);
+        sw->setKiwiSdrWaterfallDisplayRange(currentMin,
+                                            clampedMax,
+                                            false);
         syncKiwiSdrPanadapterUiState(applet->panId());
     });
-    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallFloorChanged,
-            this, [this, applet, sw](int floorDb) {
+    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallMinChanged,
+            this, [this, applet, sw](int minDbm) {
         if (!m_kiwiSdrManager) {
             return;
         }
@@ -2363,11 +2370,35 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         }
         const KiwiSdrAntennaProfile profile =
             m_kiwiSdrManager->profile(profileId);
-        m_kiwiSdrManager->setProfileWaterfallSettings(
-            profileId, profile.waterfallCellDb, floorDb,
-            profile.waterfallRate);
-        sw->setKiwiSdrWaterfallAdjustments(profile.waterfallCellDb,
-                                           floorDb);
+        const KiwiSdrWaterfallDisplayRange displayRange =
+            m_kiwiSdrManager->waterfallDisplayRange(profileId);
+        const int currentMax = displayRange.valid
+            ? static_cast<int>(std::lround(displayRange.maxDbm))
+            : profile.waterfallMaxDbm;
+        const int clampedMin = std::min(minDbm, currentMax - 1);
+        m_kiwiSdrManager->setProfileWaterfallDisplayRange(
+            profileId, clampedMin, currentMax,
+            false, profile.waterfallRate);
+        sw->setKiwiSdrWaterfallDisplayRange(clampedMin,
+                                            currentMax,
+                                            false);
+        syncKiwiSdrPanadapterUiState(applet->panId());
+    });
+    connect(menu, &SpectrumOverlayMenu::kiwiWaterfallAutoRequested,
+            this, [this, applet]() {
+        if (!m_kiwiSdrManager) {
+            return;
+        }
+        const QString profileId = kiwiSdrProfileForPan(applet->panId());
+        if (profileId.isEmpty()) {
+            return;
+        }
+        const KiwiSdrAntennaProfile profile =
+            m_kiwiSdrManager->profile(profileId);
+        m_kiwiSdrManager->setProfileWaterfallDisplayRange(
+            profileId, profile.waterfallMinDbm, profile.waterfallMaxDbm,
+            true, profile.waterfallRate);
+        m_kiwiSdrManager->requestProfileWaterfallAutoScale(profileId);
         syncKiwiSdrPanadapterUiState(applet->panId());
     });
     connect(menu, &SpectrumOverlayMenu::kiwiWaterfallRateChanged,
@@ -2381,9 +2412,9 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         }
         const KiwiSdrAntennaProfile profile =
             m_kiwiSdrManager->profile(profileId);
-        m_kiwiSdrManager->setProfileWaterfallSettings(
-            profileId, profile.waterfallCellDb, profile.waterfallFloorDb,
-            rate);
+        m_kiwiSdrManager->setProfileWaterfallDisplayRange(
+            profileId, profile.waterfallMinDbm, profile.waterfallMaxDbm,
+            profile.waterfallAutoScale, rate);
         syncKiwiSdrPanadapterUiState(applet->panId());
     });
     // NB Waterfall Blanker (#277)
@@ -3012,7 +3043,7 @@ MainWindow::TuneCenteringResult MainWindow::revealFrequencyIfNeeded(
             ? kPanFollowAnimationDurationMs
             : 0;
 
-        pan->applyPanStatus({{"center", QString::number(result.newCenterMhz, 'f', 6)}});
+        pan->setCenterBandwidth(result.newCenterMhz, -1.0);  // aetherd RFC 2.3
         m_radioModel.sendCommand(
             QString("display pan set %1 center=%2")
                 .arg(pan->panId()).arg(result.newCenterMhz, 0, 'f', 6));
@@ -3102,7 +3133,7 @@ MainWindow::TuneCenteringResult MainWindow::revealFrequencyIfNeeded(
     // Apply the center optimistically so the owning spectrum repaints
     // immediately; SpectrumWidget decides whether that becomes a short
     // retargetable animation or an immediate snap based on shift size.
-    pan->applyPanStatus({{"center", QString::number(result.newCenterMhz, 'f', 6)}});
+    pan->setCenterBandwidth(result.newCenterMhz, -1.0);  // aetherd RFC 2.3
     m_radioModel.sendCommand(
         QString("display pan set %1 center=%2")
             .arg(pan->panId()).arg(result.newCenterMhz, 0, 'f', 6));

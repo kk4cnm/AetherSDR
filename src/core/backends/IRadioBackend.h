@@ -3,10 +3,13 @@
 #include <QByteArray>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QVariant>
 #include <QVariantMap>
 
 #include "core/backends/RadioCapabilities.h"
+#include "core/backends/SliceDelta.h"
+#include "core/backends/TransmitDelta.h"
 
 namespace AetherSDR {
 
@@ -104,9 +107,27 @@ signals:
 
     // ---- normalized model state UP (RadioModel connects these to its
     //      sub-models; Q2) — the key/value shape mirrors the models' fields ----
-    void sliceChanged(int sliceId, const QVariantMap& changes);
+    // Normalized slice-status delta (aetherd RFC 2.3). Typed + compiler-checked:
+    // the backend populates only the fields the wire reported, the model applies
+    // exactly those. Replaces the prior stringly-keyed QVariantMap payload.
+    void sliceChanged(int sliceId, const SliceDelta& delta);
     void sliceRemoved(int sliceId);
     void meterUpdate(const QString& meterId, double value);
+
+    // Normalized transmit-status delta (aetherd RFC 2.3 — TransmitModel
+    // touchpoint). Typed + compiler-checked; the backend populates only the
+    // fields the wire reported (across the transmit / interlock / ATU / APD /
+    // APD-sampler status planes) and RadioModel drives the TransmitModel.
+    void transmitChanged(const TransmitDelta& delta);
+
+    // Meter definition catalog (aetherd RFC 2.3 — MeterModel touchpoint). The
+    // backend decodes the vendor meter-status wire format into a normalized
+    // definition; RadioModel drives the MeterModel. `fields` carries only the
+    // keys the wire reported (source, sourceIndex, name, unit, low, high,
+    // description) — the same present-only shape the old inline parse produced.
+    // The meter *values* stream on the data plane (VITA-49), separate from this.
+    void meterDefined(int index, const QVariantMap& fields);
+    void meterRemoved(int index);
     // Panadapter core display state (universal — every family has a pan center
     // and span). The backend decodes it from vendor status; RadioModel drives
     // the PanadapterModel. panId is the pan's identifier (opaque to the model).
@@ -114,6 +135,28 @@ signals:
     // universal pan fields + the other mixed models follow.)
     void panCenterBandwidthChanged(const QString& panId,
                                    double centerMhz, double bandwidthMhz);
+
+    // Panadapter display level range (universal — the Y-axis geometry that
+    // pairs with center/bandwidth's X-axis). Unlike center/bandwidth, dBm is
+    // signed, so the "unchanged" sentinel for an omitted field is NaN, not a
+    // negative value — the backend carries NaN for whichever of min/max the
+    // wire did not report. (aetherd RFC 2.3 — second converted universal pan
+    // field, following the center/bandwidth template.)
+    void panRangeChanged(const QString& panId, double minDbm, double maxDbm);
+
+    // Panadapter RF gain (universal — every family has an RX gain control; the
+    // range/step are family-specific and reported via RadioCapabilities). The
+    // backend decodes it from vendor status; RadioModel drives the pan.
+    void panRfGainChanged(const QString& panId, int gain);
+
+    // Panadapter antenna selection (universal). Two signals because the wire may
+    // report the selected RX antenna and the available list independently.
+    void panRxAntennaChanged(const QString& panId, const QString& antenna);
+    void panAntennaListChanged(const QString& panId, const QStringList& antennas);
+
+    // Waterfall line duration in ms (universal display timing). Decoded from the
+    // waterfall-status plane; RadioModel drives the pan's waterfall model state.
+    void panWaterfallLineDurationChanged(const QString& panId, int ms);
 
     // Vendor-specific status data that is NOT part of the core profile — the
     // namespaced *extension* channel (aetherd RFC §5.5). A client that doesn't

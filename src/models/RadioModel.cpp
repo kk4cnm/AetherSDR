@@ -393,6 +393,15 @@ QJsonObject clientInfoToJson(quint32 handle,
 RadioModel::RadioModel(QObject* parent)
     : QObject(parent)
 {
+    // Register the typed seam-delta payloads so IRadioBackend's normalized
+    // signals survive a queued connection. Today decode*Status runs synchronously
+    // on this thread (AutoConnection → DirectConnection, no metatype needed), but
+    // if a backend is ever moved to a worker thread the connection becomes queued;
+    // without registration Qt would log "Cannot queue arguments of type …" and
+    // silently drop the emit. Idempotent + cheap. (#4071 review.)
+    qRegisterMetaType<SliceDelta>();
+    qRegisterMetaType<TransmitDelta>();
+
     // aetherd RFC step 2.2b: the radio-facing seam owns the wire objects. The
     // FlexBackend creates the RadioConnection and PanadapterStream on their
     // worker threads (in the load-bearing #502 order — panStream first) and
@@ -426,26 +435,131 @@ RadioModel::RadioModel(QObject* parent)
     // remaining universal fields and the other mixed models.)
     connect(m_backend.get(), &IRadioBackend::panCenterBandwidthChanged, this,
             [this](const QString& panId, double centerMhz, double bandwidthMhz) {
-        auto* pan = m_panadapters.value(panId, nullptr);
-        if (!pan) pan = activePanadapter();
+        auto* pan = resolvePan(panId);
         if (!pan) return;
         pan->setCenterBandwidth(centerMhz, bandwidthMhz);
         // Legacy signal MainWindow still consumes (unchanged behavior).
         emit panadapterInfoChanged(pan->centerMhz(), pan->bandwidthMhz());
     });
 
-    // aetherd RFC 2.3 extension template: Flex-specific pan fields (WNB) ride
-    // the namespaced extensionStatus channel; RadioModel routes them to the
-    // addressed PanadapterModel. Other namespaces/kinds are ignored here.
+    // aetherd RFC 2.3: min/max dBm — the second universal pan field. The backend
+    // decodes the display level range; RadioModel applies it to the addressed
+    // pan and preserves the two side-effects the old inline block owned (for the
+    // pan-resolved case): the panStream setDbmRange (only when the range actually
+    // changed, to avoid a redundant GPU-scale reset) and the legacy
+    // panadapterLevelChanged signal. (The old code also emitted a synthesized-
+    // default panadapterLevelChanged on the pan==null path; that signal now has
+    // no live consumer — per-pan levelChanged is used instead — so the no-pan
+    // emit is intentionally dropped rather than resurrected. #4065 review.)
+    connect(m_backend.get(), &IRadioBackend::panRangeChanged, this,
+            [this](const QString& panId, double minDbm, double maxDbm) {
+        auto* pan = resolvePan(panId);
+        if (!pan) return;
+        if (pan->setRange(minDbm, maxDbm)) {
+            m_panStream->setDbmRange(pan->panStreamId(), pan->minDbm(), pan->maxDbm());
+        }
+        emit panadapterLevelChanged(pan->minDbm(), pan->maxDbm());
+    });
+
+    // aetherd RFC 2.3: rfgain + antenna — universal pan fields (promoted per the
+    // 2026-07-05 classification). The backend decodes them; RadioModel drives the
+    // addressed pan. The antenna-list handler ALSO drives RadioModel's own
+    // m_antList/antListChanged, converging what used to be a second independent
+    // parse of ant_list in handlePanadapterStatus onto this single source.
+    connect(m_backend.get(), &IRadioBackend::panRfGainChanged, this,
+            [this](const QString& panId, int gain) {
+        if (auto* pan = resolvePan(panId)) pan->setRfGain(gain);
+    });
+    connect(m_backend.get(), &IRadioBackend::panRxAntennaChanged, this,
+            [this](const QString& panId, const QString& ant) {
+        if (auto* pan = resolvePan(panId)) pan->setRxAntenna(ant);
+    });
+    connect(m_backend.get(), &IRadioBackend::panAntennaListChanged, this,
+            [this](const QString& panId, const QStringList& ants) {
+        if (auto* pan = resolvePan(panId)) pan->setAntList(ants);
+        // Converged RadioModel-level antenna list (the old inline dual-parse).
+        // Not gated on a resolved pan — matches the old unconditional emit.
+        if (ants != m_antList) {
+            m_antList = ants;
+            emit antListChanged(m_antList);
+        }
+    });
+    connect(m_backend.get(), &IRadioBackend::panWaterfallLineDurationChanged, this,
+            [this](const QString& panId, int ms) {
+        if (auto* pan = resolvePan(panId)) pan->setWaterfallLineDuration(ms);
+    });
+
+    // aetherd RFC 2.3 extension channel: Flex-specific pan fields ride the
+    // namespaced extensionStatus channel; RadioModel routes them to the addressed
+    // PanadapterModel. Two kinds: "panWnb" (noise blanker) and "panState" (wide,
+    // loop, fps, preamp, DAX-IQ, MultiFlex client_handle, waterfall id). Other
+    // namespaces/kinds are ignored here.
     connect(m_backend.get(), &IRadioBackend::extensionStatus, this,
             [this](const QString& ns, const QString& kind, const QVariantMap& fields) {
-        if (ns != QLatin1String("flex") || kind != QLatin1String("panWnb")) {
+        if (ns != QLatin1String("flex")) {
             return;
         }
-        auto* pan = m_panadapters.value(fields.value("panId").toString(), nullptr);
-        if (!pan) pan = activePanadapter();
-        if (pan) pan->applyWnbExtension(fields);
+        if (kind != QLatin1String("panWnb") && kind != QLatin1String("panState")) {
+            return;
+        }
+        auto* pan = resolvePan(fields.value("panId").toString());
+        if (!pan) return;
+        if (kind == QLatin1String("panWnb")) {
+            pan->applyWnbExtension(fields);
+        } else {
+            pan->applyStateExtension(fields);
+        }
     });
+
+    // aetherd RFC 2.3: MeterModel touchpoint. The backend decodes the SmartSDR
+    // meter-status wire format; RadioModel reconstructs the MeterDef (present-
+    // only, exactly as the old inline handleMeterStatus parse did) and drives the
+    // MeterModel. Meter *values* stay on the VITA-49 data plane (below).
+    connect(m_backend.get(), &IRadioBackend::meterDefined, this,
+            [this](int index, const QVariantMap& f) {
+        MeterDef def;
+        def.index = index;
+        if (f.contains(QStringLiteral("source")))
+            def.source = f.value(QStringLiteral("source")).toString();
+        if (f.contains(QStringLiteral("sourceIndex")))
+            def.sourceIndex = f.value(QStringLiteral("sourceIndex")).toInt();
+        if (f.contains(QStringLiteral("name")))
+            def.name = f.value(QStringLiteral("name")).toString();
+        if (f.contains(QStringLiteral("unit")))
+            def.unit = f.value(QStringLiteral("unit")).toString();
+        if (f.contains(QStringLiteral("low")))
+            def.low = f.value(QStringLiteral("low")).toDouble();
+        if (f.contains(QStringLiteral("high")))
+            def.high = f.value(QStringLiteral("high")).toDouble();
+        if (f.contains(QStringLiteral("description")))
+            def.description = f.value(QStringLiteral("description")).toString();
+        m_meterModel.defineMeter(def);
+    });
+    connect(m_backend.get(), &IRadioBackend::meterRemoved, this,
+            [this](int index) { m_meterModel.removeMeter(index); });
+
+    // aetherd RFC 2.3: SliceModel touchpoint. The backend decodes Flex slice
+    // status into a typed SliceDelta; RadioModel routes it to the addressed slice.
+    // This is an AutoConnection: because FlexBackend shares RadioModel's thread it
+    // resolves to a synchronous DirectConnection today, so a slice just appended
+    // to m_slices is populated before the sliceAdded UI notify below. (If a
+    // backend is ever moved to a worker thread this becomes queued — the ordering
+    // guarantee would then need an explicit populate step, not Qt::DirectConnection
+    // across threads. #4068 review.)
+    connect(m_backend.get(), &IRadioBackend::sliceChanged, this,
+            [this](int sliceId, const SliceDelta& delta) {
+        if (SliceModel* s = slice(sliceId)) {
+            s->applyChanges(delta);
+        }
+    });
+
+    // aetherd RFC 2.3: TransmitModel touchpoint. The backend decodes the five
+    // Flex transmit-family status planes (transmit/interlock/ATU/APD/APD-sampler)
+    // into a typed TransmitDelta; RadioModel drives the TransmitModel. Driven
+    // synchronously from the matching decode*Status() calls in the status
+    // handlers (main-thread AutoConnection → DirectConnection).
+    connect(m_backend.get(), &IRadioBackend::transmitChanged, this,
+            [this](const TransmitDelta& delta) { m_transmitModel.applyChanges(delta); });
 
     // Centralized DAX RX channel ownership (#3305): PanadapterStream decides
     // WHEN a dax_rx stream must exist (refcounted acquire/release from the
@@ -674,9 +788,21 @@ RadioModel::~RadioModel()
 {
     // Disconnect RadioModel's own connections to the wire objects BEFORE they
     // are torn down, to prevent use-after-free (ASAN). (#502) The objects are
-    // still alive here — the backend owns them and destroys them next.
+    // still alive here — the backend owns them and destroys them next. The WAN
+    // connection also delivers statusReceived → handlePanadapterStatus / the
+    // waterfall handler, both of which now deref m_flexBackend — sever it too so
+    // a late WAN status can't reach a half-destroyed backend. (#4065 review)
     QObject::disconnect(m_connection, nullptr, this, nullptr);
     QObject::disconnect(m_panStream, nullptr, this, nullptr);
+    if (m_wanConn) {
+        QObject::disconnect(m_wanConn, nullptr, this, nullptr);
+    }
+
+    // Null the transitional alias BEFORE destroying the backend, so any status
+    // slot that runs during teardown finds the `if (m_flexBackend)` guards
+    // failing closed instead of dereferencing a backend mid-destruction. (#4063
+    // introduced the alias; #4065 review moved this null ahead of the reset.)
+    m_flexBackend = nullptr;
 
     // Destroy the backend, which owns the RadioConnection + PanadapterStream and
     // their worker threads: ~FlexBackend runs the exact #502 teardown ordering
@@ -685,12 +811,6 @@ RadioModel::~RadioModel()
     m_backend.reset();
     m_connection = nullptr;
     m_panStream = nullptr;
-    // The transitional alias points into the just-destroyed backend — null it so
-    // the many `if (m_flexBackend)` guards (decode calls in handlePanadapterStatus,
-    // the slice modeChangeRequested lambda) fail closed instead of dereferencing a
-    // dangling pointer. handlePanadapterStatus is also reachable via the WAN
-    // statusReceived connection, so this isn't purely theoretical. (#4063 review)
-    m_flexBackend = nullptr;
 }
 
 bool RadioModel::isConnected() const
@@ -1921,6 +2041,15 @@ PanadapterModel* RadioModel::activePanadapter() const
 PanadapterModel* RadioModel::panadapter(const QString& panId) const
 {
     return m_panadapters.value(panId, nullptr);
+}
+
+PanadapterModel* RadioModel::resolvePan(const QString& panId) const
+{
+    // Single source of the pan-addressing policy: the addressed pan, else the
+    // active one. Used by the aetherd RFC 2.3 backend-signal handlers so a future
+    // change (e.g. don't fall back for MultiFlex-owned pans) lands in one place.
+    auto* p = m_panadapters.value(panId, nullptr);
+    return p ? p : activePanadapter();
 }
 
 DisplayInventory::Report RadioModel::displayInventoryReport() const
@@ -5012,8 +5141,15 @@ void RadioModel::onStatusReceived(const QString& object,
                 ours = true;
             }
 
-            if (ownerPan)
-                ownerPan->applyWaterfallStatus(kvs);
+            // aetherd RFC 2.3: waterfall status decode fully behind the seam.
+            // center/bandwidth converge onto the SAME decodePanCenterBandwidth as
+            // pan status (single-sourced, the #4063 gap), and line_duration → the
+            // universal panWaterfallLineDurationChanged. applyWaterfallStatus is
+            // gone — PanadapterModel no longer decodes the wire.
+            if (ownerPan && m_flexBackend) {
+                m_flexBackend->decodePanCenterBandwidth(ownerPan->panId(), kvs);
+                m_flexBackend->decodeWaterfallLineDuration(ownerPan->panId(), kvs);
+            }
             if (activeWfId().isEmpty() && ownerPan == activePanadapter())
                 ownerPan->setWaterfallId(wfId);
             updateStreamFilters();
@@ -5035,7 +5171,7 @@ void RadioModel::onStatusReceived(const QString& object,
         const auto m = atuRe.match(object);
         if (m.hasMatch() && m_tunerModel.handle().isEmpty())
             m_tunerModel.setHandle(m.captured(1));
-        m_transmitModel.applyAtuStatus(kvs);
+        if (m_flexBackend) m_flexBackend->decodeAtuStatus(kvs);
         if (m_tunerModel.isPresent())
             m_tunerModel.applyStatus(kvs);
         return;
@@ -5050,7 +5186,7 @@ void RadioModel::onStatusReceived(const QString& object,
     // Our parser splits object/kvs at the last space before the first '=',
     // so any leading bare flags get absorbed into the object name.
     if (object == "apd sampler") {
-        m_transmitModel.applyApdSamplerStatus(kvs);
+        if (m_flexBackend) m_flexBackend->decodeApdSamplerStatus(kvs);
         return;
     }
     if (object == "apd" || object.startsWith("apd ")) {
@@ -5059,7 +5195,7 @@ void RadioModel::onStatusReceived(const QString& object,
             const QStringList flags = object.mid(4).split(' ', Qt::SkipEmptyParts);
             for (const auto& f : flags) merged.insert(f, QString{});
         }
-        m_transmitModel.applyApdStatus(merged);
+        if (m_flexBackend) m_flexBackend->decodeApdStatus(merged);
         return;
     }
 
@@ -5160,7 +5296,7 @@ void RadioModel::onStatusReceived(const QString& object,
 
     // Transmit status: "transmit rfpower=93 tunepower=38 tune=0 ..."
     if (object == "transmit") {
-        m_transmitModel.applyTransmitStatus(kvs);
+        if (m_flexBackend) m_flexBackend->decodeTransmitStatus(kvs);
         return;
     }
 
@@ -5284,7 +5420,7 @@ void RadioModel::onStatusReceived(const QString& object,
             m_txOwnedByUs = (txOwner == clientHandle() || txOwner == 0);
         }
         // Parse interlock timing fields into TransmitModel (#498)
-        m_transmitModel.applyInterlockStatus(kvs);
+        if (m_flexBackend) m_flexBackend->decodeInterlockStatus(kvs);
 
         // Track PTT source (#2373). The radio reports source=SW for software
         // MOX/CAT/xmit, and source=MIC|ACC|RCA for hardware-keyed PTT (mic
@@ -5398,7 +5534,7 @@ void RadioModel::onStatusReceived(const QString& object,
         } else {
             emit txOwnerChanged(false, {});  // we own TX (or nobody does)
         }
-        m_transmitModel.applyInterlockStatus(kvs);
+        if (m_flexBackend) m_flexBackend->decodeInterlockStatus(kvs);
         return;
     }
 
@@ -5731,7 +5867,10 @@ void RadioModel::handleSliceStatus(int id,
         }
         s->setRttyMarkDefault(m_rttyMarkDefault);
         m_slices.append(s);
-        s->applyStatus(kvs);  // populate frequency/mode before notifying UI
+        // aetherd RFC 2.3: decode Flex slice status behind the seam → the
+        // synchronous sliceChanged handler applies it to this slice (already in
+        // m_slices) before the UI notify below. (populate frequency/mode first.)
+        if (m_flexBackend) m_flexBackend->decodeSliceStatus(id, kvs);
         m_meterModel.setActiveTxSlice(activeTxSliceNum());
         enforceTransmitInhibitForSlice(s);
         if (!reclaimed) {
@@ -5746,10 +5885,13 @@ void RadioModel::handleSliceStatus(int id,
             sendCmd(QString("slice set %1 tx=1").arg(id));
         }
         emit slotOccupancyChanged(id);  // empty/foreign → ours
-        return;                // applyStatus already called below; skip second call
+        return;   // status already decoded above via decodeSliceStatus; don't
+                  // re-run the fall-through decodeSliceStatus at the end
     }
 
-    s->applyStatus(kvs);
+    // aetherd RFC 2.3: Flex slice status decodes in FlexBackend → sliceChanged →
+    // applyChanges (synchronous, main-thread) drives this slice.
+    if (m_flexBackend) m_flexBackend->decodeSliceStatus(id, kvs);
     m_meterModel.setActiveTxSlice(activeTxSliceNum());
     enforceTransmitInhibitForSlice(s);
 
@@ -5772,55 +5914,14 @@ void RadioModel::handleSliceStatus(int id,
 
 void RadioModel::handleMeterStatus(const QString& rawBody)
 {
-    // Meter status body format (from FlexLib Radio.cs ParseMeterStatus):
-    //   Tokens separated by '#', each token is "index.key=value".
-    //   Example: "7.src=SLC#7.num=0#7.nam=LEVEL#7.unit=dBm#7.low=-150.0#7.hi=20.0"
-    //
-    // Removal format: "7 removed"
-
-    if (rawBody.contains("removed")) {
-        const QStringList words = rawBody.split(' ', Qt::SkipEmptyParts);
-        if (words.size() >= 1) {
-            bool ok = false;
-            const int idx = words[0].toInt(&ok);
-            if (ok) m_meterModel.removeMeter(idx);
-        }
-        return;
-    }
-
-    // Group tokens by meter index
-    QMap<int, QMap<QString, QString>> grouped;
-    const QStringList tokens = rawBody.split('#', Qt::SkipEmptyParts);
-
-    for (const QString& token : tokens) {
-        const int dot = token.indexOf('.');
-        if (dot < 0) continue;
-        const int eq = token.indexOf('=', dot);
-        if (eq < 0) continue;
-
-        bool ok = false;
-        const int idx = token.left(dot).toInt(&ok);
-        if (!ok) continue;
-
-        const QString key   = token.mid(dot + 1, eq - dot - 1);
-        const QString value = token.mid(eq + 1);
-        grouped[idx][key] = value;
-    }
-
-    for (auto it = grouped.constBegin(); it != grouped.constEnd(); ++it) {
-        const auto& fields = it.value();
-
-        MeterDef def;
-        def.index = it.key();
-        if (fields.contains("src"))  def.source      = fields["src"];
-        if (fields.contains("num"))  def.sourceIndex  = fields["num"].toInt(nullptr, 0);
-        if (fields.contains("nam"))  def.name         = fields["nam"];
-        if (fields.contains("unit")) def.unit         = fields["unit"];
-        if (fields.contains("low"))  def.low          = fields["low"].toDouble();
-        if (fields.contains("hi"))   def.high         = fields["hi"].toDouble();
-        if (fields.contains("desc")) def.description  = fields["desc"];
-
-        m_meterModel.defineMeter(def);
+    // aetherd RFC 2.3: the SmartSDR meter-status wire decode moved to
+    // FlexBackend::decodeMeterStatus, which emits meterDefined/meterRemoved →
+    // the ctor-wired handlers drive the MeterModel. Driving it from this choke
+    // point keeps both live and deferred/replayed meter status on the converted
+    // path. (MeterModel already held only core state; this removes the last Flex
+    // meter wire-decode from RadioModel.)
+    if (m_flexBackend) {
+        m_flexBackend->decodeMeterStatus(rawBody);
     }
 }
 
@@ -5855,36 +5956,32 @@ void RadioModel::handleGpsStatus(const QString& rawBody)
 
 void RadioModel::handlePanadapterStatus(const QString& panId, const QMap<QString, QString>& kvs)
 {
-    // Delegate to the specific PanadapterModel, not just the active one
+    // Resolve the addressed pan (fall back to active) for the y_pixels/resize
+    // bookkeeping below. All Flex status DECODE now lives in FlexBackend and
+    // drives the model via the normalized signals wired in the ctor — so there
+    // is no longer an applyPanStatus() call here (PanadapterModel holds no wire
+    // decoder). aetherd RFC 2.3: PanadapterModel touchpoint fully converted.
     auto* pan = m_panadapters.value(panId, nullptr);
     const bool panMatchedById = pan != nullptr;
     if (!pan) pan = activePanadapter();  // fallback
-    const float previousMinDbm = pan ? pan->minDbm() : 0.0f;
-    const float previousMaxDbm = pan ? pan->maxDbm() : 0.0f;
-    if (pan) {
-        pan->applyPanStatus(kvs);
-    }
 
-    // aetherd RFC 2.3: center/bandwidth decode moved to the backend. Driving it
-    // from this choke point (not a live statusReceived observer) means both live
-    // and deferred/replayed status flow through the converted path. The
-    // panCenterBandwidthChanged signal applies to the model + emits the legacy
-    // panadapterInfoChanged (in the ctor-wired handler above).
+    // Drive every converted pan field from this status choke point (not a live
+    // statusReceived observer) so both live and deferred/replayed status flow
+    // through the backend decode:
+    //   - center/bandwidth → panCenterBandwidthChanged → setCenterBandwidth
+    //   - min/max dBm      → panRangeChanged → setRange (+ setDbmRange side-effect)
+    //   - rfgain / antenna → panRfGainChanged / panRx/AntennaList (universal)
+    //   - WNB              → extensionStatus("flex","panWnb")
+    //   - wide/loop/fps/pre/daxiq/client_handle/waterfall → …("flex","panState")
+    // Each ctor-wired handler applies to the addressed pan and preserves the
+    // legacy signals/side-effects the old inline code owned.
     if (m_flexBackend) {
         m_flexBackend->decodePanCenterBandwidth(panId, kvs);
+        m_flexBackend->decodePanRange(panId, kvs);
+        m_flexBackend->decodePanRfGain(panId, kvs);
+        m_flexBackend->decodePanAntenna(panId, kvs);
         m_flexBackend->decodePanExtensions(panId, kvs);
-    }
-    if (kvs.contains("min_dbm") || kvs.contains("max_dbm")) {
-        const float minDbm = pan ? pan->minDbm() : kvs.value("min_dbm", "-130").toFloat();
-        const float maxDbm = pan ? pan->maxDbm() : kvs.value("max_dbm", "-20").toFloat();
-        if (pan) {
-            const bool levelChanged = (pan->minDbm() != previousMinDbm)
-                || (pan->maxDbm() != previousMaxDbm);
-            if (levelChanged) {
-                m_panStream->setDbmRange(pan->panStreamId(), minDbm, maxDbm);
-            }
-        }
-        emit panadapterLevelChanged(minDbm, maxDbm);
+        m_flexBackend->decodePanState(panId, kvs);
     }
     // Track usable ypixels from radio status — the radio encodes FFT bins as
     // pixel Y positions (0..ypixels-1), so PanadapterStream needs this for dBm
@@ -5910,13 +6007,9 @@ void RadioModel::handlePanadapterStatus(const QString& panId, const QMap<QString
             emit panDimensionsNeeded(pan->panId());
         }
     }
-    if (kvs.contains("ant_list")) {
-        const QStringList ants = kvs["ant_list"].split(',', Qt::SkipEmptyParts);
-        if (ants != m_antList) {
-            m_antList = ants;
-            emit antListChanged(m_antList);
-        }
-    }
+    // (ant_list is now decoded in FlexBackend → panAntennaListChanged, whose
+    // ctor handler drives both the pan model AND this m_antList/antListChanged —
+    // the old inline dual-parse here is gone. aetherd RFC 2.3.)
 
     // Configure the panadapter once we know its ID.
     if (pan && !pan->isResized() && isConnected()) {

@@ -72,10 +72,6 @@ public:
     void setPanId(const QString& id);
     QString panId() const { return m_panId; }
 
-    // Reflect the global Lean-mode state on this pan's Lean button without
-    // re-emitting (MainWindow keeps every pan's button in sync).
-    void setLeanChecked(bool on);
-
     // Connect/disconnect the ANT panel to a slice model.
     void setSlice(SliceModel* slice);
     void setWnbState(bool on, int level);
@@ -95,6 +91,14 @@ public:
     // a default-constructed value when disconnected — the conditional
     // VHF row will disappear.  Triggers a band-panel rebuild. (#695)
     void setRadioCapabilities(ModelCapabilities caps);
+
+    // Bands the radio itself declared (optional "bands=" discovery/status
+    // key, names from BandDefs).  Non-empty: the band grid is built from
+    // this list instead of the HF layout + model capability flags, so a
+    // gateway presenting non-Flex hardware offers its true band set (e.g.
+    // an IC-9700's 2m/440/23cm).  Empty (all real Flex radios): the grid
+    // is unchanged.  Triggers a band-panel rebuild on change.
+    void setDeclaredBands(const QStringList& bands);
     void syncDaxIqChannel(int channel);
     // Reflect the real WFM demodulator state onto the DAX-panel WFM toggle
     // WITHOUT re-emitting wfmToggleRequested. Self-gated on this menu's slice,
@@ -190,8 +194,6 @@ signals:
     void backgroundOpacityChanged(int pct);
     void backgroundFillColorChanged(const QColor& color);
     void displaySettingsReset();
-    // Global low-overhead render mode (opaque pan/VFO, capped repaint, WAVE off).
-    void leanModeToggled(bool on);
 
 private:
     QString m_panId;
@@ -231,7 +233,6 @@ private:
     static constexpr int kBtnDax = 6;
 
     QPushButton* m_toggleBtn{nullptr};
-    QPushButton* m_leanBtn{nullptr};  // Lean toggle (lives in the Display panel)
     QVector<QPushButton*> m_menuBtns;
     bool m_expanded{true};
 
@@ -248,6 +249,7 @@ private:
     // without the caller needing to re-supply the other half. (#695)
     QVector<XvtrBand>  m_lastXvtrBands;
     ModelCapabilities  m_radioCapabilities;
+    QStringList        m_declaredBands;   // radio-declared band set (see setDeclaredBands)
 
     // ANT sub-panel
     QWidget*     m_antPanel{nullptr};

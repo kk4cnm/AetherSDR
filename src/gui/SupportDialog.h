@@ -1,6 +1,6 @@
 #pragma once
 
-#include <QDialog>
+#include "PersistentDialog.h"
 #include <QMap>
 
 class QCheckBox;
@@ -11,7 +11,7 @@ namespace AetherSDR {
 
 class RadioModel;
 
-class SupportDialog : public QDialog {
+class SupportDialog : public PersistentDialog {
     Q_OBJECT
 
 public:
@@ -19,11 +19,15 @@ public:
 
     void setRadioModel(RadioModel* model) { m_radioModel = model; }
 
+    // Standalone entry points so the Help menu can offer these actions
+    // directly, without routing the user through the Support dialog.
+    static void fileIssue(QWidget* parent, RadioModel* radioModel);
+    static void resetSettings(QWidget* parent);
+
 private slots:
     void refreshLog();
     void clearLog();
     void openLogFolder();
-    void resetSettings();
     void enableAll();
     void disableAll();
     void sendToSupport();

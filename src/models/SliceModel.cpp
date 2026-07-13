@@ -1,4 +1,5 @@
 #include "SliceModel.h"
+#include "core/DigitalVoiceModeRegistry.h"
 #include "core/KiwiSdrProtocol.h"
 #include <QDebug>
 
@@ -16,6 +17,11 @@ SliceModel::SliceModel(int id, QObject* parent)
             this, [this] { setLockedFeedbackActive(false); });
 }
 
+SliceModel::~SliceModel()
+{
+    DigitalVoiceModeRegistry::instance().releaseSlice(m_id);
+}
+
 void SliceModel::setLockedFeedbackActive(bool on)
 {
     if (m_lockedFeedbackActive == on) return;
@@ -30,6 +36,45 @@ void SliceModel::setLockedFeedbackActive(bool on)
 void SliceModel::sendCommand(const QString& cmd)
 {
     emit commandReady(cmd);
+}
+
+// ── Filter polarity (#3434) ─────────────────────────────────────────────
+// FlexLib knows FDV only as a USB-family mode (Slice.cs:543-546), so the
+// radio reports BOTH FDVU and FDVL passbands in USB form (positive lo/hi).
+// Client-side, lower-sideband modes store negative offsets from the carrier
+// (the overlay, hit-testing and preset math all assume it). These helpers
+// hold the single mode→family mapping every polarity decision uses.
+bool SliceModel::filterPolarityUsbFamily(const QString& mode)
+{
+    return mode == "USB" || mode == "DIGU"
+        || mode == "FDV" || mode == "FDVU"   // FlexLib USB-family (FDV incl.)
+        || mode == "NT";                     // NAVTEX: USB-family digital (v4.2.18)
+}
+
+bool SliceModel::filterPolarityLsbFamily(const QString& mode)
+{
+    return mode == "LSB" || mode == "DIGL" || mode == "FDVL";
+}
+
+bool SliceModel::normalizeFilterPolarity()
+{
+    // Mirror across the carrier, preserving BOTH edges (asymmetric-safe):
+    // (lo,hi) → (-hi,-lo). For symmetric SSB this matches the historical
+    // flip (0,2700 → -2700,0); for asymmetric FDVL it keeps the low cut
+    // (95,2000 → -2000,-95) instead of collapsing it to (-2000,0), which is
+    // the discarded-edge regression #3092 worked around by excluding FDV.
+    // Sign-guarded and idempotent: values already in canonical form (and
+    // carrier-straddling passbands) are left untouched.
+    const bool usbFam = filterPolarityUsbFamily(m_mode);
+    const bool lsbFam = filterPolarityLsbFamily(m_mode);
+    if ((usbFam && m_filterLow < 0 && m_filterHigh <= 0)
+        || (lsbFam && m_filterLow >= 0 && m_filterHigh > 0)) {
+        const int lo = m_filterLow, hi = m_filterHigh;
+        m_filterLow  = -hi;
+        m_filterHigh = -lo;
+        return true;
+    }
+    return false;
 }
 
 void SliceModel::setFrequency(double mhz)
@@ -62,7 +107,47 @@ void SliceModel::tuneAndRecenter(double mhz)
 
 void SliceModel::setMode(const QString& mode)
 {
-    if (m_mode == mode) return;
+    const std::optional<DigitalVoiceModeId> requestedMode =
+        DigitalVoiceModeRegistry::modeForRadioMode(mode);
+    if (m_mode == mode) {
+        if (requestedMode.has_value()) {
+            const DigitalVoiceModeDescriptor& descriptor =
+                DigitalVoiceModeRegistry::descriptor(requestedMode.value());
+            const QString previousMode = m_modeBeforeDigitalVoice.isEmpty()
+                ? descriptor.underlyingMode
+                : m_modeBeforeDigitalVoice;
+            QString error;
+            if (!DigitalVoiceModeRegistry::instance().claimSlice(
+                    requestedMode.value(), m_id, previousMode, &error)) {
+                qWarning().noquote()
+                    << "SliceModel: restored digital-voice mode rejected:" << error;
+            }
+        }
+        return;
+    }
+
+    if (requestedMode.has_value()) {
+        const QString previousMode =
+            DigitalVoiceModeRegistry::modeForRadioMode(m_mode).has_value()
+            ? DigitalVoiceModeRegistry::descriptor(requestedMode.value()).underlyingMode
+            : m_mode;
+        std::optional<DigitalVoiceSliceClaim> displaced;
+        QString error;
+        if (!DigitalVoiceModeRegistry::instance().transferSlice(
+                requestedMode.value(), m_id, previousMode, &displaced, &error)) {
+            qWarning().noquote() << "SliceModel: digital-voice mode rejected:" << error;
+            return;
+        }
+        if (displaced.has_value()) {
+            emit digitalVoiceSliceDisplaced(
+                displaced->sliceId, displaced->previousMode);
+        }
+        m_modeBeforeDigitalVoice = previousMode;
+    } else if (DigitalVoiceModeRegistry::modeForRadioMode(m_mode).has_value()) {
+        DigitalVoiceModeRegistry::instance().releaseSlice(m_id);
+        m_modeBeforeDigitalVoice.clear();
+    }
+
     m_mode = mode;
     // aetherd RFC 2.3: express intent; FlexBackend builds "slice set N mode=…"
     // and routes it through the TX-inhibit-guarded slice sink.
@@ -74,6 +159,16 @@ void SliceModel::setFilterWidth(int low, int high)
 {
     m_filterLow  = low;
     m_filterHigh = high;
+    // Boundary defense (#3434): client-side callers can replay values captured
+    // under the pre-mirror convention (band-stack bookmarks, band snapshots,
+    // FilterPresets_* in AppSettings, net presets stored positive for FDVL) or
+    // pass audio-domain positives (EQ cutoff drag). Normalizing here keeps the
+    // model canonical even when the radio's filter already matches and no
+    // status echo will arrive to heal it. Sign-guarded: canonical input is
+    // untouched.
+    normalizeFilterPolarity();
+    low = m_filterLow;
+    high = m_filterHigh;
     // Operator-driven filter change (preset/drag): bump the user epoch so the
     // adaptive engine adopts this as its new baseline. applyAdaptiveFilter()
     // deliberately does NOT bump it. RFC #3878.
@@ -528,8 +623,18 @@ void SliceModel::setTxSlice(bool on)
 
 void SliceModel::setActive(bool on)
 {
-    if (on)
+    if (on) {
+        // Optimistic (#3854 review): activeSlice() prefers the radio's active
+        // flag, so waiting for the echo leaves a one-round-trip window where
+        // the PREVIOUS slice still reads active and the first wheel/MIDI/
+        // shortcut inputs land on it (worst over SmartLink latency). The echo
+        // remains authoritative — a rejected select is corrected by status.
+        if (!m_active) {
+            m_active = true;
+            emit activeChanged(true);
+        }
         sendCommand(QString("slice set %1 active=1").arg(m_id));
+    }
 }
 
 // ─── Record/playback ────────────────────────────────────────────────────────
@@ -825,43 +930,97 @@ void SliceModel::applyChanges(const SliceDelta& d)
     }
     if (d.mode.has_value()) {
         const QString m = *d.mode;
-        if (m_mode != m) {
+        const std::optional<DigitalVoiceModeId> previousMode =
+            DigitalVoiceModeRegistry::modeForRadioMode(m_mode);
+        const std::optional<DigitalVoiceModeId> incomingMode =
+            DigitalVoiceModeRegistry::modeForRadioMode(m);
+        bool acceptIncomingMode = true;
+        if (incomingMode.has_value()) {
+            const DigitalVoiceModeDescriptor& descriptor =
+                DigitalVoiceModeRegistry::descriptor(incomingMode.value());
+            const QString restoreMode = !m_modeBeforeDigitalVoice.isEmpty()
+                ? m_modeBeforeDigitalVoice
+                : (previousMode.has_value() ? descriptor.underlyingMode : m_mode);
+            QString error;
+            if (!DigitalVoiceModeRegistry::instance().claimSlice(
+                    incomingMode.value(), m_id, restoreMode, &error)) {
+                qWarning().noquote()
+                    << "SliceModel: radio reported conflicting digital-voice slice:"
+                    << error;
+                acceptIncomingMode = false;
+                const QString correctedMode = previousMode.has_value()
+                    ? restoreMode
+                    : m_mode;
+                if (m_mode != correctedMode) {
+                    m_mode = correctedMode;
+                    modeChanged_ = true;
+                }
+                m_modeBeforeDigitalVoice.clear();
+                emit modeChangeRequested(correctedMode);
+            } else if (!previousMode.has_value()) {
+                m_modeBeforeDigitalVoice = restoreMode;
+            }
+        } else if (previousMode.has_value()) {
+            DigitalVoiceModeRegistry::instance().releaseSlice(m_id);
+            m_modeBeforeDigitalVoice.clear();
+        }
+
+        if (acceptIncomingMode && m_mode != m) {
             m_mode = m;
             modeChanged_ = true;
         }
     }
-    if (d.filterLow.has_value() || d.filterHigh.has_value()) {
-        // The radio may report one edge without the other; keep the current
-        // value for the absent one (the old parse defaulted to the member).
-        m_filterLow  = d.filterLow.has_value()
-            ? *d.filterLow : m_filterLow;
-        m_filterHigh = d.filterHigh.has_value()
-            ? *d.filterHigh : m_filterHigh;
-
-        // Radio sometimes sends wrong-polarity filter offsets after session
-        // restore (e.g. negative offsets for USB/DIGU). Normalize based on mode.
-        //
-        // FDV/FDVU/FDVL are excluded: FreeDV passbands are asymmetric
-        // (e.g. 95..widthHz for FDVU; -widthHz..-95 for FDVL — see
-        // VfoWidget.cpp:3773-3777) and FlexLib only knows "FDV" as a
-        // USB-family mode (Slice.cs:545-550). When the radio echoes an
-        // asymmetric FDVL filter as USB-form (positive lo/hi), the
-        // anchored flip discards one edge and offsets the overlay (#3092).
-        const bool isUsbFamily = (m_mode == "USB" || m_mode == "DIGU"
-                                  || m_mode == "NT");  // NAVTEX: USB-family digital (v4.2.18)
-        const bool isLsbFamily = (m_mode == "LSB" || m_mode == "DIGL");
-        if (isUsbFamily && m_filterLow < 0 && m_filterHigh <= 0) {
-            // Flip: -2700,0 → 0,2700
-            int w = std::abs(m_filterLow);
-            m_filterLow = 0;
-            m_filterHigh = w;
-        } else if (isLsbFamily && m_filterLow >= 0 && m_filterHigh > 0) {
-            // Flip: 0,2700 → -2700,0
-            int w = m_filterHigh;
-            m_filterLow = -w;
-            m_filterHigh = 0;
+    if (d.filterLow.has_value() && d.filterHigh.has_value()) {
+        // Full pair: adopt the wire values, then normalize polarity. The radio
+        // sometimes reports wrong-polarity offsets after session restore
+        // (negative for USB/DIGU), and it ALWAYS reports FDVL in USB form
+        // (positive — FlexLib Slice.cs:543-546 knows FDV only as USB-family)
+        // while the client stores lower-sideband modes negative (overlay,
+        // hit-testing and preset math: lo=-widthHz, hi=-95). #3092 excluded
+        // FDV because the old anchored flip discarded one asymmetric edge;
+        // normalizeFilterPolarity()'s mirror preserves both edges (#3434).
+        m_filterLow  = *d.filterLow;
+        m_filterHigh = *d.filterHigh;
+        normalizeFilterPolarity();
+        filterChanged_ = true;
+    } else if (d.filterLow.has_value() || d.filterHigh.has_value()) {
+        // One edge without the other. The stored form can legitimately differ
+        // from the wire form (FDVL: stored negative, wire positive), and under
+        // the mirror a single wire edge maps to the OPPOSITE stored edge
+        // (wire filter_hi=3000 for FDVL means stored filterLow=-3000). Merging
+        // a wrong-form edge directly would build a carrier-straddling passband
+        // that neither pair guard can fix (#3434 review). Sign-gate per edge:
+        // wrong-form → crosswise with negation; canonical-form → direct.
+        // Applying this rule to both edges of a pair reproduces the pair
+        // mirror exactly, so it is a strict generalization.
+        const bool haveLo = d.filterLow.has_value();
+        const int v = haveLo ? *d.filterLow : *d.filterHigh;
+        const bool wrongForm =
+            (filterPolarityLsbFamily(m_mode) && v > 0)
+            || (filterPolarityUsbFamily(m_mode) && v < 0);
+        if (wrongForm) {
+            if (haveLo) {
+                m_filterHigh = -v;
+            } else {
+                m_filterLow = -v;
+            }
+        } else {
+            if (haveLo) {
+                m_filterLow = v;
+            } else {
+                m_filterHigh = v;
+            }
         }
         filterChanged_ = true;
+    } else if (modeChanged_) {
+        // Mode changed with NO filter keys in the same delta (a second client
+        // flipping FDVU→FDVL mid-session — the reporter's MultiFlex setup).
+        // The stored polarity may now be wrong for the new mode; the mirror is
+        // sign-guarded and idempotent, so re-running it is safe and fixes the
+        // stale-side overlay without waiting for the next filter echo (#3434).
+        if (normalizeFilterPolarity()) {
+            filterChanged_ = true;
+        }
     }
     if (d.modeList.has_value()) {
         const QStringList modes = *d.modeList;

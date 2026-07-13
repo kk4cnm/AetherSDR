@@ -4,6 +4,7 @@
 #include "Resampler.h"
 #include "deep_filter.h"
 
+#include <cstddef>
 #include <cstring>
 #include <vector>
 #include <QCoreApplication>
@@ -188,6 +189,10 @@ DeepFilterFilter::DeepFilterFilter()
     m_state = df_create(modelPath.constData(), m_attenLimit.load(), nullptr);
     if (m_state) {
         m_frameSize = static_cast<int>(df_get_frame_length(m_state));
+        // The bundled DFN3 model uses fft_size=960, hop_size=480 and two
+        // lookahead frames. Its documented delay is
+        // (fft_size - hop_size) + lookahead * hop_size = 3 hops at 48 kHz.
+        m_stereoAdapter.setProcessingLatencyFrames(3 * m_frameSize / 2);
         qDebug() << "DeepFilterFilter: initialized, frame size =" << m_frameSize;
     } else {
         qWarning() << "DeepFilterFilter: df_create() failed!";
@@ -212,12 +217,14 @@ void DeepFilterFilter::reset()
         m_state = df_create(modelPath.constData(), m_attenLimit.load(), nullptr);
         if (m_state) {
             m_frameSize = static_cast<int>(df_get_frame_length(m_state));
+            m_stereoAdapter.setProcessingLatencyFrames(3 * m_frameSize / 2);
         }
     }
     m_up = std::make_unique<Resampler>(24000, 48000);
     m_down = std::make_unique<Resampler>(48000, 24000);
     m_inAccum.clear();
     m_outAccum.clear();
+    m_stereoAdapter.reset();
     m_paramsDirty.store(true);
 }
 
@@ -247,9 +254,15 @@ QByteArray DeepFilterFilter::process(const QByteArray& pcm24kStereo)
 
     const auto* src = reinterpret_cast<const float*>(pcm24kStereo.constData());
     const int stereoFrames = pcm24kStereo.size() / (2 * static_cast<int>(sizeof(float)));
+    m_stereoAdapter.pushDryStereo(pcm24kStereo);
 
-    // 1. Upsample 24kHz stereo float32 → 48kHz mono float32 via r8brain
-    QByteArray mono48k = m_up->processStereoToMono(src, stereoFrames);
+    // 1. Downmix, then upsample 24kHz mono float32 → 48kHz mono float32 via r8brain.
+    // The dry stereo stays queued so DeepFilterNet attenuation preserves balance.
+    m_mono24k.resize(stereoFrames);
+    for (int i = 0; i < stereoFrames; ++i) {
+        m_mono24k[i] = 0.5f * (src[i * 2] + src[i * 2 + 1]);
+    }
+    QByteArray mono48k = m_up->process(m_mono24k.data(), stereoFrames);
 
     // Already float32 in [-1, 1] range — DeepFilterNet's native format
     const auto* mono48kSamples = reinterpret_cast<const float*>(mono48k.constData());
@@ -271,12 +284,14 @@ QByteArray DeepFilterFilter::process(const QByteArray& pcm24kStereo)
 
     if (completeFrames > 0) {
         auto* accumData = reinterpret_cast<float*>(m_inAccum.data());
-        std::vector<float> processed48k(completeFrames * m_frameSize);
+        m_processed48k.resize(
+            static_cast<std::size_t>(completeFrames)
+            * static_cast<std::size_t>(m_frameSize));
 
         for (int f = 0; f < completeFrames; ++f) {
             df_process_frame(m_state,
                              &accumData[f * m_frameSize],
-                             &processed48k[f * m_frameSize]);
+                             &m_processed48k[f * m_frameSize]);
         }
 
         // Keep leftover input samples
@@ -290,13 +305,16 @@ QByteArray DeepFilterFilter::process(const QByteArray& pcm24kStereo)
             m_inAccum.clear();
         }
 
-        // 3. Downsample processed 48kHz mono float32 → 24kHz stereo float32
+        // 3. Downsample processed 48kHz mono float32 → 24kHz mono float32,
+        //    then apply the shared attenuation to delayed dry stereo.
         const int outputMonoSamples = completeFrames * m_frameSize;
 
-        QByteArray downsampled = m_down->processMonoToStereo(
-            processed48k.data(), outputMonoSamples);
+        QByteArray downsampled = m_down->process(
+            m_processed48k.data(), outputMonoSamples);
+        const auto* downsampledMono = reinterpret_cast<const float*>(downsampled.constData());
+        const int downsampledFrames = downsampled.size() / static_cast<int>(sizeof(float));
 
-        m_outAccum.append(downsampled);
+        m_outAccum.append(m_stereoAdapter.takeProcessedMono(downsampledMono, downsampledFrames));
     }
 
     // 4. Return exactly the same number of bytes as input

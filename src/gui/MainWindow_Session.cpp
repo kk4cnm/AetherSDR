@@ -53,12 +53,16 @@
 #include "SpectrumWidget.h"
 #include "TitleBar.h"
 #include "core/AppSettings.h"
+#include "core/AutomationBridgeSettings.h"
+#include "core/AutomationServer.h"
 #include "core/LogManager.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
 
 #include <QMessageBox>
+#include <QCoreApplication>
 #include <QDateTime>
+#include <QPointer>
 #include <QThread>
 #include <QTimer>
 
@@ -241,6 +245,9 @@ void MainWindow::wireDiscovery()
     connect(&m_discovery, &RadioDiscovery::radioDiscovered,
             this, [this](const RadioInfo& info) {
         if (m_userDisconnected) return;
+        if (qEnvironmentVariableIsSet("AETHER_AUTOMATION_NO_AUTOCONNECT")) {
+            return;
+        }
         if (AppSettings::instance().value("AutoConnectToLastRadio", "True").toString() != "True")
             return;
         const QString lastSerial = AppSettings::instance()
@@ -1101,13 +1108,11 @@ void MainWindow::wirePanLifecycle()
                                   "#0a0a14").toString());
             if (bgFill.isValid())
                 sw->setBackgroundFillColor(bgFill);
-            // Restore the spectrum render mode (2D / 3D stacked trace) + 3D floor
-            // depth per pan, like the other Display settings above, so a pan set
-            // to 3D survives a restart / pan re-attach.
+            // Restore the spectrum render mode per pan. Source-specific trace
+            // positions/depths are loaded by SpectrumWidget from
+            // DisplaySourceTraceSettings; do not reapply legacy flat keys here.
             sw->setSpectrumRenderMode(
                 s.value(sw->settingsKey("DisplaySpectrumRenderMode"), "0").toInt());
-            sw->setDssFloorDepth(
-                s.value(sw->settingsKey("Display3DFloorDepth"), "6").toInt());
             sw->setDssGain(
                 s.value(sw->settingsKey("Display3DGain"), "70").toInt());
             // Nudge rate to force waterfall tile re-sync
@@ -1141,8 +1146,15 @@ void MainWindow::wirePanLifecycle()
                 menu->setPanId(pan->panId());
                 menu->setRadioModel(&m_radioModel);
                 menu->setRadioCapabilities(m_radioModel.capabilities());
+                menu->setDeclaredBands(m_radioModel.declaredBands());
                 connect(pan, &PanadapterModel::infoChanged,
                         sw, &SpectrumWidget::setFrequencyRange);
+                connect(pan, &PanadapterModel::infoChanged,
+                        this, [this, panId = pan->panId()](double, double) {
+                    if (!profileLoadRadioStateWritesHeld()) {
+                        recenterCenterLockForPan(panId);
+                    }
+                });
                 connect(pan, &PanadapterModel::levelChanged,
                         sw, [sw](float minDbm, float maxDbm) {
                     if (sw->isDraggingDbmScale()) {
@@ -1169,6 +1181,11 @@ void MainWindow::wirePanLifecycle()
                 // position. (#3034)
                 sw->setDbmRange(pan->minDbm(), pan->maxDbm());
             }
+            for (SliceModel* slice : m_radioModel.slices()) {
+                if (slice && slice->panId() == pan->panId()) {
+                    reattachSliceVisualsToPanadapter(slice);
+                }
+            }
             return;
         }
 
@@ -1194,6 +1211,12 @@ void MainWindow::wirePanLifecycle()
         }
         connect(pan, &PanadapterModel::infoChanged,
                 applet->spectrumWidget(), &SpectrumWidget::setFrequencyRange);
+        connect(pan, &PanadapterModel::infoChanged,
+                this, [this, panId = pan->panId()](double, double) {
+            if (!profileLoadRadioStateWritesHeld()) {
+                recenterCenterLockForPan(panId);
+            }
+        });
         // NOTE: levelChanged → setDbmRange is wired in wirePanadapter() above;
         // don't connect it here again or setDbmRange fires twice per level change.
         connect(pan, &PanadapterModel::rfGainInfoChanged,
@@ -1213,6 +1236,11 @@ void MainWindow::wirePanLifecycle()
         requestPanDimensionsForRadio(pan->panId(), sw, true);
 
         qDebug() << "MainWindow: added panadapter applet for" << pan->panId();
+        for (SliceModel* slice : m_radioModel.slices()) {
+            if (slice && slice->panId() == pan->panId()) {
+                reattachSliceVisualsToPanadapter(slice);
+            }
+        }
 
         // Debounced layout restore: after all pans are added on connect,
         // rearrange to the saved layout (e.g. 2h instead of default vertical).
@@ -1282,6 +1310,11 @@ void MainWindow::wirePanLifecycle()
             return;
         }
         wirePanReconcilers(applet, pan);
+        for (SliceModel* slice : m_radioModel.slices()) {
+            if (slice && slice->panId() == pan->panId()) {
+                reattachSliceVisualsToPanadapter(slice);
+            }
+        }
     });
     // Re-push xpixels/ypixels when the radio requests it (profile change, reconnect, etc.)
     connect(&m_radioModel, &RadioModel::panDimensionsNeeded,
@@ -1334,6 +1367,8 @@ void MainWindow::wirePanLifecycle()
 
     connect(&m_radioModel, &RadioModel::panadapterRemoved,
             this, [this](const QString& panId) {
+        clearKiwiSdrPanDisplaySourceOverride(panId);
+        clearCenterLockForPan(panId);
         if (m_shuttingDown || !m_panStack) {
             return;
         }
@@ -1362,6 +1397,32 @@ void MainWindow::wirePanLifecycle()
                 it->timer->deleteLater();
             }
             m_wfLineDurationReconcile.erase(it);
+        }
+        if (auto it = m_panAverageReconcileConnections.find(panId);
+            it != m_panAverageReconcileConnections.end()) {
+            QObject::disconnect(it.value());
+            m_panAverageReconcileConnections.erase(it);
+        }
+        if (auto it = m_panWeightedAvgReconcileConnections.find(panId);
+            it != m_panWeightedAvgReconcileConnections.end()) {
+            QObject::disconnect(it.value());
+            m_panWeightedAvgReconcileConnections.erase(it);
+        }
+        if (auto it = m_panAverageReconcile.find(panId);
+            it != m_panAverageReconcile.end()) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+            m_panAverageReconcile.erase(it);
+        }
+        if (auto it = m_panWeightedAvgReconcile.find(panId);
+            it != m_panWeightedAvgReconcile.end()) {
+            if (it->timer) {
+                it->timer->stop();
+                it->timer->deleteLater();
+            }
+            m_panWeightedAvgReconcile.erase(it);
         }
 
         // Disconnect all signals from the dying applet's widgets to prevent
@@ -1574,6 +1635,109 @@ void MainWindow::wireDaxIq()
     });
 #endif
 
+}
+
+// ── Agent automation bridge (#3646) lifecycle ────────────────────────────────
+// Kept out of the MainWindow.cpp monolith. The bridge is the endpoint MCP
+// clients connect to; MainWindow owns the server instance for its lifetime.
+
+bool MainWindow::startAutomationBridge(const QString& sockName)
+{
+    if (m_automation && m_automation->isRunning())
+        return true;  // idempotent
+
+    // AETHER_AUTOMATION_SOCKET (or the caller's sockName) pins an explicit
+    // endpoint; otherwise the default is PID-suffixed so two instances don't
+    // steal each other's socket. Drivers find the right one via the discovery
+    // file the server drops in the temp dir.
+    QString name = sockName;
+    if (name.isEmpty())
+        name = qEnvironmentVariableIsSet("AETHER_AUTOMATION_SOCKET")
+                   ? qEnvironmentVariable("AETHER_AUTOMATION_SOCKET")
+                   : QStringLiteral("aethersdr-automation-%1")
+                         .arg(QCoreApplication::applicationPid());
+
+    if (!m_automation)
+        m_automation = std::make_unique<AutomationServer>();
+
+    m_automation->setRadioModel(&radioModel());  // for the get() verb
+    m_automation->setAudioEngine(audioEngine());
+    m_automation->setQsoRecorder(qsoRecorder());  // for the record() verb
+    m_automation->setConnectionDialogHost(this);
+    m_automation->setConnectionAutomation(
+        findChild<AetherSDR::ConnectionPanel*>(QStringLiteral("connectionPanel")));
+    m_automation->setSliceReceiveSourceHandler(
+        [this](const QString& arg) { return automationSetSliceReceiveSource(arg); });
+    m_automation->setSliceCenterLockHandler(
+        [this](int sliceId, bool enabled) { return automationSetCenterLock(sliceId, enabled); });
+    m_automation->setTuneHandler(
+        [this](double mhz) { return automationTune(mhz); });
+    m_automation->setReceiveSyncSnapshotHandler(
+        [this]() { return automationReceiveSyncSnapshot(); });
+    m_automation->setKiwiSdrSnapshotHandler(
+        [this]() { return automationKiwiSdrSnapshot(); });
+    m_automation->setTxTimerSnapshotHandler(
+        [this]() { return automationTxTimerSnapshot(); });
+
+    // The access token lives in the OS secret store (QtKeychain), which reads
+    // ASYNCHRONOUSLY. Defer start()/listen() into the token callback rather
+    // than opening a brief tokenless window on the socket. A QPointer guards
+    // against the bridge being stopped/replaced before the read lands.
+    QPointer<AutomationServer> guard(m_automation.get());
+    const QString startName = name;
+    AutomationBridgeSettings::loadToken(this, [this, guard, startName](const QString& tok) {
+        if (!guard || m_automation.get() != guard)
+            return;  // toggled off or restarted before the token arrived
+        guard->setAuthToken(tok);
+        if (tok.isEmpty()) {
+            qWarning().noquote()
+                << "Automation bridge starting UNAUTHENTICATED — any same-user "
+                   "process can drive the radio. Set an access token in Radio "
+                   "Setup → Network, or the AETHER_MCP_TOKEN environment variable.";
+        }
+        if (!guard->start(startName)) {
+            qWarning() << "Automation bridge failed to start (socket in use?)";
+            m_automation.reset();
+            return;
+        }
+        // TX-automation gate — set AFTER start(), which reads
+        // AETHER_AUTOMATION_ALLOW_TX into m_txAllowed and would otherwise
+        // clobber a pre-start value. Fold in the persisted operator opt-in so
+        // a GUI enable survives restart; setTxAllowed arms the watchdog.
+        guard->setTxAllowed(
+            qEnvironmentVariableIsSet("AETHER_AUTOMATION_ALLOW_TX")
+            || AutomationBridgeSettings::txAllowed());
+    });
+    return true;  // start initiated; the socket begins listening once the token resolves
+}
+
+void MainWindow::stopAutomationBridge()
+{
+    if (m_automation) {
+        m_automation->stop();
+        m_automation.reset();
+    }
+}
+
+void MainWindow::setAutomationBridgeToken(const QString& token)
+{
+    // Persist to the OS secret store (survives restart; read by
+    // startAutomationBridge). No plaintext copy in the settings file.
+    AutomationBridgeSettings::saveToken(token);
+    // Push live so a rotate takes effect immediately on the running bridge —
+    // any client still using the old token is locked out on its next request.
+    if (m_automation)
+        m_automation->setAuthToken(token);
+}
+
+void MainWindow::setAutomationTxAllowed(bool allowed)
+{
+    // Persist the operator opt-in (nested config) so it survives restart.
+    AutomationBridgeSettings::setTxAllowed(allowed);
+    // Push live so toggling takes effect on a running bridge immediately —
+    // disabling force-unkeys the radio; enabling arms the TX watchdog.
+    if (m_automation)
+        m_automation->setTxAllowed(allowed);
 }
 
 } // namespace AetherSDR

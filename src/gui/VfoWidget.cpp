@@ -14,6 +14,7 @@
 #include "RxApplet.h"
 #include "SliceColorManager.h"
 #include "SliceLabel.h"
+#include "core/DigitalVoiceFeature.h"
 #include "core/KiwiSdrManager.h"
 #include "core/KiwiSdrProtocol.h"
 #include "models/RadioModel.h"
@@ -251,7 +252,12 @@ static const QString kBgStyle =
 
 static const QString kFlatBtn =
     "QPushButton { background: transparent; border: none; "
-    "font-size: 13px; font-weight: bold; padding: 0 6px; margin: 0; }";
+    "font-size: 13px; font-weight: bold; padding: 0 6px; margin: 0; }"
+    // Layout-stable hover: a translucent fill (no border added) so the flat
+    // antenna buttons signal clickability on hover without the text jumping
+    // — the other flag controls change border colour, but kFlatBtn has no
+    // border to recolour, so it hovered with zero feedback before (#4036).
+    "QPushButton:hover { background: rgba(255,255,255,28); border-radius: 3px; }";
 
 static const QString kTabLblNormal =
     "QPushButton { background: transparent; border: none; "
@@ -641,9 +647,16 @@ void VfoWidget::buildUI()
     root->setSpacing(2);
 
     // ── Header row: ANT1(rx) ANT1(tx) 3.8K  SPLIT TX ──────────────────────
+    // Center every field vertically.  The row mixes styled QPushButtons
+    // (antenna names — taller than their font box, text vertically centered)
+    // with raw QLabels (filter width — box IS the font box, text flush at
+    // top).  With AlignTop the visible baseline offset between them was a
+    // function of the resolved font's ascent/descent, so it happened to line
+    // up under SF (macOS) and visibly split under Segoe UI (Windows) (#4036).
+    // AlignVCenter makes the alignment metric-proof regardless of font.
     auto* hdr = new QHBoxLayout;
     hdr->setSpacing(2);
-    hdr->setAlignment(Qt::AlignTop);
+    hdr->setAlignment(Qt::AlignVCenter);
 
     m_rxAntBtn = new QPushButton("ANT1");
     m_rxAntBtn->setFlat(true);
@@ -1312,7 +1325,48 @@ void VfoWidget::buildUI()
     m_playBtn->setAccessibleName("Play recorded audio");
     m_dbmLabel->setAccessibleName("Signal level dBm");
 
+    // Give every interactive field the hand cursor (see applyInteractiveCursors).
+    applyInteractiveCursors();
+
     relayoutToCurrentContent();
+}
+
+// Every clickable/scrollable control in the flag gets Qt::PointingHandCursor so
+// hovering it signals interactivity.  Historically only a handful of fields
+// called setCursor() (the slice-letter badge, the tab bar, the meter strip), so
+// the cursor changed only over the slice badge and the rest of the flag felt
+// dead — the "only works on slice A" report (#4036).  Sweeping by widget type
+// keeps it consistent and, because it re-runs after rebuildFilterButtons(),
+// covers the dynamically rebuilt filter / autotune / marker / adaptive controls
+// too.  Static readouts (filter-width, dBm) are plain QLabels and stay arrow.
+void VfoWidget::applyInteractiveCursors()
+{
+    const auto setHand = [](QWidget* w) {
+        if (w) {
+            w->setCursor(Qt::PointingHandCursor);
+        }
+    };
+
+    for (auto* b : findChildren<QAbstractButton*>()) {
+        setHand(b);
+    }
+    for (auto* c : findChildren<QComboBox*>()) {
+        setHand(c);
+    }
+    for (auto* s : findChildren<ScrollableLabel*>()) {
+        setHand(s);
+    }
+
+    // The frequency readout is a plain QLabel but is fully interactive
+    // (scroll-to-tune, double-click to edit, right-click "Add Spot" menu).
+    setHand(m_freqLabel);
+
+    // The four slice-edge buttons are parented to the panadapter (so they can
+    // render outside our bounds), not to us, so findChildren() can't reach them.
+    setHand(m_closeSliceBtn);
+    setHand(m_lockVfoBtn);
+    setHand(m_recordBtn);
+    setHand(m_playBtn);
 }
 
 // ── Tab content ───────────────────────────────────────────────────────────────
@@ -2231,8 +2285,9 @@ void VfoWidget::buildTabContent()
         m_modeCombo = new GuardedComboBox;
         m_modeCombo->setFixedHeight(26);
         // Default modes — replaced dynamically when slice connects and sends mode_list
-        m_modeCombo->addItems({"USB", "LSB", "CW", "AM", "SAM", "FM",
-                                "NFM", "DFM", "DIGU", "DIGL", "RTTY"});
+        m_modeCombo->addItems(filterUnavailableDigitalVoiceModes(
+            {"USB", "LSB", "CW", "AM", "SAM", "FM",
+             "NFM", "DFM", "DSTR", "DIGU", "DIGL", "RTTY"}));
 #ifdef HAVE_RADE
         m_modeCombo->addItem("RADE");
 #endif
@@ -2307,8 +2362,10 @@ void VfoWidget::buildTabContent()
             btn->setContextMenuPolicy(Qt::CustomContextMenu);
             connect(btn, &QPushButton::customContextMenuRequested, this, [this, i, btn](const QPoint& pos) {
                 QMenu menu;
-                for (const char* m : {"USB", "LSB", "SSB", "CW", "AM", "SAM",
-                                      "FM", "NFM", "DFM", "RTTY", "DIGU", "DIGL", "DIG"}) {
+                const QStringList modes = filterUnavailableDigitalVoiceModes(
+                    {"USB", "LSB", "SSB", "CW", "AM", "SAM",
+                     "FM", "NFM", "DFM", "DSTR", "RTTY", "DIGU", "DIGL", "DIG"});
+                for (const QString& m : modes) {
                     menu.addAction(m, [this, i, m] {
                         m_quickModeAssign[i] = m;
                         AppSettings::instance().setValue(
@@ -2554,8 +2611,7 @@ void VfoWidget::setMeterMenuOpen(bool open)
     relayoutToCurrentContent();
     update();      // repaint the meter-strip underline
     // The flag composites over the GPU spectrum (QRhiWidget); our update()
-    // doesn't refresh the parent's texture, so force a recomposite, same as
-    // setOpaqueMode(). (#SmartMTR)
+    // doesn't refresh the parent's texture, so force a recomposite. (#SmartMTR)
     if (QWidget* p = parentWidget()) {
         p->update();
     }
@@ -2585,32 +2641,6 @@ void VfoWidget::showTab(int index)
         }
     }
     relayoutToCurrentContent();
-}
-
-void VfoWidget::setOpaqueMode(bool on)
-{
-    if (m_opaqueMode == on)
-        return;
-    m_opaqueMode = on;
-
-    // The panel's paintEvent already fills an opaque dark rounded rect; the
-    // translucent attribute + "background: transparent" stylesheet only existed
-    // to let the rounded corners show through. In lean mode we trade rounded
-    // corners for an opaque, independently-cacheable layer.
-    //
-    // The #VfoWidgetRoot stylesheet is what actually governs Qt's opacity
-    // decision here — with "background: transparent" the compositor re-blends
-    // the whole panel (and its buttons) over the window on every sync. Swapping
-    // to an opaque background lets it cache + Source-blit instead, which is the
-    // dominant idle/drag pool cost (#3283). Clearing WA_TranslucentBackground
-    // alone is not enough while the stylesheet stays transparent.
-    setAttribute(Qt::WA_TranslucentBackground, !on);
-    setStyleSheet(on
-        ? QStringLiteral("QWidget#VfoWidgetRoot { background: #0a0a14; border: none; }")
-        : kBgStyle);
-    update();
-    if (QWidget* p = parentWidget())
-        p->update();
 }
 
 void VfoWidget::setCollapsed(bool collapsed)
@@ -3933,7 +3963,7 @@ void VfoWidget::setSlice(SliceModel* slice)
         QSignalBlocker sb(m_modeCombo);
         QString cur = m_modeCombo->currentText();
         m_modeCombo->clear();
-        m_modeCombo->addItems(modes);
+        m_modeCombo->addItems(filterUnavailableDigitalVoiceModes(modes));
 #ifdef HAVE_RADE
         if (m_modeCombo->findText("RADE") < 0)
             m_modeCombo->addItem("RADE");
@@ -3946,7 +3976,7 @@ void VfoWidget::setSlice(SliceModel* slice)
         QSignalBlocker sb(m_modeCombo);
         QString cur = m_modeCombo->currentText();
         m_modeCombo->clear();
-        m_modeCombo->addItems(m_slice->modeList());
+        m_modeCombo->addItems(filterUnavailableDigitalVoiceModes(m_slice->modeList()));
 #ifdef HAVE_RADE
         if (m_modeCombo->findText("RADE") < 0)
             m_modeCombo->addItem("RADE");
@@ -4803,7 +4833,7 @@ static const ModeFilterPresets& filterPresetsFor(const QString& mode)
     // From docs/data/vfo_mode_filters.csv — 8 presets per mode, 4x2 grid
     static const ModeFilterPresets usb{{1800, 2100, 2400, 2700, 2900, 3300, 4000, 6000}};
     static const ModeFilterPresets am {{5600, 6000, 8000, 10000, 12000, 14000, 16000, 20000}};
-    static const ModeFilterPresets cw {{50, 100, 250, 400}};
+    static const ModeFilterPresets cw {{50, 100, 250, 400, 500, 600, 800, 1000}};
     static const ModeFilterPresets dig{{100, 300, 600, 1000, 1500, 2000, 3000, 6000}};
     static const ModeFilterPresets rtty{{250, 300, 350, 400, 500, 1000, 1500, 3000}};
     static const ModeFilterPresets dfm{{6000, 8000, 10000, 12000, 14000, 16000, 18000, 20000}};
@@ -5140,6 +5170,10 @@ void VfoWidget::rebuildFilterButtons()
 
         m_filterGrid->addWidget(container, row, 0, 1, 4);
     }
+
+    // The filter presets and the CW autotune / marker / adaptive controls were
+    // just recreated — give the fresh buttons the hand cursor too (#4036).
+    applyInteractiveCursors();
 
     updateFilterHighlight();
 }
@@ -5884,5 +5918,29 @@ void VfoWidget::setRadeCallsign(const QString& callsign)
     }
 }
 #endif
+
+void VfoWidget::reparentFlagSatellites(QWidget* newParent)
+{
+    if (!newParent) {
+        return;
+    }
+    const std::initializer_list<QWidget*> satellites = {
+        m_closeSliceBtn.data(), m_lockVfoBtn.data(),
+        m_recordBtn.data(), m_playBtn.data(),
+        m_collapsedFreqLabel.data(),
+    };
+    for (QWidget* sat : satellites) {
+        if (!sat || sat->parentWidget() == newParent) {
+            continue;
+        }
+        // setParent() hides the widget; restore its prior visibility so a
+        // shown button doesn't vanish until the next collapse toggle. The
+        // next updatePosition() re-places it in the new coordinate space.
+        const bool wasVisible = sat->isVisible();
+        sat->setParent(newParent);
+        sat->setVisible(wasVisible);
+        sat->raise();
+    }
+}
 
 } // namespace AetherSDR

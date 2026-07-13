@@ -1,5 +1,6 @@
 #include "NetworkDiagnosticsDialog.h"
 #include "core/AudioEngine.h"
+#include "core/DigitalVoiceModeRegistry.h"
 #include "core/LogManager.h"
 #include "core/AppSettings.h"
 #include "core/TciServer.h"   // self-guards on HAVE_WEBSOCKETS
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <utility>
 
 #include <QComboBox>
@@ -21,6 +23,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPlainTextEdit>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScrollArea>
@@ -40,7 +43,11 @@
 #include <QStandardPaths>
 #include <functional>
 #include <QSyntaxHighlighter>
-#include <QTabWidget>
+#include <QTreeWidget>
+#include <QStackedWidget>
+#include <QSplitter>
+#include <QAction>
+#include <QKeySequence>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QHeaderView>
@@ -66,33 +73,47 @@ QFrame#DiagnosticsPanel {
     border: 1px solid #233246;
     border-radius: 7px;
 }
-QTabWidget::pane {
+QTreeWidget#networkDiagnosticsNavigation {
+    color: {{color.text.primary}};
+    background: {{color.background.1}};
+    border: 1px solid {{color.background.2}};
+    border-radius: 7px;
+    padding: 6px;
+    outline: none;
+}
+QTreeWidget#networkDiagnosticsNavigation::branch {
+    image: none;
+    border-image: none;
     background: transparent;
-    border: none;
-    top: 0;
 }
-QTabBar {
-    background: transparent;
-    border-bottom: none;
+QTreeWidget#networkDiagnosticsNavigation::item {
+    min-height: 38px;
+    padding: 3px 9px;
+    border-radius: 5px;
 }
-QTabBar::tab {
-    color: #aeb9cc;
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 6px;
-    padding: 9px 16px;
-    margin: 3px 2px 2px 0;
-    min-height: 24px;
-    font-weight: 600;
+QTreeWidget#networkDiagnosticsNavigation::item:selected {
+    color: {{color.background.0}};
+    background: {{color.accent.bright}};
 }
-QTabBar::tab:selected {
-    color: #d4deea;
-    border-color: #54c768;
-    background: #0d1c20;
+QTreeWidget#networkDiagnosticsNavigation::item:hover:!selected {
+    color: {{color.text.primary}};
+    background: {{color.background.2}};
 }
-QTabBar::tab:hover {
-    border-color: #3c526d;
-    color: #d6dfeb;
+QLineEdit#networkDiagnosticsSearch {
+    color: {{color.text.primary}};
+    background: {{color.background.1}};
+    border: 2px solid {{color.background.2}};
+    border-radius: 7px;
+    padding: 8px 11px;
+    font-size: 13px;
+}
+QLineEdit#networkDiagnosticsSearch:focus {
+    border-color: {{color.accent.bright}};
+}
+QLabel#networkDiagnosticsPageTitle {
+    color: {{color.text.primary}};
+    font-size: 20px;
+    font-weight: 700;
 }
 QLabel#DiagnosticsPanelTitle {
     background: transparent;
@@ -322,6 +343,7 @@ public:
         QVector<QPointF> points;
         QString unitSuffix;
         bool    stepFunction{false};  // draw as horizontal-then-vertical steps
+        double  maxConnectGapSeconds{0.0};
     };
 
     struct LegendHit {
@@ -375,6 +397,19 @@ public:
             return;
         }
         m_logScale = on;
+        update();
+    }
+
+    void setFixedYRange(double minimum, double maximum)
+    {
+        if (!std::isfinite(minimum) || !std::isfinite(maximum)
+            || minimum >= maximum) {
+            m_fixedMinY.reset();
+            m_fixedMaxY.reset();
+        } else {
+            m_fixedMinY = minimum;
+            m_fixedMaxY = maximum;
+        }
         update();
     }
 
@@ -434,8 +469,11 @@ protected:
         // regardless of the smallest observed sample.  Log can't plot
         // zero, but the bottom decade label is overridden to "0" below
         // so the axis reads with a familiar zero baseline.
-        double minY = 1.0;
-        if (m_logScale) {
+        double minY = 0.0;
+        if (m_fixedMinY.has_value() && m_fixedMaxY.has_value()) {
+            minY = *m_fixedMinY;
+            maxY = *m_fixedMaxY;
+        } else if (m_logScale) {
             const double exactMax = std::max(maxY, 10.0);
             maxY = std::pow(10.0, std::ceil(std::log10(exactMax)));
             minY = 1.0;
@@ -458,7 +496,7 @@ protected:
             painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y));
             const double tickValue = m_logScale
                 ? minY * std::pow(10.0, static_cast<double>(i) * std::log10(maxY / minY) / yTicks)
-                : maxY * i / yTicks;
+                : minY + (maxY - minY) * i / yTicks;
             // For the log path, relabel the bottom-most tick as "0" so
             // the axis reads with a familiar zero baseline — values at
             // or below the floor (~1 unit) are functionally silent and
@@ -527,7 +565,10 @@ protected:
                     const double clamped = std::clamp(point.y(), minY, maxY);
                     yRatio = std::log10(clamped / minY) / std::log10(maxY / minY);
                 } else {
-                    yRatio = std::clamp(point.y() / maxY, 0.0, 1.0);
+                    yRatio = std::clamp(
+                        (point.y() - minY) / std::max(0.001, maxY - minY),
+                        0.0,
+                        1.0);
                 }
                 return {plot.left() + plot.width() * xRatio,
                         plot.bottom() - plot.height() * yRatio};
@@ -550,7 +591,15 @@ protected:
                 if (!first)
                     path.lineTo(QPointF(plot.right(), path.currentPosition().y()));
             } else {
+                double previousSeconds = -1.0;
                 for (const QPointF& point : series.points) {
+                    if (series.maxConnectGapSeconds > 0.0
+                        && previousSeconds >= 0.0
+                        && point.x() - previousSeconds > series.maxConnectGapSeconds) {
+                        flushBucket();
+                        hasBucket = false;
+                        first = true;
+                    }
                     const QPointF mapped = mapPoint(point);
                     const int pixel = static_cast<int>(std::round(mapped.x()));
                     if (!hasBucket) {
@@ -562,6 +611,7 @@ protected:
                     }
                     bucketSum += mapped;
                     ++bucketCount;
+                    previousSeconds = point.x();
                 }
                 flushBucket();
             }
@@ -592,7 +642,10 @@ protected:
                 const double clamped = std::clamp(v, minY, maxY);
                 yRatio = std::log10(clamped / minY) / std::log10(maxY / minY);
             } else {
-                yRatio = std::clamp(v / maxY, 0.0, 1.0);
+                yRatio = std::clamp(
+                    (v - minY) / std::max(0.001, maxY - minY),
+                    0.0,
+                    1.0);
             }
             const double y = plot.bottom() - plot.height() * yRatio;
             const QString unitSuffix = series.unitSuffix.isEmpty() ? m_suffix : series.unitSuffix;
@@ -683,6 +736,9 @@ private:
 
     QString formatAxisValue(double value, const QString& suffix) const
     {
+        if (suffix.contains("ksps", Qt::CaseInsensitive)) {
+            return QString("%1 ksps").arg(value, 0, 'f', 2);
+        }
         // kbps already has a metric prefix baked in — scale up to
         // Mbps / Gbps when the value crosses each power of 1000 so the
         // axis reads "3.8 Mbps" rather than the confusing "3.8k kbps".
@@ -824,6 +880,8 @@ private:
     QSet<QString> m_selectedLabels;
     QVector<LegendHit> m_legendHits;
     bool m_logScale{false};
+    std::optional<double> m_fixedMinY;
+    std::optional<double> m_fixedMaxY;
     QVector<QPair<double,double>> m_throttleSpans;
 };
 
@@ -838,16 +896,58 @@ NetworkDiagnosticsDialog::NetworkDiagnosticsDialog(RadioModel* model,
     theme::setContainer(this, QStringLiteral("dialog/networkDiag"));
     setMinimumSize(920, 680);
     resize(980, 760);
-    bodyWidget()->setStyleSheet(QString::fromLatin1(kNetworkDiagnosticsStyle));
+    AetherSDR::ThemeManager::instance().applyStyleSheet(
+        bodyWidget(), QString::fromLatin1(kNetworkDiagnosticsStyle));
 
     auto* body = new QVBoxLayout(bodyWidget());
     body->setSpacing(8);
 
-    // Timeframe selector lives in the top-right corner of the QTabWidget's
-    // tab bar so the tabs and the dropdown share a single row, eliminating
-    // the otherwise-empty band above the tabs.
+    auto* search = new QLineEdit;
+    search->setObjectName(QStringLiteral("networkDiagnosticsSearch"));
+    search->setPlaceholderText(QStringLiteral("Search diagnostics (%1)")
+        .arg(QKeySequence(QKeySequence::Find).toString(QKeySequence::NativeText)));
+    search->setClearButtonEnabled(true);
+    search->setMinimumHeight(40);
+    search->setAccessibleName(QStringLiteral("Search Network Diagnostics"));
+    search->setAccessibleDescription(
+        QStringLiteral("Type a symptom, stream, protocol, or measurement to filter diagnostic pages."));
+    body->addWidget(search);
+
+    auto* split = new QSplitter(Qt::Horizontal);
+    split->setChildrenCollapsible(false);
+
+    auto* navigation = new QTreeWidget;
+    navigation->setObjectName(QStringLiteral("networkDiagnosticsNavigation"));
+    navigation->setHeaderHidden(true);
+    navigation->setRootIsDecorated(false);
+    // Match Radio Setup's hierarchy cue: the child indent leaves a narrow
+    // accent notch at the leading edge of the selected page.
+    navigation->setIndentation(14);
+    navigation->setMinimumWidth(220);
+    navigation->setMaximumWidth(310);
+    navigation->setAccessibleName(QStringLiteral("Network Diagnostics categories"));
+    navigation->setAccessibleDescription(
+        QStringLiteral("Use the arrow keys to choose a diagnostic summary, trend, log, or client page."));
+    split->addWidget(navigation);
+
+    auto* pageHost = new QWidget;
+    auto* pageHostLayout = new QVBoxLayout(pageHost);
+    pageHostLayout->setContentsMargins(14, 2, 2, 2);
+    pageHostLayout->setSpacing(8);
+    auto* pageHeader = new QHBoxLayout;
+    auto* pageTitle = new QLabel;
+    pageTitle->setObjectName(QStringLiteral("networkDiagnosticsPageTitle"));
+    pageTitle->setAccessibleName(QStringLiteral("Current diagnostics page"));
+    pageHeader->addWidget(pageTitle);
+    pageHeader->addStretch();
+
     auto* rangeLabel = new QLabel("Timeframe");
+    rangeLabel->setAccessibleName(QStringLiteral("Chart timeframe"));
     m_rangeCombo = new QComboBox(this);
+    m_rangeCombo->setObjectName(QStringLiteral("networkDiagnosticsTimeframe"));
+    m_rangeCombo->setAccessibleName(QStringLiteral("Chart timeframe"));
+    m_rangeCombo->setAccessibleDescription(
+        QStringLiteral("Choose how much recent diagnostic history the charts display."));
     m_rangeCombo->setFixedWidth(132);
     m_rangeCombo->addItem("1 minute", 60);
     m_rangeCombo->addItem("5 minutes", 5 * 60);
@@ -856,17 +956,50 @@ NetworkDiagnosticsDialog::NetworkDiagnosticsDialog(RadioModel* model,
     m_rangeCombo->addItem("1 day", 24 * 60 * 60);
     m_rangeCombo->addItem("1 week", 7 * 24 * 60 * 60);
 
-    auto* tabs = new QTabWidget(this);
-    auto* corner = new QWidget(tabs);
-    corner->setObjectName("networkDiagnosticsTimeframeCorner");
-    auto* cornerRow = new QHBoxLayout(corner);
-    cornerRow->setContentsMargins(0, 0, 6, 2);
-    cornerRow->setSpacing(6);
-    cornerRow->addWidget(rangeLabel);
-    cornerRow->addWidget(m_rangeCombo);
-    tabs->setCornerWidget(corner, Qt::TopRightCorner);
-    body->addWidget(tabs, 1);
+    pageHeader->addWidget(rangeLabel);
+    pageHeader->addWidget(m_rangeCombo);
+    pageHostLayout->addLayout(pageHeader);
 
+    auto* pages = new QStackedWidget;
+    pages->setObjectName(QStringLiteral("networkDiagnosticsPages"));
+    pages->setAccessibleName(QStringLiteral("Network Diagnostics page content"));
+    pageHostLayout->addWidget(pages, 1);
+    split->addWidget(pageHost);
+    split->setStretchFactor(0, 0);
+    split->setStretchFactor(1, 1);
+    split->setSizes({245, 735});
+    body->addWidget(split, 1);
+
+    // Category headers are bold and dimmed. Source the dim colour from the same
+    // ThemeManager token system that styles the rest of the tree (a bare
+    // QPalette colour would be decoupled from the theme), resolved once and
+    // captured by value so the lambda needn't capture `this`. The base ::item
+    // QSS rule sets no colour, so this per-item foreground is honoured for the
+    // non-selected header rows.
+    const QColor categoryTextColor =
+        AetherSDR::ThemeManager::instance().color("color.text.secondary");
+    auto addCategory = [navigation, categoryTextColor](const QString& name) {
+        auto* item = new QTreeWidgetItem(navigation, {name});
+        item->setFlags(Qt::ItemIsEnabled);
+        item->setForeground(0, categoryTextColor);
+        QFont font = item->font(0);
+        font.setBold(true);
+        item->setFont(0, font);
+        return item;
+    };
+    QTreeWidgetItem* statusCategory = addCategory(QStringLiteral("STATUS"));
+    QTreeWidgetItem* trendsCategory = addCategory(QStringLiteral("TRENDS"));
+    QTreeWidgetItem* supportCategory = addCategory(QStringLiteral("SUPPORT"));
+
+    auto addPage = [pages](QTreeWidgetItem* category, QWidget* page,
+                           const QString& name, const QString& keywords) {
+        const int index = pages->addWidget(page);
+        auto* item = new QTreeWidgetItem(category, {name});
+        item->setData(0, Qt::UserRole, index);
+        item->setData(0, Qt::UserRole + 1, keywords);
+        item->setToolTip(0, keywords);
+        return item;
+    };
     auto* overviewPage = new QWidget(this);
     auto* overviewLayout = new QGridLayout(overviewPage);
     overviewLayout->setContentsMargins(8, 8, 8, 8);
@@ -876,12 +1009,14 @@ NetworkDiagnosticsDialog::NetworkDiagnosticsDialog(RadioModel* model,
     overviewLayout->setColumnStretch(1, 1);
     overviewLayout->setColumnStretch(2, 1);
     overviewLayout->setColumnStretch(3, 1);
-    tabs->addTab(overviewPage, "Overview");
+    QTreeWidgetItem* firstItem = addPage(statusCategory, overviewPage, QStringLiteral("Overview"),
+        QStringLiteral("health status summary quality connection latency loss audio buffer troubleshoot"));
 
     auto* detailsScroll = new QScrollArea(this);
     detailsScroll->setWidgetResizable(true);
     detailsScroll->setFrameShape(QFrame::NoFrame);
-    tabs->addTab(detailsScroll, "Details");
+    addPage(statusCategory, detailsScroll, QStringLiteral("Connection Details"),
+        QStringLiteral("details route source ip tcp udp endpoint packet streams bitrate throttle support"));
 
     auto* content = new QWidget;
     detailsScroll->setWidget(content);
@@ -1104,7 +1239,7 @@ NetworkDiagnosticsDialog::NetworkDiagnosticsDialog(RadioModel* model,
     row = 0;
     audioGrid->addWidget(makeNote(
         "Radio-to-PC speaker audio health. The stream rate should stay near 24 kHz while audio is playing. "
-        "The Audio tab shows per-stream rows and timing trends."),
+        "The Audio Health page shows per-stream rows and timing trends."),
         row++, 0, 1, 2);
 
     audioGrid->addWidget(new QLabel("Health:"), row, 0);
@@ -1153,7 +1288,7 @@ NetworkDiagnosticsDialog::NetworkDiagnosticsDialog(RadioModel* model,
     m_audioStreamsDetailLabel->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     AetherSDR::ThemeManager::instance().applyStyleSheet(m_audioStreamsDetailLabel, "QLabel { color: {{color.text.secondary}}; font-size: 10px; }");
     m_audioStreamsDetailLabel->setToolTip(
-        "The radio normally sends one mixed PC speaker stream. Use the Audio tab for per-stream timing rows.");
+        "The radio normally sends one mixed PC speaker stream. Use the Audio Health page for per-stream timing rows.");
     audioGrid->addWidget(m_audioStreamsDetailLabel, row++, 1);
 
     audioGrid->addWidget(new QLabel("RX Buffer Now:"), row, 0);
@@ -1229,76 +1364,173 @@ NetworkDiagnosticsDialog::NetworkDiagnosticsDialog(RadioModel* model,
     overviewLayout->addWidget(m_overviewRatesGraph, 2, 0, 1, 2);
     overviewLayout->addWidget(m_overviewAudioGraph, 2, 2, 1, 2);
 
-    auto makeGraphTab = [tabs](const QString& tabName, TimeSeriesGraphWidget** graph,
-                               const QString& title, const QString& suffix) {
+    auto makeGraphPage = [&addPage, trendsCategory](const QString& pageName,
+                                                    const QString& keywords,
+                                                    TimeSeriesGraphWidget** graph,
+                                                    const QString& title,
+                                                    const QString& suffix) {
         auto* page = new QWidget;
         auto* layout = new QVBoxLayout(page);
         layout->setContentsMargins(8, 8, 8, 8);
         *graph = new TimeSeriesGraphWidget(title, suffix, page);
         layout->addWidget(*graph);
-        tabs->addTab(page, tabName);
+        addPage(trendsCategory, page, pageName, keywords);
+        return page;
     };
-    makeGraphTab("Latency", &m_latencyGraph, "Latency, Arrival Gap, and Jitter", " ms");
-    makeGraphTab("Rates", &m_ratesGraph, "Incoming Stream Rates", " kbps");
+    makeGraphPage(QStringLiteral("Latency & Jitter"),
+        QStringLiteral("latency rtt jitter arrival gap delay slow connection ping"),
+        &m_latencyGraph, QStringLiteral("Latency, Arrival Gap, and Jitter"), QStringLiteral(" ms"));
+    QWidget* ratesPage = makeGraphPage(QStringLiteral("Stream Rates"),
+        QStringLiteral("rates bitrate bandwidth throughput rx tx fft waterfall meters dax traffic"),
+        &m_ratesGraph, QStringLiteral("Incoming Stream Rates"), QStringLiteral(" kbps"));
     m_ratesGraph->setLogScale(true);
-    // Add fps-cap step graph below the rates graph on the Rates tab.
-    // Relies on the just-added Rates tab being last; assert so a future
-    // reorder fails loudly instead of silently landing on the wrong tab.
-    Q_ASSERT(tabs->tabText(tabs->count() - 1) == QStringLiteral("Rates"));
-    if (auto* ratesPage = tabs->widget(tabs->count() - 1)) {
-        if (auto* ratesLayout = qobject_cast<QVBoxLayout*>(ratesPage->layout())) {
-            m_fpsCapGraph = new TimeSeriesGraphWidget("Adaptive Throttle — FPS Cap", " fps", ratesPage);
-            m_fpsCapGraph->setMinimumHeight(120);
-            m_fpsCapGraph->setMaximumHeight(160);
-            ratesLayout->addWidget(m_fpsCapGraph);
-        }
+    if (auto* ratesLayout = qobject_cast<QVBoxLayout*>(ratesPage->layout())) {
+        m_fpsCapGraph = new TimeSeriesGraphWidget("Adaptive Throttle — FPS Cap", " fps", ratesPage);
+        m_fpsCapGraph->setMinimumHeight(120);
+        m_fpsCapGraph->setMaximumHeight(160);
+        ratesLayout->addWidget(m_fpsCapGraph);
     }
-    makeGraphTab("Packet Loss", &m_lossGraph, "Packet Loss by Stream", "%");
+    makeGraphPage(QStringLiteral("Packet Loss"),
+        QStringLiteral("packet loss dropped missing sequence gaps vita udp network"),
+        &m_lossGraph, QStringLiteral("Packet Loss by Stream"), QStringLiteral("%"));
 
-    makeGraphTab("Audio", &m_audioGraph, "RX Audio Buffer and Timing", " ms");
+    QWidget* audioPage = makeGraphPage(QStringLiteral("Audio Health"),
+        QStringLiteral("audio speaker buffer underrun late packets gaps stream slow delivery feed rate"),
+        &m_audioGraph, QStringLiteral("RX Audio Buffer and Timing"), QStringLiteral(" ms"));
     m_audioGraph->setPrimaryAxisSeries("Buffer");
-    if (auto* audioPage = tabs->widget(tabs->count() - 1)) {
-        if (auto* audioLayout = qobject_cast<QVBoxLayout*>(audioPage->layout())) {
-            audioLayout->setSpacing(8);
-            auto* audioNote = new QLabel(
-                "PC speaker audio is normally one radio-mixed stream. If more than one transport stream appears, "
-                "each row below is shown separately; slice letters list the unmuted slices feeding the speaker mix.",
-                audioPage);
-            audioNote->setWordWrap(true);
-            AetherSDR::ThemeManager::instance().applyStyleSheet(audioNote, "QLabel { color: {{color.text.secondary}}; font-size: 11px; }");
-            audioLayout->insertWidget(0, audioNote);
+    if (auto* audioLayout = qobject_cast<QVBoxLayout*>(audioPage->layout())) {
+        audioLayout->setSpacing(8);
+        auto* audioNote = new QLabel(
+            "PC speaker audio is normally one radio-mixed stream. If more than one transport stream appears, "
+            "each row below is shown separately; slice letters list the unmuted slices feeding the speaker mix.",
+            audioPage);
+        audioNote->setWordWrap(true);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            audioNote, "QLabel { color: {{color.text.secondary}}; font-size: 11px; }");
+        audioLayout->insertWidget(0, audioNote);
 
-            m_audioStreamsTable = new QTableWidget(0, 9, audioPage);
-            m_audioStreamsTable->setHorizontalHeaderLabels({
-                "Stream", "Source", "Format", "Rate", "Slow Delivery",
-                "Late", "Packet Gaps", "Worst Gap", "Last Packet"
-            });
-            m_audioStreamsTable->verticalHeader()->setVisible(false);
-            m_audioStreamsTable->horizontalHeader()->setStretchLastSection(false);
-            m_audioStreamsTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
-            m_audioStreamsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-            m_audioStreamsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
-            m_audioStreamsTable->setSelectionMode(QAbstractItemView::NoSelection);
-            m_audioStreamsTable->setFocusPolicy(Qt::NoFocus);
-            m_audioStreamsTable->setAlternatingRowColors(true);
-            m_audioStreamsTable->setMinimumHeight(136);
-            m_audioStreamsTable->setMaximumHeight(190);
-            audioLayout->insertWidget(1, m_audioStreamsTable);
+        m_audioStreamsTable = new QTableWidget(0, 9, audioPage);
+        m_audioStreamsTable->setHorizontalHeaderLabels({
+            "Stream", "Source", "Format", "Rate", "Slow Delivery",
+            "Late", "Packet Gaps", "Worst Gap", "Last Packet"
+        });
+        m_audioStreamsTable->verticalHeader()->setVisible(false);
+        m_audioStreamsTable->horizontalHeader()->setStretchLastSection(false);
+        m_audioStreamsTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+        m_audioStreamsTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+        m_audioStreamsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        m_audioStreamsTable->setSelectionMode(QAbstractItemView::NoSelection);
+        m_audioStreamsTable->setFocusPolicy(Qt::NoFocus);
+        m_audioStreamsTable->setAlternatingRowColors(true);
+        m_audioStreamsTable->setMinimumHeight(136);
+        m_audioStreamsTable->setMaximumHeight(190);
+        audioLayout->insertWidget(1, m_audioStreamsTable);
 
-            m_audioFeedGraph = new TimeSeriesGraphWidget("RX Audio Stream Rate vs Target", " Hz", audioPage);
-            audioLayout->addWidget(m_audioFeedGraph, 1);
-        }
+        m_audioFeedGraph = new TimeSeriesGraphWidget("RX Audio Stream Rate vs Target", " Hz", audioPage);
+        audioLayout->addWidget(m_audioFeedGraph, 1);
     }
+
+    auto* waveformScroll = new QScrollArea(this);
+    waveformScroll->setObjectName(QStringLiteral("DigitalVoiceWaveformDiagnosticsTab"));
+    waveformScroll->setAccessibleName(QStringLiteral("Digital voice diagnostics"));
+    waveformScroll->setWidgetResizable(true);
+    waveformScroll->setFrameShape(QFrame::NoFrame);
+    waveformScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    waveformScroll->verticalScrollBar()->setObjectName(
+        QStringLiteral("DigitalVoiceWaveformScrollBar"));
+    m_digitalVoiceWaveformTab = waveformScroll;
+
+    auto* waveformContent = new QWidget(waveformScroll);
+    waveformContent->setObjectName(QStringLiteral("DigitalVoiceWaveformDiagnosticsContent"));
+    waveformScroll->setWidget(waveformContent);
+
+    auto* waveformLayout = new QVBoxLayout(waveformContent);
+    waveformLayout->setContentsMargins(8, 8, 8, 8);
+    waveformLayout->setSpacing(8);
+    waveformLayout->setSizeConstraint(QLayout::SetMinimumSize);
+
+    auto* waveformSummary = makeDiagnosticsPanel("Digital Voice Delivery");
+    auto* waveformSummaryGrid = new QGridLayout;
+    waveformSummaryGrid->setContentsMargins(0, 0, 0, 0);
+    waveformSummaryGrid->setHorizontalSpacing(24);
+    waveformSummaryGrid->setVerticalSpacing(3);
+    for (int column = 0; column < 3; ++column) {
+        waveformSummaryGrid->setColumnStretch(column, 1);
+    }
+    addDiagnosticsPanelContent(waveformSummary, waveformSummaryGrid);
+
+    auto addWaveformMetric = [waveformSummaryGrid](
+                                 int metricRow,
+                                 int column,
+                                 const QString& title,
+                                 const QString& accessibleName,
+                                 QLabel** valueLabel,
+                                 int valueLines = 1) {
+        auto* titleLabel = new QLabel(title);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            titleLabel,
+            "QLabel { color: {{color.text.secondary}}; font-size: 11px; }");
+        *valueLabel = new QLabel(QStringLiteral("--"));
+        (*valueLabel)->setAccessibleName(accessibleName);
+        (*valueLabel)->setMinimumHeight(
+            (*valueLabel)->fontMetrics().lineSpacing() * valueLines + 2);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            *valueLabel,
+            "QLabel { color: {{color.text.primary}}; font-weight: 700; }");
+        const int row = metricRow * 2;
+        waveformSummaryGrid->addWidget(titleLabel, row, column);
+        waveformSummaryGrid->addWidget(*valueLabel, row + 1, column);
+    };
+    addWaveformMetric(0, 0, "Mode", "Active digital voice mode",
+                      &m_digitalVoiceWaveformModeLabel);
+    addWaveformMetric(0, 1, "Health", "Digital voice waveform health",
+                      &m_digitalVoiceWaveformHealthLabel);
+    addWaveformMetric(0, 2, "RX sample rate", "Digital voice waveform receive sample rate",
+                      &m_digitalVoiceWaveformRateLabel);
+    addWaveformMetric(1, 0, "VITA sequence gaps", "Digital voice VITA sequence gaps",
+                      &m_digitalVoiceWaveformGapLabel);
+    addWaveformMetric(1, 1, "Inferred source blocks", "D-STAR inferred missing source blocks",
+                      &m_digitalVoiceWaveformSourceLabel);
+    addWaveformMetric(1, 2, "Turnaround", "Digital voice waveform processing turnaround",
+                      &m_digitalVoiceWaveformTurnaroundLabel);
+    addWaveformMetric(2, 0, "RX queue depth", "Digital voice receive processing queue depth",
+                      &m_digitalVoiceWaveformQueueLabel);
+    addWaveformMetric(2, 1, "TX sample rate", "Digital voice transmit sample rate",
+                      &m_digitalVoiceWaveformTxRateLabel);
+    addWaveformMetric(2, 2, "TX encoding", "Digital voice transmit encoding quality",
+                      &m_digitalVoiceWaveformTxQualityLabel, 2);
+    addWaveformMetric(3, 0, "TX pre-roll / drain", "Digital voice transmit pre-roll and drain",
+                      &m_digitalVoiceWaveformTxTailLabel, 2);
+    waveformLayout->addWidget(waveformSummary);
+
+    static constexpr int kDigitalVoiceGraphMinimumHeight = 190;
+    m_digitalVoiceWaveformRateGraph = new TimeSeriesGraphWidget(
+        "Digital Voice Waveform Rate", " ksps", waveformContent);
+    m_digitalVoiceWaveformRateGraph->setMinimumHeight(kDigitalVoiceGraphMinimumHeight);
+    m_digitalVoiceWaveformRateGraph->setFixedYRange(22.0, 24.5);
+    m_digitalVoiceWaveformErrorGraph = new TimeSeriesGraphWidget(
+        "Digital Voice Delivery Errors", "/s", waveformContent);
+    m_digitalVoiceWaveformErrorGraph->setMinimumHeight(kDigitalVoiceGraphMinimumHeight);
+    waveformLayout->addWidget(m_digitalVoiceWaveformRateGraph, 1);
+    waveformLayout->addWidget(m_digitalVoiceWaveformErrorGraph, 1);
+    m_digitalVoiceWaveformNavigationItem = addPage(
+        trendsCategory,
+        m_digitalVoiceWaveformTab,
+        QStringLiteral("Digital Voice"),
+        QStringLiteral("digital voice d-star waveform vita samples gaps delivery rx tx thumbdv"));
+    m_digitalVoiceWaveformNavigationItem->setHidden(true);
 
     QWidget* logsTab = buildLogsTab();
-    tabs->addTab(logsTab, "Logs");
+    addPage(supportCategory, logsTab, QStringLiteral("Application Logs"),
+        QStringLiteral("logs errors warnings commands status discovery support export follow live filter"));
 
     // TCI client list — only when a TCI server instance is available.
     QWidget* tciTab = nullptr;
 #ifdef HAVE_WEBSOCKETS
     if (m_tci) {
         tciTab = buildTciTab();
-        tabs->addTab(tciTab, "TCI");
+        addPage(supportCategory, tciTab, QStringLiteral("TCI Clients"),
+            QStringLiteral("tci websocket clients wsjt-x skimmer iq audio monitor connections messages"));
     }
 #endif
 
@@ -1315,11 +1547,74 @@ NetworkDiagnosticsDialog::NetworkDiagnosticsDialog(RadioModel* model,
     connect(m_rangeCombo, &QComboBox::currentIndexChanged, this, [this] {
         updateCharts();
     });
-    connect(tabs, &QTabWidget::currentChanged, this,
-            [tabs, corner, logsTab, tciTab](int index) {
-        QWidget* w = tabs->widget(index);
-        corner->setVisible(w != logsTab && w != tciTab);
+    connect(navigation, &QTreeWidget::currentItemChanged, this,
+            [pages, pageTitle, rangeLabel, navigation, this, logsTab, tciTab](
+                QTreeWidgetItem* current, QTreeWidgetItem* previous) {
+        if (!current) {
+            return;
+        }
+        if (!current->parent()) {
+            const bool movingDown = previous && navigation->itemAbove(current) == previous;
+            QTreeWidgetItem* next = movingDown ? navigation->itemBelow(current)
+                                               : navigation->itemAbove(current);
+            // At a list edge the directional neighbour is null (e.g. arrow-up
+            // onto the first category, whose itemAbove() is null) — fall back
+            // to the nearest page in the opposite direction so the highlight
+            // never strands on a header with no page shown.
+            if (!next || !next->parent()) {
+                next = movingDown ? navigation->itemAbove(current)
+                                  : navigation->itemBelow(current);
+            }
+            if (next && next->parent()) {
+                navigation->setCurrentItem(next);
+            }
+            return;
+        }
+        const int index = current->data(0, Qt::UserRole).toInt();
+        pages->setCurrentIndex(index);
+        pageTitle->setText(current->text(0));
+        const QWidget* page = pages->widget(index);
+        const bool showTimeframe = page != logsTab && page != tciTab;
+        rangeLabel->setVisible(showTimeframe);
+        m_rangeCombo->setVisible(showTimeframe);
     });
+    connect(search, &QLineEdit::textChanged, this, [navigation](const QString& text) {
+        const QString needle = text.trimmed();
+        QTreeWidgetItem* firstMatch = nullptr;
+        for (int i = 0; i < navigation->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* category = navigation->topLevelItem(i);
+            bool anyVisible = false;
+            for (int j = 0; j < category->childCount(); ++j) {
+                QTreeWidgetItem* item = category->child(j);
+                const QString haystack = item->text(0) + QStringLiteral(" ")
+                    + item->data(0, Qt::UserRole + 1).toString();
+                const bool matches = needle.isEmpty()
+                    || haystack.contains(needle, Qt::CaseInsensitive);
+                item->setHidden(!matches);
+                if (matches && !firstMatch) {
+                    firstMatch = item;
+                }
+                anyVisible = anyVisible || matches;
+            }
+            category->setHidden(!anyVisible);
+            category->setExpanded(true);
+        }
+        QTreeWidgetItem* current = navigation->currentItem();
+        if (firstMatch && (!current || current->isHidden())) {
+            navigation->setCurrentItem(firstMatch);
+            navigation->scrollToItem(firstMatch, QAbstractItemView::PositionAtCenter);
+        }
+    });
+    auto* findAction = new QAction(this);
+    findAction->setShortcut(QKeySequence::Find);
+    findAction->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    connect(findAction, &QAction::triggered, search, [search] {
+        search->setFocus();
+        search->selectAll();
+    });
+    addAction(findAction);
+    navigation->expandAll();
+    navigation->setCurrentItem(firstItem);
     connect(&m_refreshTimer, &QTimer::timeout, this, &NetworkDiagnosticsDialog::refresh);
     m_refreshTimer.start(1000);
     connect(&m_logRefreshTimer, &QTimer::timeout, this, &NetworkDiagnosticsDialog::appendNewLogData);
@@ -2301,7 +2596,7 @@ static QString formatAudioSupportDetails(int streamCount, const QStringList& sli
     }
     return QString("The radio sends PC speaker audio as a mixed remote_audio_rx stream. "
                    "Slice audio is mixed before the packet stream, so per-slice packet timing is not available here. "
-                   "The Audio tab shows the transport stream rows; current mix: %1.")
+                   "The Audio Health page shows the transport stream rows; current mix: %1.")
         .arg(formatSliceMix(sliceLabels));
 }
 
@@ -2545,6 +2840,39 @@ void NetworkDiagnosticsHistory::sampleNow()
     }
     sample.adaptiveFpsCap = m_currentFpsCap;
 
+    const DigitalVoiceWaveformHistoryReading waveformReading =
+        m_digitalVoiceWaveformHistory.sample(
+            m_model->digitalVoiceWaveformMetrics(), nowMs, elapsedSeconds);
+    sample.digitalVoiceWaveformValid = waveformReading.valid;
+    sample.digitalVoiceRxValid = waveformReading.rxValid;
+    sample.digitalVoiceTxValid = waveformReading.txValid;
+    if (waveformReading.rxValid) {
+        sample.digitalVoiceWaveformObservationCount = 1;
+        sample.digitalVoiceRxSampleRateHz = waveformReading.rxSampleRateHz;
+        sample.digitalVoiceVitaGapsPerSecond = waveformReading.vitaSequenceGapsPerSecond;
+        sample.digitalVoiceSourceBlocksPerSecond =
+            waveformReading.sourceBlockDeficitsPerSecond;
+        sample.digitalVoiceTurnaroundMeanUs = waveformReading.turnaroundMeanUs;
+        sample.digitalVoiceTurnaroundMaxUs = waveformReading.turnaroundMaxUs;
+        sample.digitalVoiceQueueMax = waveformReading.queueMax;
+    }
+    if (waveformReading.txValid) {
+        sample.digitalVoiceTxObservationCount = 1;
+        sample.digitalVoiceTxSampleRateHz = waveformReading.txSampleRateHz;
+        sample.digitalVoiceTxVitaGapsPerSecond =
+            waveformReading.txVitaSequenceGapsPerSecond;
+        sample.digitalVoiceTxNullFrames = waveformReading.txNullFrames;
+        sample.digitalVoiceTxPcmClips = waveformReading.txPcmClips;
+        sample.digitalVoiceTxPcmInvalid = waveformReading.txPcmInvalid;
+        sample.digitalVoiceTxSendFailures = waveformReading.txSendFailures;
+        sample.digitalVoiceTxQueueMax = waveformReading.txQueueMax;
+        sample.digitalVoiceTxTailSamples = waveformReading.txTailSamples;
+        sample.digitalVoiceTxTailUs = waveformReading.txTailUs;
+    }
+    if (waveformReading.valid) {
+        m_hasDigitalVoiceWaveformTelemetry = true;
+    }
+
     m_lastSampleMs = nowMs;
 
     m_samples.push_back(sample);
@@ -2564,6 +2892,16 @@ void NetworkDiagnosticsHistory::pruneSamples(qint64 nowMs)
     int bucketSampleCount = 0;
     auto mergeAverage = [](double current, double incoming, int currentCount) {
         return ((current * currentCount) + incoming) / (currentCount + 1);
+    };
+    auto mergeWeightedAverage = [](double current,
+                                   int currentCount,
+                                   double incoming,
+                                   int incomingCount) {
+        const int totalCount = currentCount + incomingCount;
+        return totalCount <= 0
+            ? 0.0
+            : ((current * currentCount) + (incoming * incomingCount))
+                / totalCount;
     };
     for (const NetworkDiagnosticsSample& sample : m_samples) {
         if (sample.timestampMs < cutoff) {
@@ -2611,6 +2949,115 @@ void NetworkDiagnosticsHistory::pruneSamples(qint64 nowMs)
             bucket.audioLastPacketAgeMs = sample.audioLastPacketAgeMs;
             bucket.audioPacketClassCode = sample.audioPacketClassCode;
             bucket.audioStreamCount = sample.audioStreamCount;
+            if (sample.digitalVoiceRxValid) {
+                const int incomingCount =
+                    std::max(1, sample.digitalVoiceWaveformObservationCount);
+                if (!bucket.digitalVoiceRxValid) {
+                    bucket.digitalVoiceWaveformValid = true;
+                    bucket.digitalVoiceRxValid = true;
+                    bucket.digitalVoiceWaveformObservationCount = incomingCount;
+                    bucket.digitalVoiceRxSampleRateHz = sample.digitalVoiceRxSampleRateHz;
+                    bucket.digitalVoiceVitaGapsPerSecond = sample.digitalVoiceVitaGapsPerSecond;
+                    bucket.digitalVoiceSourceBlocksPerSecond = sample.digitalVoiceSourceBlocksPerSecond;
+                    bucket.digitalVoiceTurnaroundMeanUs = sample.digitalVoiceTurnaroundMeanUs;
+                    bucket.digitalVoiceTurnaroundMaxUs = sample.digitalVoiceTurnaroundMaxUs;
+                    bucket.digitalVoiceQueueMax = sample.digitalVoiceQueueMax;
+                } else {
+                    const int currentCount =
+                        std::max(1, bucket.digitalVoiceWaveformObservationCount);
+                    bucket.digitalVoiceRxSampleRateHz = mergeWeightedAverage(
+                        bucket.digitalVoiceRxSampleRateHz,
+                        currentCount,
+                        sample.digitalVoiceRxSampleRateHz,
+                        incomingCount);
+                    bucket.digitalVoiceVitaGapsPerSecond = mergeWeightedAverage(
+                        bucket.digitalVoiceVitaGapsPerSecond,
+                        currentCount,
+                        sample.digitalVoiceVitaGapsPerSecond,
+                        incomingCount);
+                    bucket.digitalVoiceSourceBlocksPerSecond = mergeWeightedAverage(
+                        bucket.digitalVoiceSourceBlocksPerSecond,
+                        currentCount,
+                        sample.digitalVoiceSourceBlocksPerSecond,
+                        incomingCount);
+                    bucket.digitalVoiceTurnaroundMeanUs = mergeWeightedAverage(
+                        bucket.digitalVoiceTurnaroundMeanUs,
+                        currentCount,
+                        sample.digitalVoiceTurnaroundMeanUs,
+                        incomingCount);
+                    bucket.digitalVoiceTurnaroundMaxUs = std::max(
+                        bucket.digitalVoiceTurnaroundMaxUs,
+                        sample.digitalVoiceTurnaroundMaxUs);
+                    bucket.digitalVoiceQueueMax = std::max(
+                        bucket.digitalVoiceQueueMax,
+                        sample.digitalVoiceQueueMax);
+                    bucket.digitalVoiceWaveformObservationCount =
+                        currentCount + incomingCount;
+                }
+            }
+            if (sample.digitalVoiceTxValid) {
+                const int incomingCount =
+                    std::max(1, sample.digitalVoiceTxObservationCount);
+                if (!bucket.digitalVoiceTxValid) {
+                    bucket.digitalVoiceWaveformValid = true;
+                    bucket.digitalVoiceTxValid = true;
+                    bucket.digitalVoiceTxObservationCount = incomingCount;
+                    bucket.digitalVoiceTxSampleRateHz =
+                        sample.digitalVoiceTxSampleRateHz;
+                    bucket.digitalVoiceTxVitaGapsPerSecond =
+                        sample.digitalVoiceTxVitaGapsPerSecond;
+                    bucket.digitalVoiceTxNullFrames =
+                        sample.digitalVoiceTxNullFrames;
+                    bucket.digitalVoiceTxPcmClips =
+                        sample.digitalVoiceTxPcmClips;
+                    bucket.digitalVoiceTxPcmInvalid =
+                        sample.digitalVoiceTxPcmInvalid;
+                    bucket.digitalVoiceTxSendFailures =
+                        sample.digitalVoiceTxSendFailures;
+                    bucket.digitalVoiceTxQueueMax =
+                        sample.digitalVoiceTxQueueMax;
+                    bucket.digitalVoiceTxTailSamples =
+                        sample.digitalVoiceTxTailSamples;
+                    bucket.digitalVoiceTxTailUs = sample.digitalVoiceTxTailUs;
+                } else {
+                    const int currentCount =
+                        std::max(1, bucket.digitalVoiceTxObservationCount);
+                    bucket.digitalVoiceTxSampleRateHz = mergeWeightedAverage(
+                        bucket.digitalVoiceTxSampleRateHz,
+                        currentCount,
+                        sample.digitalVoiceTxSampleRateHz,
+                        incomingCount);
+                    bucket.digitalVoiceTxVitaGapsPerSecond =
+                        mergeWeightedAverage(
+                            bucket.digitalVoiceTxVitaGapsPerSecond,
+                            currentCount,
+                            sample.digitalVoiceTxVitaGapsPerSecond,
+                            incomingCount);
+                    bucket.digitalVoiceTxNullFrames = std::max(
+                        bucket.digitalVoiceTxNullFrames,
+                        sample.digitalVoiceTxNullFrames);
+                    bucket.digitalVoiceTxPcmClips = std::max(
+                        bucket.digitalVoiceTxPcmClips,
+                        sample.digitalVoiceTxPcmClips);
+                    bucket.digitalVoiceTxPcmInvalid = std::max(
+                        bucket.digitalVoiceTxPcmInvalid,
+                        sample.digitalVoiceTxPcmInvalid);
+                    bucket.digitalVoiceTxSendFailures = std::max(
+                        bucket.digitalVoiceTxSendFailures,
+                        sample.digitalVoiceTxSendFailures);
+                    bucket.digitalVoiceTxQueueMax = std::max(
+                        bucket.digitalVoiceTxQueueMax,
+                        sample.digitalVoiceTxQueueMax);
+                    bucket.digitalVoiceTxTailSamples = std::max(
+                        bucket.digitalVoiceTxTailSamples,
+                        sample.digitalVoiceTxTailSamples);
+                    bucket.digitalVoiceTxTailUs = std::max(
+                        bucket.digitalVoiceTxTailUs,
+                        sample.digitalVoiceTxTailUs);
+                    bucket.digitalVoiceTxObservationCount =
+                        currentCount + incomingCount;
+                }
+            }
             ++bucketSampleCount;
         }
     }
@@ -2693,6 +3140,89 @@ static void updateAudioStreamTable(QTableWidget* table,
 void NetworkDiagnosticsDialog::refresh()
 {
     const NetworkDiagnosticsSample sample = m_history ? m_history->latestSample() : NetworkDiagnosticsSample{};
+
+    const bool waveformSeen =
+        (m_history && m_history->hasDigitalVoiceWaveformTelemetry())
+        || m_model->digitalVoiceWaveformHealth() != DigitalVoiceWaveformHealth::Inactive;
+    if (m_digitalVoiceWaveformNavigationItem) {
+        m_digitalVoiceWaveformNavigationItem->setHidden(!waveformSeen);
+    }
+    if (waveformSeen) {
+        const DigitalVoiceWaveformMetrics& metrics = m_model->digitalVoiceWaveformMetrics();
+        const DigitalVoiceWaveformHealth health = m_model->digitalVoiceWaveformHealth();
+        const std::optional<DigitalVoiceModeId> mode =
+            DigitalVoiceModeRegistry::modeForRadioMode(metrics.mode);
+        m_digitalVoiceWaveformModeLabel->setText(
+            mode.has_value()
+                ? DigitalVoiceModeRegistry::descriptor(mode.value()).displayName
+                : (metrics.mode.isEmpty() ? QStringLiteral("--") : metrics.mode));
+        m_digitalVoiceWaveformHealthLabel->setText(m_model->digitalVoiceWaveformHealthName());
+        if (isDegradedDigitalVoiceWaveformHealth(health)) {
+            AetherSDR::ThemeManager::instance().applyStyleSheet(
+                m_digitalVoiceWaveformHealthLabel,
+                "QLabel { color: {{color.accent.warning}}; font-weight: 700; }");
+        } else {
+            AetherSDR::ThemeManager::instance().applyStyleSheet(
+                m_digitalVoiceWaveformHealthLabel,
+                "QLabel { color: {{color.text.primary}}; font-weight: 700; }");
+        }
+
+        if (sample.digitalVoiceRxValid) {
+            m_digitalVoiceWaveformRateLabel->setText(
+                QStringLiteral("%1 ksps")
+                    .arg(sample.digitalVoiceRxSampleRateHz / 1000.0, 0, 'f', 2));
+            m_digitalVoiceWaveformGapLabel->setText(
+                QStringLiteral("%1 total  |  %2/s")
+                    .arg(metrics.vitaSequenceGapsTotal)
+                    .arg(sample.digitalVoiceVitaGapsPerSecond, 0, 'f', 1));
+            m_digitalVoiceWaveformSourceLabel->setText(
+                QStringLiteral("%1 total  |  %2/s")
+                    .arg(metrics.sourceBlockDeficitsTotal)
+                    .arg(sample.digitalVoiceSourceBlocksPerSecond, 0, 'f', 1));
+            m_digitalVoiceWaveformTurnaroundLabel->setText(
+                QStringLiteral("%1 us mean  |  %2 us max")
+                    .arg(sample.digitalVoiceTurnaroundMeanUs, 0, 'f', 1)
+                    .arg(sample.digitalVoiceTurnaroundMaxUs));
+            m_digitalVoiceWaveformQueueLabel->setText(
+                QString::number(sample.digitalVoiceQueueMax));
+        } else {
+            m_digitalVoiceWaveformRateLabel->setText(QStringLiteral("No recent data"));
+            m_digitalVoiceWaveformGapLabel->setText(QStringLiteral("--"));
+            m_digitalVoiceWaveformSourceLabel->setText(QStringLiteral("--"));
+            m_digitalVoiceWaveformTurnaroundLabel->setText(QStringLiteral("--"));
+            m_digitalVoiceWaveformQueueLabel->setText(QStringLiteral("--"));
+        }
+        if (sample.digitalVoiceTxValid) {
+            m_digitalVoiceWaveformTxRateLabel->setText(
+                sample.digitalVoiceTxSampleRateHz > 0.0
+                    ? QStringLiteral("%1 ksps")
+                          .arg(sample.digitalVoiceTxSampleRateHz / 1000.0,
+                               0, 'f', 2)
+                    : QStringLiteral("Measuring"));
+            m_digitalVoiceWaveformTxQualityLabel->setText(
+                QStringLiteral("%1 null  |  %2 underflow  |  %3 overflow\n"
+                               "%4 clipped  |  %5 invalid  |  %6 sequence")
+                    .arg(sample.digitalVoiceTxNullFrames)
+                    .arg(metrics.txAmbeUnderflows)
+                    .arg(metrics.txAmbeOverflows)
+                    .arg(sample.digitalVoiceTxPcmClips)
+                    .arg(sample.digitalVoiceTxPcmInvalid)
+                    .arg(metrics.txAmbeSequenceErrors));
+            m_digitalVoiceWaveformTxTailLabel->setText(
+                QStringLiteral("%1 frames / %2 ms pre-roll\n"
+                               "%3 frames / %4 ms drain  |  %5 timeout  |  %6 dropped")
+                    .arg(metrics.txPreRollFrames)
+                    .arg(metrics.txPreRollDelayMs)
+                    .arg(metrics.txDrainFrames)
+                    .arg(sample.digitalVoiceTxTailUs / 1000.0, 0, 'f', 1)
+                    .arg(metrics.txDrainTimeouts)
+                    .arg(metrics.txDrainDiscardedFrames));
+        } else {
+            m_digitalVoiceWaveformTxRateLabel->setText(QStringLiteral("No recent data"));
+            m_digitalVoiceWaveformTxQualityLabel->setText(QStringLiteral("--"));
+            m_digitalVoiceWaveformTxTailLabel->setText(QStringLiteral("--"));
+        }
+    }
 
     // Status and RTT
     m_statusLabel->setText(m_model->networkQuality());
@@ -2946,6 +3476,63 @@ void NetworkDiagnosticsDialog::updateCharts()
         series.unitSuffix = unitSuffix;
         return series;
     };
+    auto buildWaveformSeries = [&](const QString& label,
+                                   const QColor& color,
+                                   const QString& unitSuffix,
+                                   auto validFor,
+                                   auto valueFor) {
+        TimeSeriesGraphWidget::Series series{label, color, {}, unitSuffix};
+        series.points.reserve(samples.size());
+        series.maxConnectGapSeconds = std::max(
+            2.5, static_cast<double>(bucketMs) / 1000.0 * 1.5);
+        if (bucketMs <= 1000) {
+            for (const NetworkDiagnosticsSample& sample : samples) {
+                if (!validFor(sample)
+                    || sample.timestampMs < cutoffMs
+                    || sample.timestampMs > endMs) {
+                    continue;
+                }
+                const double secondsFromStart =
+                    (sample.timestampMs - cutoffMs) / 1000.0;
+                series.points.push_back(QPointF(
+                    secondsFromStart,
+                    std::max(0.0, static_cast<double>(valueFor(sample)))));
+            }
+        } else {
+            qint64 currentBucket = -1;
+            double bucketSum = 0.0;
+            int bucketCount = 0;
+            auto flushBucket = [&] {
+                if (currentBucket < 0 || bucketCount <= 0) {
+                    return;
+                }
+                const qint64 bucketCenterMs = currentBucket * bucketMs + bucketMs / 2;
+                const double secondsFromStart =
+                    (bucketCenterMs - cutoffMs) / 1000.0;
+                series.points.push_back(
+                    QPointF(secondsFromStart, bucketSum / bucketCount));
+                bucketSum = 0.0;
+                bucketCount = 0;
+            };
+            for (const NetworkDiagnosticsSample& sample : samples) {
+                if (!validFor(sample)
+                    || sample.timestampMs < cutoffMs
+                    || sample.timestampMs > endMs) {
+                    continue;
+                }
+                const qint64 sampleBucket = sample.timestampMs / bucketMs;
+                if (currentBucket != sampleBucket) {
+                    flushBucket();
+                    currentBucket = sampleBucket;
+                }
+                bucketSum += std::max(
+                    0.0, static_cast<double>(valueFor(sample)));
+                ++bucketCount;
+            }
+            flushBucket();
+        }
+        return series;
+    };
 
     QVector<TimeSeriesGraphWidget::Series> latencySeries{
         buildSeriesWithUnit("RTT", QColor("#00b4d8"), " ms", [](const NetworkDiagnosticsSample& s) { return static_cast<double>(s.rttMs); }),
@@ -2979,6 +3566,69 @@ void NetworkDiagnosticsDialog::updateCharts()
         buildSeriesWithUnit("Target", QColor("#8aa8c0"), " Hz", [](const NetworkDiagnosticsSample&) {
             return static_cast<double>(AudioEngine::DEFAULT_SAMPLE_RATE);
         })
+    };
+    QVector<TimeSeriesGraphWidget::Series> waveformRateSeries{
+        buildWaveformSeries(
+            "Actual RX",
+            QColor("#56ccf2"),
+            " ksps",
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceRxValid;
+            },
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceRxSampleRateHz / 1000.0;
+            }),
+        buildWaveformSeries(
+            "Actual TX",
+            QColor("#f2c94c"),
+            " ksps",
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceTxValid
+                    && s.digitalVoiceTxSampleRateHz > 0.0;
+            },
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceTxSampleRateHz / 1000.0;
+            }),
+        buildWaveformSeries(
+            "24.00 ksps target",
+            QColor("#8aa8c0"),
+            " ksps",
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceWaveformValid;
+            },
+            [](const NetworkDiagnosticsSample&) { return 24.0; })
+    };
+    QVector<TimeSeriesGraphWidget::Series> waveformErrorSeries{
+        buildWaveformSeries(
+            "VITA sequence gaps",
+            QColor("#f2c94c"),
+            "/s",
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceRxValid;
+            },
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceVitaGapsPerSecond;
+            }),
+        buildWaveformSeries(
+            "Inferred source blocks",
+            QColor("#56ccf2"),
+            "/s",
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceRxValid;
+            },
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceSourceBlocksPerSecond;
+            }),
+        buildWaveformSeries(
+            "TX VITA sequence gaps",
+            QColor("#eb5757"),
+            "/s",
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceTxValid;
+            },
+            [](const NetworkDiagnosticsSample& s) {
+                return s.digitalVoiceTxVitaGapsPerSecond;
+            })
     };
 
     // ── Adaptive throttle spans for amber band ───────────────────────────
@@ -3035,6 +3685,12 @@ void NetworkDiagnosticsDialog::updateCharts()
     m_audioFeedGraph->setThrottleSpans(throttleSpans);
     if (m_fpsCapGraph) {
         m_fpsCapGraph->setSeries({fpsCapSeries}, rangeSeconds);
+    }
+    if (m_digitalVoiceWaveformRateGraph) {
+        m_digitalVoiceWaveformRateGraph->setSeries(waveformRateSeries, rangeSeconds);
+    }
+    if (m_digitalVoiceWaveformErrorGraph) {
+        m_digitalVoiceWaveformErrorGraph->setSeries(waveformErrorSeries, rangeSeconds);
     }
 }
 

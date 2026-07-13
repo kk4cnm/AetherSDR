@@ -40,6 +40,9 @@
 #include "core/PipeWireAudioBridge.h"
 #endif
 #include "core/AppSettings.h"
+#include "core/DigitalVoiceFeature.h"
+#include "core/DigitalVoiceWaveformProcess.h"
+#include "core/DigitalVoiceWaveformSettings.h"
 #include "core/aprs/AprsSettings.h"
 #include "core/LogManager.h"
 #include "core/WfmDemodulator.h"
@@ -56,6 +59,33 @@
 #include <cmath>
 
 namespace AetherSDR {
+
+void MainWindow::scheduleDigitalVoiceAutoStart()
+{
+    if (!kLocalDigitalVoiceWaveformAvailable
+        || !DigitalVoiceWaveformSettings::autoStart()) {
+        return;
+    }
+
+    QTimer::singleShot(3000, this, [this] {
+        // The helper must reach the radio directly; a SmartLink/WAN session's
+        // advertised LAN address is not a usable transport endpoint.
+        if (!m_radioModel.isConnected() || m_radioModel.isWan()) {
+            return;
+        }
+        m_radioModel.dstarModel().start(
+            m_radioModel.radioAddress(), m_radioModel.callsign());
+    });
+}
+
+void MainWindow::stopDigitalVoiceService(bool waitForExit)
+{
+    if (waitForExit) {
+        DigitalVoiceWaveformProcess::instance().stopAndWait();
+    } else {
+        DigitalVoiceWaveformProcess::instance().stop();
+    }
+}
 
 void MainWindow::showAx25HfPacketDecodeDialog()
 {
@@ -74,7 +104,7 @@ void MainWindow::showAx25HfPacketDecodeDialog()
         dlg->setFramelessMode(
             AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
         m_ax25HfPacketDecodeDialog = dlg;
-        m_persistentDialogs.append(QPointer<PersistentDialog>(dlg));
+        trackPersistentDialog(dlg);
     }
     m_ax25HfPacketDecodeDialog->setAttachedSlice(slice);
 #ifdef HAVE_MQTT
@@ -107,7 +137,7 @@ void MainWindow::startKissTncOnStartupIfConfigured()
     dlg->setFramelessMode(
         AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
     m_ax25HfPacketDecodeDialog = dlg;
-    m_persistentDialogs.append(QPointer<PersistentDialog>(dlg));
+    trackPersistentDialog(dlg);
 #ifdef HAVE_MQTT
     m_ax25HfPacketDecodeDialog->setMqttClient(m_mqttClient);
 #endif
@@ -1267,7 +1297,7 @@ void MainWindow::showPskReporterMapDialog()
         dlg->setFramelessMode(
             AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
         m_pskReporterMapDialog = dlg;
-        m_persistentDialogs.append(QPointer<PersistentDialog>(dlg));
+        trackPersistentDialog(dlg);
     }
     m_pskReporterMapDialog->show();
     m_pskReporterMapDialog->raise();

@@ -58,8 +58,21 @@ jobs:
             echo "Pre-built Qt not available at $URL — falling back to from-source build (~27 min).  Run the Build macOS Qt (Intel deps) workflow to populate this asset."
           fi
 
-      - name: Build Qt from source (Intel only, fallback)
+      - name: Cache Qt (Intel from-source build)
+        # The pre-built Qt tarball above is the fast path; when that asset is
+        # missing we compile Qt from source (~2 h on the Intel runner). Cache the
+        # resulting qt-install prefix so it's built once per Qt version and
+        # restored on every later run. Bump the version in the key whenever the
+        # Qt version / module set below changes (same as the download URL above).
         if: matrix.label == 'intel' && steps.qt-download.outputs.downloaded != 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        id: qt-cache
+        with:
+          path: qt-install
+          key: qt-intel-src-6.8.3-deploy13.0-qtbase.mm.ws.sp.st
+
+      - name: Build Qt from source (Intel only, fallback)
+        if: matrix.label == 'intel' && steps.qt-download.outputs.downloaded != 'true' && steps.qt-cache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch v6.8.3 https://code.qt.io/qt/qt5.git qt-src
           cd qt-src
@@ -201,6 +214,20 @@ jobs:
             # Sign the framework bundle itself
             codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$fw"
           done
+
+          # 2b. Sign any extra helper executables in Contents/MacOS/ (e.g.
+          # aether-dv-waveform, the D-STAR ThumbDV helper). The bundle sign in
+          # step 3 runs without --deep, and these aren't .dylib or frameworks,
+          # so without this they reach notarization unsigned — no Developer ID,
+          # no secure timestamp, no hardened runtime — and Apple rejects the
+          # whole archive. Skip the bundle's main executable (step 3 signs it).
+          find "$APP/Contents/MacOS" -maxdepth 1 -type f ! -name AetherSDR -print0 |
+            while IFS= read -r -d '' bin; do
+              if file "$bin" | grep -q "Mach-O"; then
+                echo "Signing helper executable: $bin"
+                codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$bin"
+              fi
+            done
 
           # 3. Sign the main app bundle last (no --deep)
           codesign --force --options runtime --timestamp \

@@ -103,7 +103,7 @@ jobs:
           # emitting a full PDB, which is what create-msix.ps1 bundles as
           # .appxsym for Partner Center crash symbolication (and what we keep
           # as a standalone artifact for our own WinDbg use).
-          cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMQTT_TLS=OFF -DREQUIRE_KEYCHAIN=ON -DENABLE_NVIDIA_AFX=ON -DCMAKE_TOOLCHAIN_FILE="$env:CMAKE_TOOLCHAIN_FILE" -DVCPKG_TARGET_TRIPLET="$env:VCPKG_TARGET_TRIPLET"
+          cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMQTT_TLS=OFF -DREQUIRE_KEYCHAIN=ON -DREQUIRE_SERIALPORT=ON -DENABLE_NVIDIA_AFX=ON -DCMAKE_TOOLCHAIN_FILE="$env:CMAKE_TOOLCHAIN_FILE" -DVCPKG_TARGET_TRIPLET="$env:VCPKG_TARGET_TRIPLET"
 
       - name: Build Opus (RADE dependency)
         # ExternalProject dependency ordering via BUILD_BYPRODUCTS is correct,
@@ -118,6 +118,14 @@ jobs:
         run: |
           mkdir deploy
           copy build\AetherSDR.exe deploy\
+          if (-not (Test-Path "build\aether-dv-waveform.exe")) {
+            throw "Required ThumbDV helper build\aether-dv-waveform.exe is missing"
+          }
+          if (-not (Test-Path "build\AetherDV.cfg")) {
+            throw "Required digital-voice manifest build\AetherDV.cfg is missing"
+          }
+          copy build\aether-dv-waveform.exe deploy\
+          copy build\AetherDV.cfg deploy\
           # windeployqt treats any Qt6* DLL as an official Qt module and looks for
           # it in the Qt bin directory to scan its transitive dependencies. Copy
           # qt6keychain.dll there before invoking windeployqt so it can resolve it.
@@ -199,6 +207,25 @@ jobs:
         run: |
           . .\packaging\windows\store-identity.ps1
           powershell -NoProfile -ExecutionPolicy Bypass -File packaging\windows\create-msix.ps1 -DeployDir deploy -OutputDir . -CreateUpload -SkipSign -ExcludeDfnrModel -RequirePdb
+
+      # Hard gate for the PDB-regression class (#3946). The Create MSIX
+      # package step above is continue-on-error (to tolerate MSIX SDK/tool
+      # flakes), which ALSO swallows create-msix.ps1's -RequirePdb throw — so
+      # a missing PDB can't red the build from inside that step. A missing PDB
+      # is not an MSIX hiccup though: it's a build regression (e.g.
+      # CMAKE_BUILD_TYPE flipped back to Release, which omits /Zi + /DEBUG so
+      # no build/AetherSDR.pdb is emitted) that would silently ship
+      # symbol-less .msixupload packages and skip the Windows-Symbols upload.
+      # Re-check the PDB the RelWithDebInfo Build step must emit in a step that
+      # is deliberately NOT continue-on-error, so that regression fails the job
+      # loudly instead of landing on a green build. -RequirePdb is kept above
+      # for local/dev ergonomics; this step is the CI gate that actually reds.
+      - name: Verify debug symbols (PDB) present
+        run: |
+          if (-not (Test-Path build\AetherSDR.pdb)) {
+            throw "build/AetherSDR.pdb is missing. The RelWithDebInfo Windows build must emit a PDB for Partner Center crash symbolication (.appxsym) and the standalone Windows-Symbols artifact. If CMAKE_BUILD_TYPE was changed to Release, restore RelWithDebInfo. See #3946 / #3934."
+          }
+          Write-Host "PDB present: build\AetherSDR.pdb"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

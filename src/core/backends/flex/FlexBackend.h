@@ -62,6 +62,7 @@ public:
     void setSliceFrequency(int sliceId, double hz) override;
     void setSliceMode(int sliceId, const QString& mode) override;
     void setSliceFilter(int sliceId, int lowHz, int highHz) override;
+    void sendSliceWaveformCommand(int sliceId, const QString& command);
     void setKeying(bool key) override;
     void invokeExtension(const QString& ns, const QString& verb,
                          quint64 requestId, const QVariant& arg = {}) override;
@@ -116,10 +117,50 @@ public:
     // clamped numeric parses, uppercase, and list split; the model applies the
     // present fields. Called from the matching RadioModel status choke points.
     void decodeTransmitStatus(const QMap<QString, QString>& kvs);
+    // Decode radio-global status ("radio …" / "radio slices …" etc.) into the
+    // normalized RadioDelta and emit radioChanged (aetherd RFC 2.3 — RadioModel
+    // residual). Present-only, ok-guarded numeric parses.
+    void decodeRadioStatus(const QMap<QString, QString>& kvs);
     void decodeInterlockStatus(const QMap<QString, QString>& kvs);
     void decodeAtuStatus(const QMap<QString, QString>& kvs);
     void decodeApdStatus(const QMap<QString, QString>& kvs);
+    // Translate a SmartSDR "amplifier <handle> …" status into a typed AmpDelta
+    // and emit amplifierChanged (aetherd 2.4 — AmpModel decode split, #4094).
+    // `model` is the wire "model" key (TunerGeniusXL routes to the tuner, not
+    // here); `removed` marks an "amplifier <handle> removed". Stateless — the
+    // presence latch / operate change-gating live in AmpModel::applyChanges.
+    void decodeAmplifierStatus(const QString& handle, const QString& model,
+                               const QMap<QString, QString>& kvs, bool removed);
+    // Translate a SmartSDR TGXL tuner status (the "atu <handle> …" and
+    // "amplifier <handle> model=TunerGeniusXL …" kv-sets) into a typed
+    // TunerDelta and emit tunerChanged (aetherd 2.4 — TunerModel decode split,
+    // #4092). Present-only, strict-parity with the prior TunerModel::applyStatus.
+    // `handle` is the (sanitized) TGXL object handle RadioModel extracted; it is
+    // cached here to source the tuner encode path (#4198).
+    void decodeTunerStatus(const QString& handle, const QMap<QString, QString>& kvs);
+    // Drop the cached amp/tuner encode handles (#4198). Called on radio
+    // disconnect/reset, where RadioModel clears the model-side presence outside
+    // the decode path — without this the stale handle could survive a reconnect
+    // to a *different* radio and be used to build a bogus relay command.
+    void clearExtensionHandles();
     void decodeApdSamplerStatus(const QMap<QString, QString>& kvs);
+    // Decode the Flex GPS-status line ("gps …", '#'-separated key=value tokens)
+    // into a present-only GpsDelta and emit gpsChanged (aetherd RFC 2.3 —
+    // RadioModel residual). Satellite counts are numeric; the rest keep the
+    // radio's string form (units included).
+    void decodeGpsStatus(const QString& rawBody);
+    // Decode a Flex memory-slot status kv-set (keyed by slot index) into a
+    // normalized MemoryDelta and emit memoryChanged (aetherd RFC 2.3 — RadioModel
+    // residual). Sets delta.removed for "in_use=0" / a bare "removed"; carries
+    // text fields raw (the model sanitises). Present-only, ok-guarded numerics.
+    void decodeMemoryStatus(int index, const QMap<QString, QString>& kvs);
+    // Parse a Flex "profile <type> …" status body into a ProfileDelta and emit
+    // profileChanged (aetherd RFC 2.3 — RadioModel residual). Handles the raw
+    // ('^'-list, space-containing values) list/current form and the plain
+    // importing/exporting flags. profileType is "tx"/"mic"/"global"; empty for a
+    // flags-only kv-set with no profile type.
+    void decodeProfileStatus(const QString& profileType, const QString& rawBody);
+    void decodeProfileFlags(const QMap<QString, QString>& kvs);
 
 private:
     void send(const QString& cmd);
@@ -132,6 +173,14 @@ private:
     std::function<void(const QString&)> m_sink;
     std::function<void(const QString&)> m_sliceSink;
     std::function<QString()> m_modelProvider;
+
+    // Decode-side handle state (#4198). Captured from the amplifier/tgxl status
+    // decode and consumed by invokeExtension() to build the amp/tuner relay wire,
+    // so RadioModel no longer threads the Flex handle through the encode arg.
+    // Touched only on the main thread — both the decode (RadioModel::handleStatus)
+    // and the encode intent lambdas run there — so a plain QString needs no sync.
+    QString m_ampHandle;
+    QString m_tunerHandle;
 };
 
 }  // namespace AetherSDR

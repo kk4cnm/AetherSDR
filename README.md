@@ -30,7 +30,7 @@ The upstream README follows.
 
 AetherSDR brings full FlexRadio operation to Linux, macOS, and Windows — each a native build, no Wine or virtual machines. A native aarch64 build also runs on Raspberry Pi and other embedded ARM devices. Built from the ground up with Qt6 and C++20, it speaks the SmartSDR protocol natively and aims to replicate the full SmartSDR experience.
 
-**Current version: 26.7.1** — CalVer (`YY.M.patch[.hotfix]`). | [Download](https://github.com/aethersdr/AetherSDR/releases/latest) | [Discussions](https://github.com/aethersdr/AetherSDR/discussions) | [What's New](https://github.com/aethersdr/AetherSDR/releases)
+**Current version: 26.7.2** — CalVer (`YY.M.patch[.hotfix]`). | [Download](https://github.com/aethersdr/AetherSDR/releases/latest) | [Discussions](https://github.com/aethersdr/AetherSDR/discussions) | [What's New](https://github.com/aethersdr/AetherSDR/releases)
 
 > **Native builds for Linux, macOS, and Windows** — Linux AppImage (x86-64 + aarch64), macOS DMG (Apple Silicon + Intel), Windows installer and portable ZIP. Every platform is built, tested in CI, and released together.
 
@@ -252,10 +252,18 @@ sudo cmake --install build
 
 ## Roadmap
 
-- [ ] CW ultimatic keyer mode (#416)
-- [ ] Native DAX audio channels on Windows
+Currently in flight:
 
-See the full [issue tracker](https://github.com/aethersdr/AetherSDR/issues) for all planned features.
+- **aetherd** — a vendor-neutral `IRadioBackend` seam so radio-family logic
+  lives behind a stable interface (the groundwork for non-Flex radios).
+- **Hermes-Lite 2** — a first non-Flex, raw-IQ backend on that seam
+  (design spike in [`prototypes/hl2/`](prototypes/hl2/)).
+- **AppSettings nested-JSON refactor**, **TX DSP chain visual rebuild**, and
+  the **Flathub submission**.
+
+See [`ROADMAP.md`](ROADMAP.md) for the full picture and the community backlog,
+and the [issue tracker](https://github.com/aethersdr/AetherSDR/issues) for
+everything else.
 
 ---
 
@@ -266,6 +274,21 @@ PRs, bug reports, and feature requests welcome! See [CONTRIBUTING.md](CONTRIBUTI
 **Development environment:** AetherSDR is developed using [Claude Code](https://claude.com/claude-code) as the primary development tool. We encourage contributors to use Claude Code for consistency. PRs must follow project conventions, pass CI, and include GPG-signed commits.
 
 **Not a developer?** Click the lightbulb button in AetherSDR's title bar to create an AI-assisted bug report or feature request.
+
+---
+
+## Related projects
+
+- **[Aether-gate](https://github.com/aethersdr/Aether-gate)** — put *any* radio into
+  AetherSDR. A bridge that presents an Icom/Kenwood/Yaesu/Elecraft CAT rig (via
+  [Hamlib](https://hamlib.github.io/)), an Icom LAN rig, or a SoapySDR dongle to
+  AetherSDR as if it were a FlexRadio — live panadapter, waterfall, and
+  frequency/mode control. Receive + control today (no transmit yet). By Nigel
+  Fenton (G0JKN); GPL-3.0-or-later. *(`aethersdr/Aether-gate` tracks upstream
+  [nigelfenton/Aether-gate](https://github.com/nigelfenton/Aether-gate).)*
+
+AetherSDR integrates radios that earn deep native support directly in-engine; the
+gate covers the long tail of legacy/CAT radios and dongles.
 
 ---
 
@@ -287,3 +310,4 @@ See [docs/VERIFYING-RELEASES.md](docs/VERIFYING-RELEASES.md) for full instructio
 AetherSDR is free and open-source software licensed under the [GNU General Public License v3](LICENSE).
 
 *AetherSDR is an independent project and is not affiliated with or endorsed by FlexRadio Systems.*
+*D-STAR is a registered trademark of Icom Inc. AetherSDR is not affiliated with or endorsed by Icom Inc.*

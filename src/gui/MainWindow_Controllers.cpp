@@ -22,6 +22,7 @@
 #include "MainWindowHelpers.h"
 #include "core/AppSettings.h"
 #include "core/CwTrace.h"
+#include "core/DigitalVoiceFeature.h"
 #include "core/KiwiSdrProtocol.h"
 #include "core/LogManager.h"
 #include "core/MidiSettings.h"
@@ -433,25 +434,10 @@ void MainWindow::handleFlexControlButton(int button, int action)
     } else if (actionName == "ToggleApf") {
         if (auto* s = activeSlice()) s->setApf(!s->apfOn());
     } else if (actionName == "BandZoom") {
-        auto* s = activeSlice();
-        if (!s) return;
-        const QString panId = !s->panId().isEmpty()
-            ? s->panId()
-            : (m_panStack ? m_panStack->activePanId() : m_radioModel.panId());
-        if (panId.isEmpty()) return;
-        m_flexVirtualBandZoomOn = !m_flexVirtualBandZoomOn;
-        m_radioModel.sendCommand(QString("display pan set %1 band_zoom=%2")
-            .arg(panId).arg(m_flexVirtualBandZoomOn ? 1 : 0));
+        // Radio-authoritative per-pan toggle shared by all entry points (#4057).
+        togglePanZoomMode(/*segmentZoom=*/false);
     } else if (actionName == "SegmentZoom") {
-        auto* s = activeSlice();
-        if (!s) return;
-        const QString panId = !s->panId().isEmpty()
-            ? s->panId()
-            : (m_panStack ? m_panStack->activePanId() : m_radioModel.panId());
-        if (panId.isEmpty()) return;
-        m_flexVirtualSegmentZoomOn = !m_flexVirtualSegmentZoomOn;
-        m_radioModel.sendCommand(QString("display pan set %1 segment_zoom=%2")
-            .arg(panId).arg(m_flexVirtualSegmentZoomOn ? 1 : 0));
+        togglePanZoomMode(/*segmentZoom=*/true);
     } else if (actionName == "NextSlice") {
         const auto& slices = m_radioModel.slices();
         if (slices.size() > 1) {
@@ -848,7 +834,7 @@ void MainWindow::updateTMate2Indicators()
     const float dbm   = m_tmate2SmeterDbm;
     const float txPowerWatts = m_tmate2TxWatts;
     const float txPowerFullScaleWatts =
-        (m_radioModel.hasAmplifier() && m_radioModel.ampOperate()) ? 2000.0f : 100.0f;
+        (m_radioModel.amplifier().present() && m_radioModel.amplifier().operate()) ? 2000.0f : 100.0f;
     auto& settings = AppSettings::instance();
     // TMate 2 settings list the main tuning encoder first, then the two
     // auxiliary encoders. The LCD labels those auxiliaries in the opposite
@@ -975,27 +961,10 @@ void MainWindow::dispatchHidAction(const QString& actionName,
 #endif
         }
     } else if (actionName == "BandZoom") {
-        auto* s = activeSlice();
-        if (s) {
-            const QString panId = !s->panId().isEmpty() ? s->panId()
-                : (m_panStack ? m_panStack->activePanId() : m_radioModel.panId());
-            if (!panId.isEmpty()) {
-                m_flexVirtualBandZoomOn = !m_flexVirtualBandZoomOn;
-                m_radioModel.sendCommand(QString("display pan set %1 band_zoom=%2")
-                    .arg(panId).arg(m_flexVirtualBandZoomOn ? 1 : 0));
-            }
-        }
+        // Radio-authoritative per-pan toggle shared by all entry points (#4057).
+        togglePanZoomMode(/*segmentZoom=*/false);
     } else if (actionName == "SegmentZoom") {
-        auto* s = activeSlice();
-        if (s) {
-            const QString panId = !s->panId().isEmpty() ? s->panId()
-                : (m_panStack ? m_panStack->activePanId() : m_radioModel.panId());
-            if (!panId.isEmpty()) {
-                m_flexVirtualSegmentZoomOn = !m_flexVirtualSegmentZoomOn;
-                m_radioModel.sendCommand(QString("display pan set %1 segment_zoom=%2")
-                    .arg(panId).arg(m_flexVirtualSegmentZoomOn ? 1 : 0));
-            }
-        }
+        togglePanZoomMode(/*segmentZoom=*/true);
     } else if (actionName == "NextSlice") {
         const auto& slices = m_radioModel.slices();
         if (slices.size() > 1) {
@@ -1781,6 +1750,17 @@ void MainWindow::registerMidiParams()
         [this](float v) { if (auto* s = activeSlice()) s->setLocked(v > 0.5f); },
         [this]() -> float { auto* s = activeSlice(); return s && s->isLocked() ? 1 : 0; });
 
+    reg("rx.centerLock", "Center Lock", "RX", P::Toggle, 0, 1,
+        [this](float v) {
+            if (SliceModel* slice = activeSlice()) {
+                setCenterLockForSlice(slice, v > 0.5f);
+            }
+        },
+        [this]() -> float {
+            SliceModel* slice = activeSlice();
+            return centerLockActiveForSlice(slice) ? 1 : 0;
+        });
+
     reg("rx.ritEnable", "RIT Enable", "RX", P::Toggle, 0, 1,
         [this](float v) { if (auto* s = activeSlice()) s->setRit(v > 0.5f, s->ritFreq()); },
         [this]() -> float { auto* s = activeSlice(); return s && s->ritOn() ? 1 : 0; });
@@ -2023,11 +2003,11 @@ void MainWindow::registerMidiParams()
     };
 
     // ── Mode triggers (mirror Mode/* keyboard shortcuts) ───────────────
-    static const char* kModes[] = {"USB", "LSB", "CW", "CWL",
-                                    "AM", "SAM", "FM", "NFM",
-                                    "DFM", "DIGU", "DIGL", "RTTY"};
-    for (const char* m : kModes) {
-        const QString idShort = QString("mode_%1").arg(QString(m).toLower());
+    const QStringList modes = filterUnavailableDigitalVoiceModes(
+        {"USB", "LSB", "CW", "CWL", "AM", "SAM", "FM", "NFM",
+         "DFM", "DSTR", "DIGU", "DIGL", "RTTY"});
+    for (const QString& m : modes) {
+        const QString idShort = QString("mode_%1").arg(m.toLower());
         const QString idMidi  = QString("global.mode%1").arg(m);
         const QString name    = QString("Mode %1").arg(m);
         reg(idMidi.toUtf8().constData(),
@@ -2092,19 +2072,20 @@ void MainWindow::registerMidiParams()
         [cycleBand](float) { cycleBand(-1); });
 
     // ── Mode Up / Down (cycle through the mode list above) ───────────
-    static constexpr int kModeCount =
-        static_cast<int>(sizeof(kModes) / sizeof(const char*));
-    auto cycleMode = [this, fireShortcut](int direction) {
+    auto cycleMode = [this, fireShortcut, modes](int direction) {
         // Find current mode index from the active slice; if no match, start at 0.
         int currentIdx = 0;
         if (auto* s = activeSlice()) {
             const QString curMode = s->mode().toUpper();
-            for (int i = 0; i < kModeCount; ++i) {
-                if (curMode == QLatin1String(kModes[i])) { currentIdx = i; break; }
+            for (int i = 0; i < modes.size(); ++i) {
+                if (curMode == modes[i]) {
+                    currentIdx = i;
+                    break;
+                }
             }
         }
-        const int next = (currentIdx + direction + kModeCount) % kModeCount;
-        const QString idShort = QString("mode_%1").arg(QString(kModes[next]).toLower());
+        const int next = (currentIdx + direction + modes.size()) % modes.size();
+        const QString idShort = QString("mode_%1").arg(modes[next].toLower());
         fireShortcut(idShort.toUtf8().constData());
     };
     reg("global.modeUp", "Mode Up", "Global", P::Trigger, 0, 1,

@@ -7,7 +7,6 @@
 #include <array>
 #include <functional>
 
-class QTabWidget;
 class QLabel;
 class QLineEdit;
 class QGroupBox;
@@ -18,6 +17,9 @@ class QCheckBox;
 class QSpinBox;
 class QVBoxLayout;
 class QTableWidget;
+class QStackedWidget;
+class QTreeWidget;
+class QTreeWidgetItem;
 
 namespace AetherSDR {
 
@@ -30,8 +32,7 @@ class PgxlConnection;
 class AntennaGeniusModel;
 class KiwiSdrManager;
 
-// Radio Setup dialog — tabbed configuration window matching SmartSDR's
-// Settings → Radio Setup. Shows radio info, GPS, TX, RX, filters, etc.
+// Radio Setup dialog — searchable, category-based configuration window.
 class RadioSetupDialog : public PersistentDialog {
     Q_OBJECT
 
@@ -54,6 +55,20 @@ signals:
     // widgets (the AppSettings value is what's actually consulted at
     // paint time — this signal is just the redraw trigger).
     void sliceLetterDisplayModeChanged();
+    // Fired when the user toggles the agent automation bridge in the
+    // Network tab. MainWindow starts/stops the in-app bridge that MCP
+    // clients (AI coding assistants) connect to. The AppSettings value
+    // AutomationBridgeEnabled is persisted by the dialog before the
+    // signal fires, so it survives restart.
+    void automationBridgeToggled(bool enabled);
+    // Fired when the user rotates (or first-generates) the bridge access
+    // token. MainWindow persists it and pushes it to the running bridge so
+    // the rotation takes effect immediately.
+    void automationBridgeTokenRotated(const QString& token);
+    // Fired when the user changes the "Allow TX via MCP" toggle (after the
+    // one-time confirmation dialog). MainWindow persists it and pushes it to
+    // the running bridge — enabling arms the force-unkey watchdog.
+    void automationBridgeTxAllowedChanged(bool allowed);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -106,7 +121,15 @@ private:
     PgxlConnection*    m_pgxl{nullptr};
     AntennaGeniusModel* m_ag{nullptr};
     KiwiSdrManager* m_kiwiSdrManager{nullptr};
-    QTabWidget*  m_tabs{nullptr};
+    QTreeWidget* m_navigation{nullptr};
+    QStackedWidget* m_pages{nullptr};
+    QLabel* m_pageTitle{nullptr};
+    QHash<QString, int> m_pageIndexes;
+    QHash<int, QTreeWidgetItem*> m_pageItems;
+    // First visible navigation match for the current search text (#4183).
+    // Stashed by the search filter and committed on Enter, so typing highlights
+    // the match without eagerly building deferred, hardware-probing pages.
+    QTreeWidgetItem* m_searchFirstMatch{nullptr};
     QHash<QString, QComboBox*> m_flexControlActionCombos;
     QHash<QString, QString> m_flexControlActionDefaults;
     QLabel* m_flexControlStatusLabel{nullptr};
@@ -151,12 +174,12 @@ private:
     FirmwareUploader* m_uploader{nullptr};
     FirmwareStager*   m_stager{nullptr};
 
-    // Lazy tab construction — deferred builders keyed by tab index (#1776)
+    // Lazy page construction — deferred builders keyed by page index (#1776)
     QHash<int, std::function<QWidget*()>> m_deferredBuilders;
     void buildDeferredTab(int index);
 
-    // External APD tab (visible only when the radio reports apd configurable=1)
-    int                       m_apdTabIndex{-1};
+    // External APD page (visible only when the radio reports apd configurable=1)
+    int                       m_apdPageIndex{-1};
     QHash<QString, QComboBox*> m_apdSamplerCombos;
 
     // Peripherals tab — savers run on dialog close to persist field edits

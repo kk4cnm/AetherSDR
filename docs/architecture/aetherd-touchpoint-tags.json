@@ -140,7 +140,7 @@
  "core/CommandParser.h": {
   "tag": "vendor(flex)",
   "note": "Stateless parser/builder for SmartSDR TCP wire lines (V/H/C/R/S/M, FlexLib semantics) \u2014 pure Flex protocol.",
-  "split": "",
+  "split": "Generic MessageType/MessageSeverity enums extracted to core/RadioMessageTypes.h (vendor-free) so above-seam enum-only consumers decouple (EB3, #4087); the parser + ParsedMessage stay vendor(flex).",
   "confidence": "high"
  },
  "core/CwCallsignSpotter.h": {
@@ -216,8 +216,8 @@
   "confidence": "high"
  },
  "core/FlexControlManager.h": {
-  "tag": "vendor(flex)",
-  "note": "FlexControl USB knob serial driver (VID 0x2192); Flex ecosystem hardware but client-side input, home=gui shell",
+  "tag": "ui-support",
+  "note": "FlexControl USB knob serial driver (VID 0x2192) — a desktop input-surface driver, the same class as HidEncoderManager (RC-28/TMate)/UlanziDialBackend/SerialPortController, all ui-support. Flex-branded hardware but client-side input, not radio-family wire; NOT behind the radio seam (reclassified from vendor(flex), #4089).",
   "split": "",
   "confidence": "high"
  },
@@ -402,8 +402,8 @@
   "confidence": "high"
  },
  "core/PgxlConnection.h": {
-  "tag": "vendor(flex)",
-  "note": "Direct TCP client (port 9008) for 4O3A Power Genius XL amp telemetry \u2014 Flex-ecosystem accessory protocol.",
+  "tag": "peripheral(4o3a)",
+  "note": "Direct TCP client (port 9008) for the external 4O3A Power Genius XL (PGXL) amplifier \u2014 TELEMETRY-ONLY (statusUpdated: state/power/SWR/current/temp/\u2026); it has no operate/standby command. PGXL operate/standby is relayed through the radio (RadioModel::setAmpOperate \u2192 'amplifier set <handle> operate=\u2026'), which is also the only path for remote/SmartLink. So this header is a genuine local direct-transport peripheral(4o3a); the amp's radio-relay control lives in RadioModel (radio-side) and should split into a generic AmpModel + Flex relay behind FlexBackend \u2014 see #4094.",
   "split": "",
   "confidence": "high"
  },
@@ -465,6 +465,12 @@
   "tag": "mixed(flex)",
   "note": "Device-discovery list/events are core-profile; SmartSDR UDP:4992 parsing + Multi-Flex/license fields are flex",
   "split": "Discovered-device list surface (name/model/serial/address/status, discovered/updated/lost events) is core-profile; SmartSDR UDP 4992 broadcast parsing, multi-Flex/GUI-client fields (guiClient*, mf_enable), maxLicensedVersion/turfRegion, and bind/re-bind churn tied to SmartSDR discovery are flex vendor extension.",
+  "confidence": "high"
+ },
+ "core/RadioMessageTypes.h": {
+  "tag": "universal",
+  "note": "Generic radio-message classification enums (MessageType/MessageSeverity) — no vendor ties. Extracted from vendor(flex) core/CommandParser.h so above-seam consumers of just the enums decouple from the SmartSDR wire parser (EB3 decouple, #4087). MessageSeverity values are load-bearing wire values (see the header).",
+  "split": "",
   "confidence": "high"
  },
  "core/ReceivePresentationSync.h": {
@@ -552,8 +558,8 @@
   "confidence": "high"
  },
  "core/TgxlConnection.h": {
-  "tag": "vendor(flex)",
-  "note": "Direct TCP client for 4O3A Tuner Genius XL port-9010 protocol (relay/autotune); Flex-ecosystem accessory.",
+  "tag": "peripheral(4o3a)",
+  "note": "Direct TCP client for the 4O3A Tuner Genius XL (port 9010, relay/autotune), reverse-engineered from the 4O3A management app — a standalone accessory transport, not SmartSDR. Not radio-family wire; a peripheral accessory, NOT behind the IRadioBackend radio seam (reclassified from vendor(flex), #4087 follow-up).",
   "split": "",
   "confidence": "high"
  },
@@ -701,9 +707,15 @@
   "split": "",
   "confidence": "medium"
  },
+ "models/AmpModel.h": {
+  "tag": "mixed(flex)",
+  "note": "Power-amplifier state model (PGXL / any non-TGXL amp the radio proxies), extracted from RadioModel (#4094). Like TunerModel: universal amp state (presence/operate/telemetry) fused with a Flex relay — the radio-proxied 'amplifier set … operate=' command (the only path that works remote/SmartLink; the direct PgxlConnection is telemetry-only).",
+  "split": "Core (stays the model the UI/3rd-party amp sees): presence, operate/standby, telemetry (power/SWR/current/temp/voltage/band). Flex extension (move behind FlexBackend as an IRadioBackend extension verb): the 'amplifier' relay — commandReady 'amplifier set operate' + amplifier-status decode. 2.3-style split; see #4094.",
+  "confidence": "high"
+ },
  "models/AntennaGeniusModel.h": {
-  "tag": "vendor(flex)",
-  "note": "4O3A Antenna Genius switch client: UDP discovery + SmartSDR-like TCP protocol; Flex-ecosystem accessory",
+  "tag": "peripheral(4o3a)",
+  "note": "4O3A Antenna Genius switch client — standalone accessory with its own UDP-broadcast discovery (port 9007) + direct TCP; connects by device IP/port independent of the radio, works with any radio. Not radio-family wire; a peripheral accessory, NOT behind the IRadioBackend radio seam (reclassified from vendor(flex), #4087 follow-up).",
   "split": "",
   "confidence": "high"
  },
@@ -828,9 +840,9 @@
   "confidence": "high"
  },
  "models/TunerModel.h": {
-  "tag": "vendor(flex)",
-  "note": "4o3a TGXL tuner state/commands via SmartSDR 'atu'/'tgxl' TCP verbs + direct port-9010 relay control",
-  "split": "",
+  "tag": "mixed(flex)",
+  "note": "External-tuner state model, intended to become vendor-neutral (usable by any 3rd-party tuner). Fuses universal tuner state with Flex-specific TGXL wiring, so it's mixed — NOT peripheral (that's the transport TgxlConnection) and NOT pure vendor. Distinct from the radio's own built-in ATU (TransmitModel).",
+  "split": "Core (universal, stays the model the UI/3rd-party sees): operate/bypass/tuning state, SWR/fwd-power, antenna-switch selection, presence. Flex extension (move behind FlexBackend as an IRadioBackend extension verb): the TGXL radio-relay — SmartSDR atu/tgxl/amplifier passthrough (commandReady, atu-status decode), which is the ONLY control path for remote/SmartLink operation and is TGXL-specific (the radio relays only the TGXL). A direct TgxlConnection (peripheral, port 9010) is the local fast-path. 2.3-style split; see #4092.",
   "confidence": "high"
  },
  "models/XvtrPolicy.h": {

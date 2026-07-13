@@ -138,6 +138,14 @@ device/OS plumbing, control surfaces — need engine-vs-shell home decisions,
 not protocol messages). The protocol-message workload is therefore roughly
 half the raw touchpoint count.
 
+> **Update (2026-07):** reclassifications since the first pass narrowed the
+> `vendor` set to **21** (17 flex, 4 kiwi). Five headers were found to be
+> not-radio-wire and moved out: the 4O3A Tgxl/Pgxl/AntennaGenius transports →
+> `peripheral(4o3a)` (a new tag for standalone accessory devices, not behind the
+> radio seam, now **3**), the FlexControl USB knob → `ui-support`, and
+> `TunerModel` → `mixed(flex)` (so `mixed` is now **17**).
+> `aetherd-touchpoint-tags.json` is the source of truth.
+
 ---
 
 ## 3. Proposed architecture

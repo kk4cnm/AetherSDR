@@ -433,8 +433,18 @@ void KiwiSdrClient::setReceiverControls(
     sendReceiverControlsToServer();
 }
 
-void KiwiSdrClient::connectToEndpoint(const QString& endpoint)
+void KiwiSdrClient::connectToEndpoint(const QString& endpoint,
+                                      const QString& password)
 {
+    if (!KiwiSdrProtocol::authPasswordFitsServerLimit(password)) {
+        setState(
+            State::Error,
+            tr("The KiwiSDR password is too long after URL encoding "
+               "(maximum %1 characters).")
+                .arg(KiwiSdrProtocol::kAuthPasswordEncodedMaxLength));
+        return;
+    }
+
     QString host;
     quint16 port = 0;
     if (!parseEndpoint(endpoint, &host, &port)) {
@@ -443,6 +453,7 @@ void KiwiSdrClient::connectToEndpoint(const QString& endpoint)
     }
 
     m_endpoint = QStringLiteral("%1:%2").arg(host).arg(port);
+    m_password = password;
     m_host = host;
     m_port = port;
     m_webSocketPort = 0;
@@ -1190,6 +1201,15 @@ void KiwiSdrClient::cleanupSockets()
     m_loggedSoundFrameShape = false;
     m_loggedWaterfallFrameShape = false;
     m_lastDecodedSoundPcm.clear();
+    // Release the sound resampler on teardown, matching the other two teardown
+    // sites (connectToEndpoint / stream-rate change). It was the one sound-decode
+    // member cleanupSockets() left alive, so it lingered per retained
+    // KiwiSdrClient until profile removal. It is rebuilt lazily on the next
+    // connection once the rate is re-negotiated. Minor on its own (~0.2 MB per
+    // receiver); the dominant #4199 growth is the cached waterfall history freed
+    // in KiwiSdrManager::disconnectProfile().
+    m_soundResamplerRateHz = 0.0;
+    m_soundResampler.reset();
     KiwiSdrProtocol::resetSoundAdpcmState(&m_soundAdpcmState);
     m_lastSoundFrameLayout = KiwiSdrProtocol::FrameLayout::Unknown;
     m_soundAudioRateText.clear();
@@ -1266,7 +1286,7 @@ void KiwiSdrClient::cleanupSockets()
 
 void KiwiSdrClient::sendSoundSetupCommands()
 {
-    sendSoundCommand(QStringLiteral("SET auth t=kiwi p=#"));
+    sendSoundCommand(KiwiSdrProtocol::formatAuthCommand(m_password));
     sendSoundIdentityToServer();
     sendSoundCommand(KiwiSdrProtocol::formatSoundCompressionCommand(
         diagnosticSoundCompressionRequested()));
@@ -1318,7 +1338,7 @@ void KiwiSdrClient::sendSoundSampleRateCommands()
 
 void KiwiSdrClient::sendWaterfallSetupCommands()
 {
-    sendWaterfallCommand(QStringLiteral("SET auth t=kiwi p=#"));
+    sendWaterfallCommand(KiwiSdrProtocol::formatAuthCommand(m_password));
     sendWaterfallIdentityToServer();
     sendWaterfallCommand(QStringLiteral("SERVER DE CLIENT AetherSDR W/F"));
     sendWaterfallCommand(KiwiSdrProtocol::formatWaterfallCompressionCommand(

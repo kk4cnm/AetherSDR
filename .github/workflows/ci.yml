@@ -43,6 +43,19 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
+      # #4146 turned liquid-dsp off by default, so the main build above no
+      # longer proves the vendored snapshot still compiles. Build only the
+      # liquid-static target (separate build dir, opt-in flag) so a bitrotted
+      # vendor snapshot fails here rather than on the first future consumer.
+      # The full project configure is intentional: it exercises the main
+      # CMakeLists ENABLE_LIQUID_DSP gating, not just the third_party compile —
+      # don't narrow it to an isolated third_party/liquid-dsp configure.
+      - name: Verify vendored liquid-dsp still builds (opt-in)
+        run: |
+          cmake -B build-liquid -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DENABLE_LIQUID_DSP=ON
+          cmake --build build-liquid --target liquid-static -j$(nproc)
+
   # Cross-platform build check — runs on every PR (no path gating).
   #
   # History: previously gated by a `check-paths` job on a hand-maintained
@@ -159,6 +172,7 @@ jobs:
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded",
             "-DENABLE_NVIDIA_AFX=ON",
+            "-DREQUIRE_SERIALPORT=ON",
             "-DCMAKE_TOOLCHAIN_FILE=$env:CMAKE_TOOLCHAIN_FILE",
             "-DVCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET_TRIPLET"
           )
@@ -176,6 +190,9 @@ jobs:
 
       - name: Build
         run: cmake --build build -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Test ThumbDV portability paths
+        run: ctest --test-dir build -R "aether_dv_waveform_no_args|thumbdv_queue_test|dstar_model_test|digital_voice_waveform_process_test" --output-on-failure
 
       - name: sccache stats
         if: always()

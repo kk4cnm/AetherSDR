@@ -45,6 +45,7 @@
 #include <QActionGroup>
 #include <QCoreApplication>
 #include <QCheckBox>
+#include <QDesktopServices>
 #include <QFrame>
 #include <QJsonDocument>
 #include <QLabel>
@@ -56,6 +57,7 @@
 #include <QScrollBar>
 #include <QShortcut>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWidgetAction>
 
@@ -723,20 +725,28 @@ void MainWindow::buildMenuBar()
     });
     m_profilesMenu->addSeparator();
 
-    // Global profile list (populated on connect)
+    // Global profile list (populated on connect).  Rebuilt on every
+    // globalProfilesChanged() — the radio emits that for both the list and the
+    // active-selection ("current") status, so the checkmark tracks the radio's
+    // authoritative selection live on all platforms.
     connect(&m_radioModel, &RadioModel::globalProfilesChanged, this, [this] {
-        // Remove old profile actions (after the separator)
+        // Delete the old profile actions (after the separator).  Deleting —
+        // rather than removeAction() — frees them; removeAction() leaves each
+        // QAction parented to the menu, so a session's worth of rebuilds would
+        // otherwise accumulate detached actions.
         const auto actions = m_profilesMenu->actions();
         for (int i = 3; i < actions.size(); ++i)  // skip Manager, Import/Export, separator
-            m_profilesMenu->removeAction(actions[i]);
+            delete actions[i];
 
-        // Add current global profiles
+        // Add the current global profiles.  The radio reports an empty active
+        // ("current") until a global profile is explicitly loaded, in which
+        // case no item is checked — that is the honest state, not a bug.
         const auto profiles = m_radioModel.globalProfiles();
         const auto active = m_radioModel.activeGlobalProfile();
         for (const auto& name : profiles) {
             auto* act = m_profilesMenu->addAction(name);
             act->setCheckable(true);
-            act->setChecked(name == active);
+            act->setChecked(!active.isEmpty() && name == active);
             connect(act, &QAction::triggered, this, [this, name] {
                 m_radioModel.loadGlobalProfile(name);
             });
@@ -1054,6 +1064,25 @@ void MainWindow::buildMenuBar()
     }
 
     auto* helpMenu = menuBar()->addMenu("&Help");
+
+    // ── Learn & news ──────────────────────────────────────────────────────
+    // Orientation first: how to get going, the full manual, and what changed.
+    helpMenu->addAction("Getting Started...", this, [this]() {
+        auto* dlg = new HelpDialog("Getting Started", ":/help/getting-started.md", this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
+    helpMenu->addAction("AetherSDR Help...", this, [this]() {
+        auto* dlg = new HelpDialog("AetherSDR Help", ":/help/aethersdr-help.md", this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
     helpMenu->addAction("What's New...", this, [this]() {
         if (m_whatsNewDialog) {
             m_whatsNewDialog->show();
@@ -1064,29 +1093,16 @@ void MainWindow::buildMenuBar()
         m_whatsNewDialog = WhatsNewDialog::showAll(this);
         m_whatsNewDialog->setFramelessMode(
             AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
-        m_persistentDialogs.append(QPointer<PersistentDialog>(m_whatsNewDialog));
+        trackPersistentDialog(m_whatsNewDialog);
     });
     helpMenu->addSeparator();
-    helpMenu->addAction("Getting Started...", this, [this]() {
-        auto* dlg = new HelpDialog("Getting Started", ":/help/getting-started.md", this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
-        dlg->show();
-        dlg->raise();
-        dlg->activateWindow();
-    });
-    helpMenu->addAction("AetherSDR Help...", this, [this]() {
-        auto* dlg = new HelpDialog("AetherSDR Help", ":/help/aethersdr-help.md", this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
-        dlg->show();
-        dlg->raise();
-        dlg->activateWindow();
-    });
+
+    // ── Feature guides ────────────────────────────────────────────────────
+    // Deeper topic walkthroughs for specific parts of the app.
     helpMenu->addAction("Understanding Noise Cancellation...", this, [this]() {
         auto* dlg = new HelpDialog("Understanding Noise Cancellation", ":/help/understanding-noise-cancellation.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
@@ -1094,7 +1110,7 @@ void MainWindow::buildMenuBar()
     auto* controlsHelpAction = helpMenu->addAction("Configuring AetherSDR Controls...", this, [this]() {
         auto* dlg = new HelpDialog("Configuring AetherSDR Controls", ":/help/configuring-aethersdr-controls.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
@@ -1103,59 +1119,96 @@ void MainWindow::buildMenuBar()
     auto* dataModesAction = helpMenu->addAction("Configuring Data Modes...", this, [this]() {
         auto* dlg = new HelpDialog("Configuring Data Modes", ":/help/understanding-data-modes.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
     });
     dataModesAction->setMenuRole(QAction::NoRole); // prevent macOS auto-reparenting (#883)
+    helpMenu->addSeparator();
+
+    // ── Community & feedback ──────────────────────────────────────────────
+    // Outward-facing links: the website, donations, feature ideas, bug
+    // reports, and how to contribute back.
+    helpMenu->addAction("AetherSDR Website", this, []() {
+        QDesktopServices::openUrl(QUrl("https://www.aethersdr.com"));
+    });
+    helpMenu->addAction("Donate to AetherSDR", this, []() {
+        QDesktopServices::openUrl(QUrl("https://opencollective.com/aethersdr"));
+    });
+    helpMenu->addAction(QString::fromUtf8("Submit your Idea... \xF0\x9F\x92\xA1"),
+                        this, [this]() {
+        if (m_titleBar) m_titleBar->showFeatureRequestDialog();
+    });
+    // "File an Issue" was previously buried inside the Support dialog; surface
+    // it directly so reporting a bug is one click from the Help menu.
+    helpMenu->addAction("File an Issue...", this, [this]() {
+        SupportDialog::fileIssue(this, &m_radioModel);
+    });
     helpMenu->addAction("Contributing to AetherSDR...", this, [this]() {
         auto* dlg = new HelpDialog("Contributing to AetherSDR", ":/help/contributing-to-aethersdr.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
     });
     helpMenu->addSeparator();
-    helpMenu->addAction(QString::fromUtf8("Submit your idea... \xF0\x9F\x92\xA1"),
-                        this, [this]() {
-        if (m_titleBar) m_titleBar->showFeatureRequestDialog();
-    });
-    helpMenu->addAction("Support...", this, [this]() {
+
+    // ── Diagnostics & maintenance ─────────────────────────────────────────
+    // Tools for capturing logs, chasing slice problems, resetting local
+    // settings, and staying up to date.
+    helpMenu->addAction("Support && Diagnostics...", this, [this]() {
         auto* dlg = new SupportDialog(this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->setRadioModel(&m_radioModel);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
     });
     helpMenu->addAction("Slice Troubleshooting...", this, [this]() {
-        SliceTroubleshootingDialog dlg(&m_radioModel, m_audio, this,
-                                       [this]() { return buildControlDevicesSnapshot(); },
-                                       [this]() {
-                                           QJsonObject renderer;
-                                           renderer["available"] = true;
-                                           renderer["description"] = spectrum()
-                                               ? spectrum()->rendererDescription()
-                                               : QStringLiteral("No active pan");
-                                           return renderer;
-                                       });
-        dlg.exec();
+        auto* dlg = new SliceTroubleshootingDialog(
+            &m_radioModel, m_audio, this,
+            [this]() { return buildControlDevicesSnapshot(); },
+            [this]() {
+                QJsonObject renderer;
+                renderer["available"] = true;
+                renderer["description"] = spectrum()
+                    ? spectrum()->rendererDescription()
+                    : QStringLiteral("No active pan");
+                return renderer;
+            });
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->setWindowModality(Qt::ApplicationModal);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
     });
+    // "Reset Settings" was previously buried inside the Support dialog too.
+    // NoRole is required: macOS would otherwise treat the word "Settings" as a
+    // Preferences action and reparent it into the application menu.
+    auto* resetSettingsAction = helpMenu->addAction("Reset Settings...", this, [this]() {
+        SupportDialog::resetSettings(this);
+    });
+    resetSettingsAction->setMenuRole(QAction::NoRole);
     helpMenu->addAction("Check for Updates...", this, [this]() {
         m_updateChecker->checkNow();
     });
     helpMenu->addSeparator();
     helpMenu->addAction("About AetherSDR", this, [this]{
-        auto* dlg = new QDialog(this);
+        auto* dlg = new PersistentDialog(QStringLiteral("About AetherSDR"),
+                                         QStringLiteral("AboutDialogGeometry"), this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setWindowTitle("About AetherSDR");
         dlg->setFixedWidth(380);
         AetherSDR::ThemeManager::instance().applyStyleSheet(dlg, "QDialog { background: {{color.background.0}}; }");
 
-        auto* vbox = new QVBoxLayout(dlg);
+        auto* vbox = new QVBoxLayout(dlg->bodyWidget());
         vbox->setSpacing(8);
         vbox->setContentsMargins(16, 16, 16, 16);
+        dlg->setBodyLayoutMargins(QMargins(16, 16, 16, 16),
+                                  QMargins(16, 14, 16, 16));
+        trackPersistentDialog(dlg);
 
         // Icon
         auto* iconLbl = new QLabel;
@@ -1251,6 +1304,9 @@ void MainWindow::buildMenuBar()
             "github.com/aethersdr/AetherSDR</a></p>"
             "<p style='font-size:10px; color:#6a8090;'>"
             "SmartSDR protocol &copy; FlexRadio Systems</p>"
+            "<p style='font-size:10px; color:#6a8090;'>"
+            "D-STAR is a registered trademark of Icom Inc.<br>"
+            "AetherSDR is not affiliated with or endorsed by Icom Inc.</p>"
             "<p style='font-size:10px; color:#6a8090;'>"
             "HF propagation forecasts provided by "
             "<a href='https://www.hamqsl.com/' style='color:#8aa8c0;'>hamqsl.com</a></p>"

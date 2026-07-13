@@ -4,6 +4,8 @@
 #include <QMap>
 #include <QString>
 
+#include "core/backends/TunerDelta.h"
+
 namespace AetherSDR {
 
 class TgxlConnection;
@@ -42,8 +44,10 @@ public:
     bool    isPresent() const { return !m_handle.isEmpty() || m_directPresence; }
     bool    hasDirectConnection() const;
 
-    // Apply key=value pairs from a TCP status message.
-    void applyStatus(const QMap<QString, QString>& kvs);
+    // Apply a normalized tuner delta decoded by the backend
+    // (IRadioBackend::tunerChanged). Change-gated; emits tuningChanged /
+    // antennaAChanged on their edges and stateChanged once if anything moved.
+    void applyChanges(const TunerDelta& delta);
 
     // Set the tuner handle (extracted from the status object name).
     void setHandle(const QString& handle);
@@ -54,7 +58,10 @@ public:
     // Manual relay adjustment: relay 0=C1, 1=L, 2=C2; direction +1 or -1
     void adjustRelay(int relay, int direction);
 
-    // Command methods — emit commandReady()
+    // Command methods — emit neutral intents (operate/bypass/autotune) that
+    // RadioModel translates to the Flex TGXL relay via invokeExtension. The
+    // direct port-9010 fast-path (autoTune when a direct conn is up, and the
+    // antenna/relay methods below) stays local and does not go through the seam.
     void setOperate(bool on);
     void setBypass(bool on);
     void autoTune();
@@ -69,7 +76,13 @@ signals:
     void metersChanged(float fwdPower, float swr);  // fwd power/SWR from direct TGXL
     void presenceChanged(bool present); // tuner detected / lost
     void directConnectionChanged(bool connected);
-    void commandReady(const QString& cmd);
+    // Neutral relay intents. RadioModel translates each to the Flex TGXL wire
+    // ("tgxl set handle=<h> mode=/bypass=", "tgxl autotune handle=<h>") via
+    // IRadioBackend::invokeExtension. autotuneRequested also carries the TX
+    // interlock gate in RadioModel (was a commandReady string-sniff).
+    void operateRequested(bool on);
+    void bypassRequested(bool on);
+    void autotuneRequested();
 
 private:
     QString m_handle;

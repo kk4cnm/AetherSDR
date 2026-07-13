@@ -1,16 +1,22 @@
 #pragma once
 
 #include "core/CommandParser.h"   // MessageSeverity for radioMessageReceived
+#include "core/backends/GpsDelta.h"     // applyGpsChanges payload (aetherd 2.3)
+#include "core/backends/MemoryDelta.h"  // applyMemoryChanges payload (aetherd 2.3)
+#include "core/backends/ProfileDelta.h" // applyProfileChanges payload (aetherd 2.3)
+#include "core/backends/RadioDelta.h"   // applyRadioChanges payload (aetherd 2.3)
 #include "core/RadioConnection.h"
 #include "core/WanConnection.h"
 #include "core/PanadapterStream.h"
 #include "core/SleepInhibitor.h"
 #include "core/DaxTxPolicy.h"
+#include "core/DigitalVoiceWaveformTelemetry.h"
 #include <QThread>
 #include "SliceModel.h"
 #include "MeterModel.h"
 #include "PanadapterModel.h"
 #include "TunerModel.h"
+#include "AmpModel.h"
 #include "TransmitModel.h"
 #include "EqualizerModel.h"
 #include "TnfModel.h"
@@ -21,6 +27,7 @@
 #include "DaxIqModel.h"
 #include "NavtexModel.h"
 #include "FlexWaveformModel.h"
+#include "DStarModel.h"
 #include "MemoryEntry.h"
 #include "ModelCapabilities.h"
 #include "RadioStatusOwnership.h"
@@ -43,6 +50,12 @@ namespace AetherSDR {
 
 class IRadioBackend;   // aetherd RFC §5.5 radio-facing seam (owned via unique_ptr below)
 class FlexBackend;     // transitional concrete alias for 2.3 status-decode driving
+
+struct LicenseFeatureState {
+    bool    seen{false};
+    bool    enabled{false};
+    QString reason;
+};
 
 // RadioModel is the central data model for a connected radio.
 // It owns the RadioConnection, processes incoming status messages,
@@ -77,11 +90,15 @@ public:
     UsbCableModel&    usbCableModel()    { return m_usbCableModel; }
     DaxIqModel&       daxIqModel()       { return m_daxIqModel; }
     FlexWaveformModel& flexWaveformModel() { return m_flexWaveformModel; }
-    bool              hasAmplifier() const { return m_hasAmplifier; }
-    bool              ampOperate()   const { return m_ampOperate; }
-    QString           ampHandle()    const { return m_ampHandle; }
-    QString           ampIp()        const { return m_ampIp; }
-    QString           ampModel()     const { return m_ampModel; }
+    DStarModel&        dstarModel()        { return m_dstarModel; }
+    const DigitalVoiceWaveformMetrics& digitalVoiceWaveformMetrics() const;
+    DigitalVoiceWaveformHealth digitalVoiceWaveformHealth() const;
+    QString digitalVoiceWaveformHealthName() const;
+    QString digitalVoiceWaveformHealthDetail() const;
+    // Power amplifier (PGXL / any non-TGXL amp the radio proxies). Extracted
+    // from RadioModel (#4094); consumers bind it like the other sub-models.
+    AmpModel&         amplifier()        { return m_amplifier; }
+    const AmpModel&   amplifier() const  { return m_amplifier; }
 
     // Getters
     QString name()    const { return m_name; }
@@ -90,10 +107,13 @@ public:
     bool isConnected() const;
     bool fullDuplexEnabled() const { return m_fullDuplex; }
     void setFullDuplex(bool on) { m_fullDuplex = on; emit infoChanged(); }
-    void setAmpOperate(bool on);
     float paTemp()    const { return m_paTemp; }
     float txPower()   const { return m_txPower; }
     bool  isRadioTransmitting() const { return m_radioTransmitting; }
+    // True while the local operator is keying a phone/data mode (MOX/PTT/VOX/
+    // tune), false for TCI-hardware, DAX, and CW transmits. See
+    // operatorTransmitChanged().
+    bool  isOperatorTransmitting() const { return m_operatorTransmitting; }
     QStringList antennaList() const { return m_antList; }
     QString antennaAlias(const QString& token) const;
     QString antennaDisplayName(const QString& token,
@@ -119,6 +139,10 @@ public:
     QString licenseExpirationDate() const { return m_licenseExpirationDate; }
     QString licenseMaxVersion()     const { return m_licenseMaxVersion; }
     QString licenseSubscription()   const { return m_licenseSubscription; }
+    LicenseFeatureState licenseFeature(const QString& name) const;
+    bool licenseFeatureSeen(const QString& name) const;
+    bool licenseFeatureEnabled(const QString& name) const;
+    QString licenseFeatureReason(const QString& name) const;
 
     QString ip()          const { return m_ip; }
     QString netmask()     const { return m_netmask; }
@@ -149,6 +173,14 @@ public:
     ModelCapabilities capabilities() const {
         return capabilitiesFor(m_model);
     }
+
+    // Bands the radio itself declared via the optional discovery/status
+    // key "bands=2m,440,23cm" (names validated against BandDefs).  Empty
+    // for real Flex radios — the band UI then falls back to the model
+    // capability flags.  Lets a gateway presenting non-Flex hardware
+    // (e.g. an Icom IC-9700 shown as a FLEX-6700) offer its true band
+    // set rather than the impersonated model's.
+    QStringList declaredBands() const { return m_declaredBands; }
 
     // Returns true for BigBend/DragonFire-platform radios (8400, 8600,
     // AU-/ML-/MLS-/CL-/CLS- series, RT-2122) that support the extended
@@ -274,6 +306,7 @@ public:
     bool sliceMayBelongToUs(int sliceId) const;
 
     struct ClientInfo {
+        QString clientId;
         QString station;
         QString program;
         QString source;
@@ -339,6 +372,8 @@ public:
 
     QList<SliceModel*> slices() const { return m_slices; }
     SliceModel* slice(int id) const;
+    QMap<int, QString> rawSliceModeLists() const { return m_rawSliceModeLists; }
+    int rawModeOccurrenceCount(const QString& mode) const;
     int activeTxSliceNum() const;
     void setPanTransmitInhibited(const QString& panId,
                                  bool inhibited,
@@ -356,6 +391,11 @@ public:
     // Station name of the client occupying a foreign slot, or empty string
     // if not foreign / not known yet.
     QString foreignSliceOwnerStation(int sliceId) const;
+    bool automationApplySliceFixture(int sliceId,
+                                     const QString& radioLetter,
+                                     QString* error = nullptr);
+    bool automationRemoveSliceFixture(int sliceId,
+                                      QString* error = nullptr);
 
     // High-level actions
     void connectToRadio(const RadioInfo& info);
@@ -429,6 +469,7 @@ public:
 
 signals:
     void infoChanged();
+    void licenseFeaturesChanged();
     void connectionStateChanged(bool connected);
     // Emitted whenever the local CW key transitions on/off — funnel for
     // serial CTS/DSR, MIDI Gate, TCI key, CWX, and HID encoder sources.
@@ -437,6 +478,7 @@ signals:
     void cwKeyDownChanged(bool down);
     void sliceAdded(SliceModel* slice);
     void sliceRemoved(int sliceId);
+    void rawSliceModeListsChanged();
     void metersChanged();
     void connectionError(const QString& msg);
     // Phase 2 of GHSA-wfx7-w6p8-4jr2 (#2951): forwarded from
@@ -472,12 +514,8 @@ signals:
     void antListChanged(QStringList ants);
     // Local AetherSDR display aliases changed. The radio still uses canonical tokens.
     void antennaAliasesChanged();
-    // Emitted when a power amplifier (e.g. PGXL) is detected or lost.
-    void amplifierChanged(bool present);
-    void ampStateChanged();   // amplifier operate/bypass changed
-    // Raw KVS from the radio's amplifier status message (id, vac, meffa, temp, state, …).
-    // Emitted on every update so the GUI can refresh telemetry without a direct PGXL connection.
-    void ampTelemetryUpdated(const QMap<QString, QString>& kvs);
+    // (Amplifier presence/state/telemetry signals moved to AmpModel — bind
+    //  m_radioModel.amplifier() directly. #4094.)
     void memoryChanged(int index);
     void memoryRemoved(int index);
     void memoriesCleared();
@@ -522,6 +560,13 @@ signals:
     void txAudioGateChanged(bool transmitting);
     // Raw interlock TX state (regardless of ownership — for DAX passthrough).
     void radioTransmittingChanged(bool transmitting);
+    // Operator-driven RF transmit: true while THIS seat is keyed by the local
+    // operator in a phone/data mode (MOX, local/hardware PTT, footswitch, VOX,
+    // tune) and false otherwise. Deliberately excludes TCI-hardware and DAX
+    // transmits (external-app keying paths, not the operator on the mic) and CW
+    // (break-in/QSK per-element keying would thrash a wall-clock timer). Drives
+    // the status-bar TX timer.
+    void operatorTransmitChanged(bool active);
     // Short operator-facing interlock warnings for the panadapter overlay.
     // `key` is the stable, translation-invariant dedup key (e.g. "radio:...",
     // "pan-tx-inhibit:...") so the UI can classify the notice without sniffing
@@ -554,6 +599,11 @@ signals:
     // active=true: all pans are being throttled to fpsCap fps to reduce UDP load.
     // active=false: throttle lifted; receivers should restore user-configured fps.
     void adaptiveThrottleChanged(bool active, int fpsCap);
+    // Local waveform diagnostics are proxied through the model so GUI
+    // consumers do not depend on the helper process implementation.
+    void digitalVoiceWaveformMetricsChanged();
+    void digitalVoiceWaveformHealthChanged();
+    void digitalVoiceWaveformDegradationStarted(const QString& message);
     // Generic status relay — for dialogs that need to listen for specific objects.
     void statusReceived(const QString& object, const QMap<QString, QString>& kvs);
     // Emitted when the radio sends an M-prefix informational, warning, error,
@@ -601,7 +651,19 @@ private slots:
 
 private:
     void handleRadioStatus(const QMap<QString, QString>& kvs);
+    // Apply a normalized radio-global delta from the backend
+    // (IRadioBackend::radioChanged). aetherd RFC 2.3 — RadioModel residual.
+    void applyRadioChanges(const RadioDelta& delta);
+    // Apply normalized GPS / memory-slot / profile deltas from the backend
+    // (IRadioBackend::gpsChanged / memoryChanged / profileChanged). aetherd RFC
+    // 2.3 — RadioModel residual.
+    void applyGpsChanges(const GpsDelta& delta);
+    void applyMemoryChanges(const MemoryDelta& delta);
+    void applyProfileChanges(const ProfileDelta& delta);
     void handleSliceStatus(int id, const QMap<QString, QString>& kvs, bool removed);
+    void scheduleDStarRuntimeConfiguration();
+    void applyPendingDStarRuntimeConfiguration();
+    void syncDigitalVoiceTxSelection(bool force = false);
     void handleMeterStatus(const QString& rawBody);
     void handlePanadapterStatus(const QString& panId, const QMap<QString, QString>& kvs);
     void handleProfileStatus(const QString& object, const QMap<QString, QString>& kvs);
@@ -628,6 +690,11 @@ private:
     // sending client gui. Calls continuation() if no conflict is found.
     void peekForMultiFlexConflictThen(std::function<void()> continuation);
     void handleForcedClientDisconnect();
+    void handleDuplicateClientIdDisconnect();
+    // Shared transport teardown for a radio-initiated terminal disconnect
+    // (forced or duplicate-client-id); callers set m_intentionalDisconnect first.
+    void closeConnectionForTerminalDisconnect();
+    void resolveLiveGuiClientIdCollision();
     void applyKnownGuiClients(const QStringList& handles,
                               const QStringList& programs,
                               const QStringList& stations,
@@ -703,6 +770,7 @@ private:
     UsbCableModel       m_usbCableModel;
     DaxIqModel          m_daxIqModel;
     FlexWaveformModel   m_flexWaveformModel;
+    DStarModel          m_dstarModel{nullptr, true};
 
     // NetCW stream — VITA-49 UDP delivery for low-latency CW keying
     quint32  m_netCwStreamId{0};
@@ -715,6 +783,7 @@ private:
 
     QString     m_name;
     QString     m_model;
+    QStringList m_declaredBands;    // optional "bands=" declaration (see declaredBands())
     int         m_maxSlices{4};
     QString     m_version;          // software version from discovery (e.g. "4.1.5")
     QString     m_protocolVersion;  // protocol version from V line (e.g. "1.4.0.0")
@@ -729,6 +798,7 @@ private:
     QString     m_licenseExpirationDate;
     QString     m_licenseMaxVersion;
     QString     m_licenseSubscription;   // e.g. "SmartSDR+", "SmartSDR", "Unknown"
+    QHash<QString, LicenseFeatureState> m_licenseFeatures;
     QString     m_ip;
     QString     m_netmask;
     QString     m_gateway;
@@ -767,14 +837,18 @@ private:
     bool        m_txRequested{false}; // local MOX command intent (for edge sync)
     bool        m_cwKeyActive{false}; // true while CW key/paddle is held (#1379)
     bool        m_cwxActive{false};   // true while CWX send is in flight (#2047, #2097)
+    bool        m_cwxDrainArmed{false}; // CWX drain-release latch, immune to interlock flicker (#3949)
     bool        m_txAudioGate{false}; // actual TX audio gate state
     bool        m_radioTransmitting{false}; // raw interlock TX state, any owner
+    bool        m_operatorTransmitting{false}; // owned MOX/PTT/VOX (not TCI/DAX)
     QString     m_lastInterlockNotificationKey;
     qint64      m_lastInterlockNotificationMs{0};
     qint64      m_interlockNotificationArmedUntilMs{0};
     TransmitModel::PttSource m_pendingTransmitPreflightSource{TransmitModel::PttSource::Mox};
     TransmitModel::PttSource m_interlockNotificationSource{TransmitModel::PttSource::Mox};
     int         m_digitalVoiceTxSliceId{-1};
+    QString     m_lastDigitalVoiceTxSelectionKey;
+    bool        m_dstarRuntimeConfigurationPending{false};
     QString     m_lastInterlockSource;   // last seen interlock source= (#2373)
                                          // SW/MIC/ACC/RCA/TUNE per FlexLib
                                          // v4.2.18 ParsePTTSource. Persists
@@ -818,11 +892,7 @@ private:
     // emit "removed").
     QMap<QString, QPair<qint64, QMap<QString, QString>>> m_pendingPanStatuses;
 
-    bool    m_hasAmplifier{false};  // true if a power amp (PGXL) is detected
-    QString m_ampHandle;             // amplifier handle for commands
-    QString m_ampIp;                 // amplifier IP for direct connection
-    QString m_ampModel;              // "PowerGeniusXL"
-    bool    m_ampOperate{false};
+    AmpModel m_amplifier;            // power amp (PGXL) state + relay (#4094)
 
     // GPS state
     QString m_gpsStatus;           // "Locked", "Present", "Not Present"
@@ -853,6 +923,7 @@ private:
     };
     QMap<int, TxBandInfo> m_txBandSettings;
     QHash<QString, QString> m_panTransmitInhibitReasons;
+    QHash<QString, int> m_panTransmitInhibitedTxSlices;
     int  m_tuneInhibitBandId{-1};  // band ID whose TX outputs were inhibited during tune
     bool m_tuneInhibitActive{false};
 
@@ -864,12 +935,17 @@ private:
     QString transmitInhibitMessageForTxSlice() const;
     void enforceTransmitInhibitForPan(const QString& panId);
     void enforceTransmitInhibitForSlice(SliceModel* slice);
+    void selectSoleValidTxAntennaIfNeeded(SliceModel* slice, bool txAntennaStatusReceived);
     bool transmitStartBlockedByInhibit(const QString& key);
+    void noteLocalTxSliceEnableIntent(int sliceId);
     void sendSliceCommand(SliceModel* slice, const QString& cmd);
     QString localPttInterlockMessage(TransmitModel::PttSource source) const;
     QString txFilterFrequencyLimitMessage(int lowHz, int highHz) const;
     QString radioInterlockNotificationMessage(const QMap<QString, QString>& kvs) const;
     void armInterlockNotification(TransmitModel::PttSource source = TransmitModel::PttSource::Mox);
+    // Recompute the operator-transmit predicate and emit operatorTransmitChanged
+    // on a rising/falling edge. Cheap; safe to call from every TX-state path.
+    void updateOperatorTransmit();
     bool interlockNotificationArmed() const;
     void emitInterlockNotification(const QString& message,
                                    const QString& key,
@@ -921,6 +997,7 @@ private:
 
 private:
     QList<SliceModel*> m_slices;
+    QMap<int, QString> m_rawSliceModeLists;
     QMap<int, SliceModel*> m_staleSlices;  // previous session, kept alive for UI reuse
     quint64 m_sessionModelGeneration{0};
     // chassis_serial of the radio the staged session models came from.
@@ -968,6 +1045,10 @@ private:
     quint16  m_wanUdpPort{4991};
     QSet<int>          m_ownedSliceIds;   // slice IDs that belong to our client
     QHash<int, quint32> m_foreignSliceOwners;  // slot id → owning client handle
+    QSet<int>          m_automationSliceFixtures; // disconnected bridge fixtures
+    bool               m_automationSliceFixtureBaselineActive{false};
+    QString            m_automationSliceFixtureBaselineModel;
+    int                m_automationSliceFixtureBaselineMaxSlices{4};
     bool               m_txOwnedByUs{true};  // true when tx_client_handle matches our handle
     bool               m_fullDuplex{false};
     int                m_rttyMarkDefault{2125};
@@ -981,6 +1062,8 @@ private:
     QSet<quint32> m_startupClientConnections; // clients present before our connect status replay
     QElapsedTimer m_clientConnectionNoticeTimer;
     static constexpr qint64 CLIENT_CONNECTION_STARTUP_SUPPRESS_MS = 5000;
+    void clearAutomationSliceFixtures();
+    void restoreAutomationSliceFixtureBaseline();
 
     SleepInhibitor m_sleepInhibitor;     // prevents OS idle sleep while connected
     RadioInfo m_lastInfo;               // stored for auto-reconnect

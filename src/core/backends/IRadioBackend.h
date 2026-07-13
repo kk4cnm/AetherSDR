@@ -7,9 +7,16 @@
 #include <QVariant>
 #include <QVariantMap>
 
+#include "core/backends/AmpDelta.h"
+#include "core/backends/GpsDelta.h"
+#include "core/backends/MemoryDelta.h"
+#include "core/backends/MeterDef.h"
+#include "core/backends/ProfileDelta.h"
 #include "core/backends/RadioCapabilities.h"
+#include "core/backends/RadioDelta.h"
 #include "core/backends/SliceDelta.h"
 #include "core/backends/TransmitDelta.h"
+#include "core/backends/TunerDelta.h"
 
 namespace AetherSDR {
 
@@ -120,13 +127,49 @@ signals:
     // APD-sampler status planes) and RadioModel drives the TransmitModel.
     void transmitChanged(const TransmitDelta& delta);
 
+    // Normalized power-amplifier status delta (aetherd 2.4 — AmpModel decode
+    // split, #4094). Typed + present-only; the backend translates the SmartSDR
+    // "amplifier" wire and AmpModel applies the state machine. Command/encode is
+    // the neutral AmpModel::operateRequested intent, translated back to the wire
+    // by invokeExtension("flex", "amp.operate", …) (#4094).
+    void amplifierChanged(const AmpDelta& delta);
+
+    // Normalized antenna-tuner status delta (aetherd 2.4 — TunerModel decode
+    // split, #4092). Typed + present-only; the backend translates the SmartSDR
+    // "atu"/"amplifier"(TunerGeniusXL) wire, TunerModel applies the change-gated
+    // state. Command/encode is TunerModel's neutral operate/bypass/autotune
+    // intents, translated by invokeExtension("flex", "tuner.*", …) (#4092).
+    void tunerChanged(const TunerDelta& delta);
+
+    // Normalized radio-global status delta (aetherd RFC 2.3 — RadioModel
+    // residual). Typed + compiler-checked; the backend populates only the fields
+    // the wire reported and RadioModel applies them + its own orchestration.
+    void radioChanged(const RadioDelta& delta);
+
+    // Normalized GPS status delta (aetherd RFC 2.3 — RadioModel residual). The
+    // backend tokenizes the vendor GPS status line into a present-only GpsDelta;
+    // RadioModel applies it and emits gpsStatusChanged.
+    void gpsChanged(const GpsDelta& delta);
+
+    // Normalized memory-slot status (aetherd RFC 2.3 — RadioModel residual),
+    // keyed by slot index. The backend decodes the vendor memory-status kv-set;
+    // RadioModel applies it to MemoryEntry (text sanitisation is a model
+    // concern) or drops the slot when delta.removed is set.
+    void memoryChanged(const MemoryDelta& delta);
+
+    // Normalized profile status (aetherd RFC 2.3 — RadioModel residual). The
+    // backend parses the vendor "profile <type> …" status (list/current + the
+    // database importing/exporting flags); RadioModel routes it to TransmitModel
+    // tx/mic profiles, the global-profile list, or the import/export flags.
+    void profileChanged(const ProfileDelta& delta);
+
     // Meter definition catalog (aetherd RFC 2.3 — MeterModel touchpoint). The
-    // backend decodes the vendor meter-status wire format into a normalized
-    // definition; RadioModel drives the MeterModel. `fields` carries only the
-    // keys the wire reported (source, sourceIndex, name, unit, low, high,
-    // description) — the same present-only shape the old inline parse produced.
-    // The meter *values* stream on the data plane (VITA-49), separate from this.
-    void meterDefined(int index, const QVariantMap& fields);
+    // backend decodes the vendor meter-status wire format into a typed MeterDef;
+    // RadioModel hands it straight to MeterModel::defineMeter(). Fields the wire
+    // did not report keep their MeterDef defaults (present-only on the decode
+    // side). The meter *values* stream on the data plane (VITA-49), separate.
+    // (#4070: typed payload — replaces the prior stringly-keyed QVariantMap.)
+    void meterDefined(const MeterDef& def);
     void meterRemoved(int index);
     // Panadapter core display state (universal — every family has a pan center
     // and span). The backend decodes it from vendor status; RadioModel drives

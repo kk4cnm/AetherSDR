@@ -798,14 +798,6 @@ void SpectrumOverlayMenu::setPanId(const QString& id)
     refreshAntennaCombo();
 }
 
-void SpectrumOverlayMenu::setLeanChecked(bool on)
-{
-    if (!m_leanBtn || m_leanBtn->isChecked() == on)
-        return;
-    QSignalBlocker block(m_leanBtn);  // reflect state without re-emitting
-    m_leanBtn->setChecked(on);
-}
-
 void SpectrumOverlayMenu::setRadioModel(RadioModel* model)
 {
     if (m_radioModel)
@@ -1851,28 +1843,11 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
     makeHeader("SYSTEM");
 
-    // ── Lean render mode toggle (#3283) ─────────────────────────────────
-    // Global low-overhead render mode: opaque panadapter + VFO, capped
-    // repaint, WAVE scope off, throttled meters. Grouped with the spectrum
-    // render controls, below the 3D Floor slider. Drives the app-wide toggle.
-    {
-        m_leanBtn = new QPushButton("Lean Mode");
-        m_leanBtn->setObjectName("displayLeanModeBtn");
-        m_leanBtn->setCheckable(true);
-        m_leanBtn->setStyleSheet(btnStyle);
-        m_leanBtn->setToolTip("Lean mode: opaque panadapter + VFO, capped "
-                              "repaint, WAVE scope off, throttled meters. "
-                              "Reduces CPU/GPU load. Persists across restarts.");
-        connect(m_leanBtn, &QPushButton::toggled, this,
-                [this](bool on) { emit leanModeToggled(on); });
-        grid->addWidget(m_leanBtn, row, 0, 1, 4);
-        ++row;
-    }
-
     // ── Render GPU (multi-GPU systems only) ───────────────────────────────
-    // The graphics adapter can't be switched under a live context, so the
-    // choice is persisted and applied on the next launch (GpuSelector reads it
-    // before QApplication).  Hidden entirely on single-GPU systems.
+    // First control under SYSTEM: the graphics adapter can't be switched under
+    // a live context, so the choice is persisted and applied on the next launch
+    // (GpuSelector reads it before QApplication).  Hidden entirely on single-GPU
+    // systems.
     if (GpuSelector::hasMultiple()) {
         auto* lbl = new QLabel("GPU:");
         lbl->setStyleSheet(labelStyle);
@@ -2375,6 +2350,15 @@ void SpectrumOverlayMenu::setRadioCapabilities(ModelCapabilities caps)
     setXvtrBands(m_lastXvtrBands);
 }
 
+void SpectrumOverlayMenu::setDeclaredBands(const QStringList& bands)
+{
+    if (bands == m_declaredBands)
+        return;  // No change — skip the rebuild.
+    m_declaredBands = bands;
+    // Same full-rebuild delegation as a capability change (above).
+    setXvtrBands(m_lastXvtrBands);
+}
+
 void SpectrumOverlayMenu::updateLoopButtonVisibility()
 {
     const bool showLoopA = m_radioCapabilities.hasLoopA;
@@ -2477,26 +2461,58 @@ void SpectrumOverlayMenu::setXvtrBands(const QVector<XvtrBand>& bands)
     };
 
     int row = 0;
-    for (int r = 0; r < 4; ++r) {
-        for (int col = 0; col < 3; ++col) {
-            int idx = hfLayout[r][col];
-            if (idx < 0) continue;
-            grid->addWidget(makeBandBtn(idx), row, col);
-        }
-        ++row;
-    }
-
-    // Built-in transverter bands (4m / 2m) — surfaced for radios that
-    // report the corresponding capability flag (FLEX-6500 Region 1: 4m;
-    // FLEX-6700: 4m + 2m).  Styled identically to HF bands per #695
-    // (these are native radio hardware, not user-configured XVTRs).
-    if (m_radioCapabilities.has4Meters || m_radioCapabilities.has2Meters) {
+    if (!m_declaredBands.isEmpty()) {
+        // The radio declared its own band set ("bands=" discovery/status
+        // key — gateways presenting non-Flex hardware).  Build the grid
+        // from the declaration in BandDefs order instead of the HF layout
+        // + model capability flags: the radio said what it can do, so the
+        // menu offers exactly that (an IC-9700 gets 2m/440/23cm, not an
+        // HF grid it can't tune).  Utility and XVTR rows are unaffected.
+        // NB buttons are built from BandDefs here, not via makeBandBtn():
+        // BAND_GRID only carries the curated HF-menu entries, so declared
+        // VHF/UHF names (440, 23cm, ...) have no BAND_GRID row to reuse.
         int col = 0;
-        if (m_radioCapabilities.has4Meters)
-            grid->addWidget(makeBandBtn(kBandIdx4m), row, col++);
-        if (m_radioCapabilities.has2Meters)
-            grid->addWidget(makeBandBtn(kBandIdx2m), row, col++);
-        ++row;
+        for (const auto& def : kBands) {
+            const QString bandName = QString::fromLatin1(def.name);
+            if (!m_declaredBands.contains(bandName))
+                continue;
+            auto* btn = new QPushButton(bandName, m_bandPanel);
+            btn->setFixedSize(BAND_BTN_W, BAND_BTN_H);
+            btn->setStyleSheet(bandBtnStyle);
+            const double  freq = def.defaultFreqMhz;
+            const QString mode = QString::fromLatin1(def.defaultMode);
+            connect(btn, &QPushButton::clicked, this, [this, bandName, freq, mode]() {
+                hideAllSubPanels();
+                emit bandSelected(bandName, freq, mode);
+            });
+            grid->addWidget(btn, row, col % 3);
+            if (++col % 3 == 0)
+                ++row;
+        }
+        if (col % 3)
+            ++row;
+    } else {
+        for (int r = 0; r < 4; ++r) {
+            for (int col = 0; col < 3; ++col) {
+                int idx = hfLayout[r][col];
+                if (idx < 0) continue;
+                grid->addWidget(makeBandBtn(idx), row, col);
+            }
+            ++row;
+        }
+
+        // Built-in transverter bands (4m / 2m) — surfaced for radios that
+        // report the corresponding capability flag (FLEX-6500 Region 1: 4m;
+        // FLEX-6700: 4m + 2m).  Styled identically to HF bands per #695
+        // (these are native radio hardware, not user-configured XVTRs).
+        if (m_radioCapabilities.has4Meters || m_radioCapabilities.has2Meters) {
+            int col = 0;
+            if (m_radioCapabilities.has4Meters)
+                grid->addWidget(makeBandBtn(kBandIdx4m), row, col++);
+            if (m_radioCapabilities.has2Meters)
+                grid->addWidget(makeBandBtn(kBandIdx2m), row, col++);
+            ++row;
+        }
     }
 
     // XVTR bands (inserted between HF and utility)

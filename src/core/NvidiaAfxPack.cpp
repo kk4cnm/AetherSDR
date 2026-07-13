@@ -39,8 +39,8 @@ namespace {
 #if defined(_WIN32)
 constexpr char kCoreRelPath[] = "bin/NVAudioEffects.dll";
 constexpr char kPlatformTag[] = "windows-x86_64";
-// Pinned sha256 of the published afx-bits-2.1.0-windows-x86_64 zip.
-constexpr char kWinTarballSha[] = "55e0a35bed70ade2e3b80d463c660da6b749223a998843f176af7da2d689a899";
+// The per-arch afx-bits archive sha256s live in publishedAfxPacks() below (one
+// row per GPU arch), so both the download gate and the manifest agree.
 // pypi.nvidia.com's tensorrt-cu12-libs wheel is 1.6 GB because it bundles the
 // builder + plugins + ONNX parser. Maxine AFX uses a pre-baked .trtpkg engine
 // and only needs the inference runtime (nvinfer_<ver>.dll, ~420 MB raw).
@@ -139,12 +139,51 @@ QString NvidiaAfxPack::detectArch()
     return cached;
 }
 
-// Compute capabilities (sm_<cc>) for which an afx-bits pack is actually published
-// on our releases. detectArch() can report a newer NVIDIA card — e.g. sm_120
-// (consumer Blackwell / RTX 50-series) — that clears the Ada+ bar but has no
-// published pack yet, so it must not dead-end at a Download that 404s. Keep this
-// in sync with the afx-bits release assets + the build-afx-bits ValidateSet. (#3933)
-static const QList<int> kPublishedComputeCaps = { 89 };   // sm_89 (Ada) — Linux + Windows
+// AFX-bits archives actually published on our releases, keyed by GPU compute
+// capability, with the pinned sha256 of the per-arch archive for THIS platform.
+// detectArch() can report a newer NVIDIA card — e.g. sm_120 (consumer Blackwell
+// / RTX 50-series) — that clears the Ada+ bar but has no published pack yet, so
+// it must not dead-end at a Download that 404s (#3933). An arch appears here
+// ONLY once its archive is built, verified to NvAFX_Load on that GPU, and
+// uploaded to the afx-bits-2.1.0 release — presence here is what lights up
+// hasSupportedGpu() and the Download button, and the sha is what validates the
+// download, so the two can never drift apart.
+//
+// To add a GPU (e.g. sm_120 / RTX 50-series, tracked in #4206): build the pack
+// (build-afx-bits-*.ps1 -Arch sm_120), test it, upload it, then add a row with
+// the archive's sha256. Keep in sync with the build-afx-bits ValidateSet.
+struct PublishedAfxPack {
+    int         computeCap;   // 89 for "sm_89"
+    const char* sha256;       // sha256 of the afx-bits archive for kPlatformTag
+};
+static const QList<PublishedAfxPack>& publishedAfxPacks()
+{
+    // Supported set is Ada and later (the isAfxCapableGpu() floor). Uncomment +
+    // fill the sha the moment each per-arch archive is built, load-tested on
+    // that GPU, and uploaded to the afx-bits-2.1.0 release (#4206).
+    static const QList<PublishedAfxPack> packs = {
+#if defined(_WIN32)
+        { 89, "55e0a35bed70ade2e3b80d463c660da6b749223a998843f176af7da2d689a899" }, // Ada / RTX 40xx
+        { 100, "c3fa4236c5dbef705f38e7a04e4c3f1a5fb6eaefaf43198555b06a097cac5081" }, // Blackwell datacenter
+        { 120, "9fa30d21c1ec5b914f112a4464d5185234976bd0823dbb99db91480ed4c4620f" }, // Blackwell / RTX 50xx (2.1.0-48k-blackwell model)
+#else
+        { 89, "0bfe85b0faeb322958303c145996350d0fea8a203899f9215fc0d3a341395b67" }, // Ada / RTX 40xx
+        { 100, "f7df778320557c70e18d0066904c774d0f1ac0a6085f4e02bf545dfb0351abc0" }, // Blackwell datacenter (2.1.0-48k-sm100 model)
+        { 120, "dae7e1a47ae8a30a651497b3aa1547f528bbe1939689a3f9f46342662aaa26c2" }, // Blackwell / RTX 50xx (2.1.0-48k-sm120 model)
+#endif
+    };
+    return packs;
+}
+
+// Pinned sha256 of the published afx-bits archive for the given compute cap, or
+// empty if no pack is published for it.
+static QString publishedAfxSha(int computeCap)
+{
+    for (const PublishedAfxPack& p : publishedAfxPacks())
+        if (p.computeCap == computeCap)
+            return QString::fromLatin1(p.sha256);
+    return {};
+}
 
 // Compute capability of the detected NVIDIA GPU (89 for "sm_89"), or -1 if none.
 static int detectedComputeCap()
@@ -171,7 +210,7 @@ bool NvidiaAfxPack::hasSupportedGpu()
     // detected GPU's arch — not merely when the GPU is new enough for AFX. An
     // AFX-capable card with no published pack (e.g. sm_120) is reported distinctly
     // by the UI and steered to DFNR instead of a 404 Download. (#3933)
-    return isAfxCapableGpu() && kPublishedComputeCaps.contains(detectedComputeCap());
+    return isAfxCapableGpu() && !publishedAfxSha(detectedComputeCap()).isEmpty();
 }
 
 QString NvidiaAfxPack::cacheRoot()
@@ -232,6 +271,13 @@ QList<NvidiaAfxPack::Component> NvidiaAfxPack::manifest(const QString& arch) con
                  QStringLiteral("tar.zst"));
 #endif
 
+    // Pinned sha256 of the per-arch archive above. Empty for the "any" probe
+    // (latestComponents) and for any arch without a published pack — the
+    // hasSupportedGpu() gate keeps such an arch from ever reaching a download.
+    bool capOk = false;
+    const int afxCap = QStringView{arch}.mid(3).toInt(&capOk);   // "sm_89" -> 89
+    const QString afxSha = capOk ? publishedAfxSha(afxCap) : QString();
+
     // NOTE: the first field is a STABLE key used for cache/resume matching —
     // never change it once shipped (display names in the 2nd field may change).
 #if defined(_WIN32)
@@ -248,7 +294,7 @@ QList<NvidiaAfxPack::Component> NvidiaAfxPack::manifest(const QString& arch) con
     return {
         { QStringLiteral("afx"), QStringLiteral("AFX runtime"),
           {}, QStringLiteral("2.1.0"), {}, afxUrl,
-          QString::fromLatin1(kWinTarballSha), Kind::Tarball },
+          afxSha, Kind::Tarball },
         { QStringLiteral("cuda-runtime"), QStringLiteral("CUDA runtime"), QStringLiteral("nvidia-cuda-runtime-cu12"), QStringLiteral("12.8.90"),  {}, {}, {}, Kind::Wheel },
         { QStringLiteral("cublas"),       QStringLiteral("cuBLAS"),       QStringLiteral("nvidia-cublas-cu12"),       QStringLiteral("12.8.4.1"),  {}, {}, {}, Kind::Wheel },
         { QStringLiteral("cufft"),        QStringLiteral("cuFFT"),        QStringLiteral("nvidia-cufft-cu12"),        QStringLiteral("11.3.3.83"), {}, {}, {}, Kind::Wheel },
@@ -262,8 +308,7 @@ QList<NvidiaAfxPack::Component> NvidiaAfxPack::manifest(const QString& arch) con
     return {
         { QStringLiteral("afx"), QStringLiteral("AFX runtime"),
           {}, QStringLiteral("2.1.0"), {}, afxUrl,
-          QStringLiteral("0bfe85b0faeb322958303c145996350d0fea8a203899f9215fc0d3a341395b67"),
-          Kind::Tarball },
+          afxSha, Kind::Tarball },
         { QStringLiteral("cuda-runtime"), QStringLiteral("CUDA runtime"), QStringLiteral("nvidia-cuda-runtime-cu12"), QStringLiteral("12.8.90"),  {}, {}, {}, Kind::Wheel },
         { QStringLiteral("cublas"),       QStringLiteral("cuBLAS"),       QStringLiteral("nvidia-cublas-cu12"),       QStringLiteral("12.8.4.1"),  {}, {}, {}, Kind::Wheel },
         { QStringLiteral("cufft"),        QStringLiteral("cuFFT"),        QStringLiteral("nvidia-cufft-cu12"),        QStringLiteral("11.3.3.83"), {}, {}, {}, Kind::Wheel },

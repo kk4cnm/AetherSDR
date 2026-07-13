@@ -33,7 +33,11 @@
 .PARAMETER Arch
     Target SM architecture. Currently the app's pack is per-arch and the manifest
     pins one zip per arch — pick the one matching the test GPU. Valid: sm_75,
-    sm_86, sm_89, sm_100.
+    sm_86, sm_89, sm_100, sm_120.
+    sm_120 is consumer Blackwell (RTX 50-series, e.g. RTX 5060 Ti / 5090). It
+    reuses NVIDIA's 'blackwell' denoiser model — NvAFX_Load builds the TensorRT
+    engine on-device with the bundled TRT 10.9, which supports sm_120. Verify on
+    a 50-series card that NvAFX_Load succeeds before pinning + publishing (#3933).
 
 .PARAMETER OutDir
     Where the staged tree and final .zip are written.
@@ -53,7 +57,7 @@ param(
     [string]$SdkDir,
 
     [Parameter()]
-    [ValidateSet('sm_75','sm_86','sm_89','sm_100')]
+    [ValidateSet('sm_75','sm_86','sm_89','sm_100','sm_120')]
     [string]$Arch = 'sm_89',
 
     [Parameter()]
@@ -87,6 +91,7 @@ $archTag = switch ($Arch) {
     'sm_86'  { 'ampere' }
     'sm_89'  { 'ada' }
     'sm_100' { 'blackwell' }
+    'sm_120' { 'blackwell' }   # consumer Blackwell (RTX 50-series) reuses the blackwell model
 }
 Log "Target arch: $Arch (NGC tag: $archTag)"
 
@@ -240,10 +245,11 @@ Log "Next steps:"
 Log "  1. Extract the AFX zip into %LOCALAPPDATA%\AetherSDR\AetherSDR\nvidia-afx\current\"
 Log "     (or set AETHER_NVAFX_DIR to its extracted location)"
 Log "  2. Launch AetherSDR, AetherDSP → BNR → accept license, confirm Active"
-Log "  3. If it works, pin BOTH shas in src/core/NvidiaAfxPack.cpp:"
-Log "       kWinTarballSha  = $hash"
-Log "       kWinTensorrtSha = $trtHash"
-Log "     (and kWinTensorrtVer = $trtVersion), then commit + push (updates PR #3902)"
-Log "  4. Publish BOTH assets:"
+Log "  3. Publish the assets:"
 Log "       gh release upload afx-bits-$Version `"$zipPath`""
 Log "       gh release upload afx-bits-$Version `"$trtZipPath`""
+Log "  4. If it loads on that GPU, add this row to publishedAfxPacks() (Windows"
+Log "     branch) in src/core/NvidiaAfxPack.cpp, then commit + push:"
+Log "       { $($Arch -replace 'sm_','') , `"$hash`" }, // $Arch"
+Log "     (TensorRT is arch-independent; kWinTensorrtVer=$trtVersion /"
+Log "      kWinTensorrtSha=$trtHash change only when the TRT pack is rebuilt.)"

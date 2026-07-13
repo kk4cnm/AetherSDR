@@ -171,7 +171,7 @@ cmake --build build -j$(nproc)
 
 Full dependency list is in `README.md` — don't duplicate it here.
 
-Current version: **26.7.1** (set in both `CMakeLists.txt` and `README.md`).
+Current version: **26.7.2** (set in both `CMakeLists.txt` and `README.md`).
 Versioning scheme is **CalVer** (`YY.M.patch[.hotfix]`) starting from v26.5.1,
 the 1.0-equivalent. Hotfix sub-patches use a 4th component (e.g. 26.5.2.1).
 Earlier tags used semver through v0.9.8.
@@ -249,15 +249,31 @@ still consumes models directly, and that remains correct.
 | `libaethercore` (`aethercore`) | `src/core/` + `src/models/` — the engine | Qt Core/Network/Multimedia/WebSockets/SerialPort/DBus, the DSP + third-party libs. **Never `gui/`; QtWidgets only via the tracked-legacy files below, shrinking to zero** |
 | `AetherSDR` | `src/gui/` + `main.cpp` — the desktop app | `aethercore` + Qt Widgets + qgeoview + QRhi private |
 
-The engine→gui dependency direction is CI-enforced
-(`tools/check_engine_boundary.py`, `engine-boundary.yml`, `--strict`): no
-`core/`/`models/` file may include a `gui/` header (**EB1 — now zero,
-any finding is an error**), nor use QtWidgets (**EB2** — a shrinking
-tracked-legacy set warns, new usage errors). If your change trips the
-check, restructure the change — do not move the file, weaken the check,
-or add an exemption. Engine code that needs a UI callback defines a
-gui-free interface in `core/` (e.g. `IConnectionAutomation`) that the gui
-implements — never a `gui/` include.
+The dependency direction is CI-enforced (`tools/check_engine_boundary.py`,
+`engine-boundary.yml`, `--strict`) by three ratchets:
+- **EB1** — no `core/`/`models/` file may include a `gui/` header (now
+  zero; any finding is an error).
+- **EB2** — no `core/`/`models/` file may use QtWidgets (a shrinking
+  tracked-legacy set warns, new usage errors).
+- **EB3** — no file **above the radio seam** (all of `src/gui/`,
+  `src/core/`, `src/models/` **except** the backend tree
+  `src/core/backends/`) may include a **vendor header** — the
+  family-specific wire classes the RFC keeps behind `IRadioBackend`
+  (SmartSDR/FlexLib + KiwiSDR; the headers tagged `vendor(...)` in
+  `docs/architecture/aetherd-touchpoint-tags.json`). Only `vendor(...)` is
+  EB3-gated: a standalone *accessory* device's own transport (the 4O3A
+  antenna switch, the Tgxl/Pgxl direct sockets) is `peripheral(...)`, a
+  USB input surface is `ui-support`, and a generic device model fused with
+  vendor relay (e.g. `TunerModel`) is `mixed(flex)` — none of those are
+  `vendor`, so none are EB3-gated. Today's coupling is
+  frozen as a per-file, shrink-only baseline; a **new** above-seam vendor
+  include, or an **increase** in a tracked file, errors. (RFC step 2.4;
+  see "Engine boundary ratchet — EB3" below.)
+
+If your change trips any of these, restructure the change — do not move
+the file, weaken the check, or add an exemption. Engine code that needs a
+UI callback defines a gui-free interface in `core/` (e.g.
+`IConnectionAutomation`) that the gui implements — never a `gui/` include.
 
 **Until migration rules appear in this file, nothing changes for you.**
 Do not pre-emptively restructure code toward the RFC — no new engine/UI
@@ -267,10 +283,48 @@ rules (pre-drafted in
 [`docs/aetherd-agents-md-staging.md`](docs/aetherd-agents-md-staging.md));
 if a rule isn't in this file, its step hasn't landed. Architecture changes
 ahead of the RFC steps remain maintainer-only (see Autonomous Agent
-Boundaries above). One rule is already CI-enforced: the engine
-(`src/core/` + `src/models/`) must not gain new `gui/` includes or
-QtWidgets usage (`tools/check_engine_boundary.py`, warning for tracked
-legacy files, error for new ones).
+Boundaries above). The CI-enforced rules so far are EB1/EB2/EB3 above
+(`tools/check_engine_boundary.py`, warning for tracked baselines, error
+for new violations).
+
+**Engine boundary ratchet — EB3 (vendor includes).** As of RFC step 2.4,
+`check_engine_boundary.py` also enforces that nothing above the radio seam
+reaches around `IRadioBackend` to a vendor wire class. What this means for
+you:
+
+- **Nothing was relocated.** Step 2.4 is *ratchet-only*: the vendor
+  headers stay where they are (`src/core/…`, `src/models/…`) for now. EB3
+  just makes the existing boundary enforceable *in place*, so the
+  decoupling can proceed without new coupling piling up behind it.
+- **The rule.** Each tracked file's baseline row is the exact **set** of
+  vendor headers it may include. Adding a vendor `#include` (e.g.
+  `KiwiSdrManager.h`, `RadioConnection.h`, `StreamStatus.h`) to a `gui/`,
+  `core/`, or `models/` file that isn't tracked — or adding a header not
+  in a tracked file's set, *including a lateral swap that keeps the count
+  flat* (drop `RadioConnection.h`, add `KiwiSdrManager.h`) — fails the
+  check. The per-file baseline (`KNOWN_VENDOR_INCLUDE_BASELINE`) lives at
+  the top of `tools/check_engine_boundary.py`; the vendor vocabulary is
+  **derived at runtime from the touchpoint audit**
+  (`docs/architecture/aetherd-touchpoint-tags.json`, the single source of
+  truth), so a header newly tagged `vendor` there is enforced without
+  editing the checker.
+- **Adding a radio feature?** Don't include the vendor class above the
+  seam. Put the wire code in the family backend
+  (`src/core/backends/<family>/`) and surface it through `IRadioBackend`
+  (a canonical verb/signal, or the namespaced
+  `invokeExtension`/`extensionStatus` channel for vendor-specifics), then
+  consume *that* from the model/UI. Backend code (under
+  `src/core/backends/`) and the vendor translation units themselves may
+  include vendor headers freely — they're below the seam.
+- **Removing coupling (the goal).** When you convert a file's radio access
+  to the seam and drop a vendor include, **remove that stem from the
+  file's row** in `KNOWN_VENDOR_INCLUDE_BASELINE` (delete the row when it
+  empties). The set only shrinks — never add a stem or a row to make a
+  build pass. If EB3 blocks you and the include is genuinely unavoidable,
+  that's a design conversation for a maintainer, not a baseline edit.
+- **`src/gui/**` is in the CI trigger** for `engine-boundary.yml` now
+  (EB3 guards gui files), so a gui-only PR that adds vendor coupling is
+  still caught.
 
 **Where radio-facing code goes now that the seam exists.** Route by kind:
 
@@ -280,12 +334,20 @@ legacy files, error for new ones).
 | A new radio family | a new `IRadioBackend` implementation under `src/core/backends/<family>/` — requires an approved design doc naming its open protocol authority (Constitution Principles I & IV apply per backend) |
 | A new engine feature | `libaethercore`, exposed through models — never via a new gui→core header |
 
-Do **not** yet reroute existing model↔wire code through `FlexBackend`
+Do **not** reroute existing model↔wire code through `FlexBackend`
 wholesale — the per-touchpoint conversion is staged work
-(`docs/architecture/aetherd-touchpoints.md`), and its claim protocol +
-before/after `tools/verify_slice0_rx.py` verification recipe land in this
-file when those conversions (2.3) begin. Until then the models' existing
-direct wire access remains correct.
+(`docs/architecture/aetherd-touchpoints.md`). The five `mixed` models
+(Radio/Slice/Transmit/Panadapter/Meter) have been split (2.3): their
+SmartSDR status decode now lives in `FlexBackend` behind typed deltas, and
+the models apply normalized signals. The amp (PGXL) and tuner (TGXL)
+accessory models followed in 2.4 — `AmpModel` was extracted from
+`RadioModel`, and their status decode and command encode now route through
+`FlexBackend` too (#4099, #4101, #4113, #4192, #4200). The remaining vendor
+headers are **not** relocated yet — step 2.4 landed the EB3 ratchet (above) that
+freezes today's above-seam vendor coupling and lets it be decoupled
+subsystem-by-subsystem. Converting a touchpoint still follows the claim
+protocol + before/after `tools/verify_slice0_rx.py` recipe; a converted
+file drops its vendor include and lowers its EB3 baseline.
 
 ---
 
@@ -587,3 +649,15 @@ JSON schemas, targeting rules, recipes, gotchas — in
 **[`docs/automation-bridge.md`](docs/automation-bridge.md)**. This is the
 deterministic, cross-OS way to do "snapshot → act → assert" on the native UI
 (issue [#3646](https://github.com/aethersdr/AetherSDR/issues/3646)).
+
+**MCP server (for AI assistants).** The same bridge is also exposed over the
+**Model Context Protocol**, so an MCP-capable assistant can drive AetherSDR
+through schema-validated tools instead of raw JSON. It's enabled from a Radio
+Setup toggle and guarded by token auth; the common verbs (tune, slice, pan,
+connect, record, mark, menu, floors, streams, capture_audio, …) are surfaced as
+first-class typed tools, alongside robustness helpers (`wait_for`,
+`assert_state`, fuzzy `did_you_mean` target resolution), a guided
+`validate_ui_change` prompt, and read-only live-state resources. The same TX
+gate applies — keying verbs stay behind `AETHER_AUTOMATION_ALLOW_TX`. Regenerate
+the verb→tool tables with `tools/gen_bridge_docs.py` (a CI check fails on drift).
+See `docs/automation-bridge.md` for setup and the tool catalog.

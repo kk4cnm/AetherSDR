@@ -6,6 +6,7 @@
 #include "models/RadioModel.h"
 #include "models/XvtrPolicy.h"
 #include "core/AppSettings.h"
+#include "core/AutomationBridgeSettings.h"
 #include "core/NetworkSettings.h"
 #include "core/PanadapterStream.h"
 #include "core/KiwiSdrManager.h"
@@ -74,12 +75,16 @@
 #include <QDebug>
 #include <QGuiApplication>
 #include <QPainter>
+#include <QRandomGenerator>
 #include <QPaintEvent>
 #include <QPointer>
 #include <QScreen>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QToolButton>
+#include <QTreeWidget>
+#include <QAction>
+#include <QKeySequence>
 
 #include <algorithm>
 #include <functional>
@@ -300,7 +305,7 @@ static QString radioOptionsText(const RadioModel* model)
     if (!model->radioOptions().isEmpty()) {
         return model->radioOptions();
     }
-    return model->hasAmplifier() ? QStringLiteral("GPS, PGXL") : QStringLiteral("GPS");
+    return model->amplifier().present() ? QStringLiteral("GPS, PGXL") : QStringLiteral("GPS");
 }
 
 static void showCopiedPopup(QWidget* anchor);
@@ -595,59 +600,224 @@ RadioSetupDialog::RadioSetupDialog(RadioModel* model, AudioEngine* audio,
       m_kiwiSdrManager(kiwiSdrManager)
 {
     theme::setContainer(this, QStringLiteral("dialog/radioSetup"));
-    setMinimumSize(820, 620);
+    setMinimumSize(960, 680);
     AetherSDR::ThemeManager::instance().applyStyleSheet(this, "QDialog { background: {{color.background.0}}; }");
 
     auto* layout = new QVBoxLayout(bodyWidget());
 
-    auto* tabs = new QTabWidget;
-    m_tabs = tabs;
-    AetherSDR::ThemeManager::instance().applyStyleSheet(tabs, "QTabWidget::pane { border: 1px solid {{color.background.2}}; background: {{color.background.0}}; }"
-        "QTabBar::tab { background: {{color.background.1}}; color: {{color.text.secondary}}; "
-        "border: 1px solid {{color.background.2}}; padding: 4px 12px; margin-right: 2px; }"
-        "QTabBar::tab:selected { background: {{color.background.0}}; color: {{color.text.primary}}; "
-        "border-bottom-color: {{color.background.0}}; }");
+    auto* search = new QLineEdit;
+    search->setObjectName(QStringLiteral("radioSetupSearch"));
+    search->setPlaceholderText(QStringLiteral("Search settings (%1)")
+        .arg(QKeySequence(QKeySequence::Find).toString(QKeySequence::NativeText)));
+    search->setClearButtonEnabled(true);
+    search->setAccessibleName(QStringLiteral("Search Radio Setup settings"));
+    search->setAccessibleDescription(
+        QStringLiteral("Type a feature, device, or setting name to filter the navigation list."));
+    search->setMinimumHeight(38);
+    AetherSDR::ThemeManager::instance().applyStyleSheet(search,
+        "QLineEdit { background: {{color.background.1}}; color: {{color.text.primary}}; "
+        "border: 2px solid {{color.background.2}}; border-radius: 6px; padding: 7px 10px; font-size: 13px; }"
+        "QLineEdit:focus { border-color: {{color.accent.bright}}; }");
+    layout->addWidget(search);
+
+    auto* content = new QSplitter(Qt::Horizontal);
+    content->setChildrenCollapsible(false);
+
+    m_navigation = new QTreeWidget;
+    m_navigation->setObjectName(QStringLiteral("radioSetupNavigation"));
+    m_navigation->setHeaderHidden(true);
+    m_navigation->setRootIsDecorated(false);
+    m_navigation->setIndentation(14);
+    m_navigation->setUniformRowHeights(false);
+    m_navigation->setMinimumWidth(235);
+    m_navigation->setMaximumWidth(340);
+    m_navigation->setAccessibleName(QStringLiteral("Radio Setup categories"));
+    m_navigation->setAccessibleDescription(
+        QStringLiteral("Use the arrow keys to move between categories and settings pages."));
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_navigation,
+        "QTreeWidget { background: {{color.background.1}}; color: {{color.text.primary}}; "
+        "border: 1px solid {{color.background.2}}; border-radius: 6px; padding: 6px; outline: none; }"
+        "QTreeWidget::branch { image: none; border-image: none; background: transparent; }"
+        "QTreeWidget::item { min-height: 36px; padding: 3px 8px; border-radius: 4px; }"
+        "QTreeWidget::item:selected { background: {{color.accent.bright}}; color: {{color.background.0}}; }"
+        "QTreeWidget::item:hover:!selected { background: {{color.background.2}}; }");
+    content->addWidget(m_navigation);
+
+    auto* pageHost = new QWidget;
+    auto* pageLayout = new QVBoxLayout(pageHost);
+    pageLayout->setContentsMargins(16, 4, 4, 4);
+    pageLayout->setSpacing(10);
+    m_pageTitle = new QLabel;
+    m_pageTitle->setAccessibleName(QStringLiteral("Current settings page"));
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_pageTitle,
+        "QLabel { color: {{color.text.primary}}; font-size: 20px; font-weight: 600; padding: 2px 0 8px 0; }");
+    pageLayout->addWidget(m_pageTitle);
+    m_pages = new QStackedWidget;
+    m_pages->setObjectName(QStringLiteral("radioSetupPages"));
+    m_pages->setAccessibleName(QStringLiteral("Settings page content"));
+    pageLayout->addWidget(m_pages, 1);
+    content->addWidget(pageHost);
+    content->setStretchFactor(0, 0);
+    content->setStretchFactor(1, 1);
+    content->setSizes({260, 700});
+
+    auto addCategory = [this](const QString& name) {
+        auto* item = new QTreeWidgetItem(m_navigation, {name});
+        item->setFlags(Qt::ItemIsEnabled);
+        QFont font = item->font(0);
+        font.setBold(true);
+        item->setFont(0, font);
+        return item;
+    };
+
+    auto* radioCategory = addCategory(QStringLiteral("RADIO"));
+    auto* signalCategory = addCategory(QStringLiteral("RECEIVE & TRANSMIT"));
+    auto* hardwareCategory = addCategory(QStringLiteral("CONTROLLERS & HARDWARE"));
+    auto* onlineCategory = addCategory(QStringLiteral("ONLINE & APPEARANCE"));
+
+    auto addPage = [this](QTreeWidgetItem* category, const QString& name,
+                         const QString& keywords, std::function<QWidget*()> builder,
+                         bool eager = false) {
+        QWidget* placeholder = eager ? wrapTabInScrollArea(builder()) : new QWidget;
+        const int index = m_pages->addWidget(placeholder);
+        auto* item = new QTreeWidgetItem(category, {name});
+        item->setData(0, Qt::UserRole, index);
+        item->setData(0, Qt::UserRole + 1, keywords);
+        item->setToolTip(0, keywords);
+        m_pageIndexes.insert(name, index);
+        m_pageItems.insert(index, item);
+        if (!eager) {
+            m_deferredBuilders[index] = std::move(builder);
+        }
+        return item;
+    };
 
     // Build only the default (Radio) tab eagerly; defer the rest until first
     // selected.  This avoids hardware-probing calls (QSerialPortInfo,
     // QMediaDevices) during construction, which crash on some Wayland/Qt 6.11
     // configurations (#1776).
-    tabs->addTab(wrapTabInScrollArea(buildRadioTab()), "Radio");
-
-    auto addDeferred = [&](const QString& name, std::function<QWidget*()> builder) {
-        int idx = tabs->addTab(new QWidget, name);
-        m_deferredBuilders[idx] = std::move(builder);
-    };
-    addDeferred("Network",     [this] { return buildNetworkTab(); });
-    addDeferred("GPS",         [this] { return buildGpsTab(); });
-    addDeferred("Audio",       [this] { return buildAudioTab(); });
-    addDeferred("TX",          [this] { return buildTxTab(); });
-    addDeferred("Phone/CW",   [this] { return buildPhoneCwTab(); });
-    addDeferred("RX",          [this] { return buildRxTab(); });
-    addDeferred("Antennas",    [this] { return buildAntennaNamesTab(); });
-    addDeferred("Filters",     [this] { return buildFiltersTab(); });
-    addDeferred("XVTR",        [this] { return buildXvtrTab(); });
+    QTreeWidgetItem* firstItem = addPage(radioCategory, QStringLiteral("Radio"),
+        QStringLiteral("identity nickname callsign firmware license model region remote power"),
+        [this] { return buildRadioTab(); }, true);
+    addPage(radioCategory, QStringLiteral("Network"),
+        QStringLiteral("ip address dhcp static ethernet connection network"),
+        [this] { return buildNetworkTab(); });
+    addPage(radioCategory, QStringLiteral("GPS"),
+        QStringLiteral("gpsdo satellite location oscillator time"), [this] { return buildGpsTab(); });
+    addPage(signalCategory, QStringLiteral("Audio"),
+        QStringLiteral("speaker microphone device sample rate latency sound dax"), [this] { return buildAudioTab(); });
+    addPage(signalCategory, QStringLiteral("Transmit"),
+        QStringLiteral("tx transmit rf power tune ptt band settings"), [this] { return buildTxTab(); });
+    addPage(signalCategory, QStringLiteral("Phone & CW"),
+        QStringLiteral("phone cw keyer break-in sidetone microphone voice"), [this] { return buildPhoneCwTab(); });
+    addPage(signalCategory, QStringLiteral("Receive"),
+        QStringLiteral("rx receive calibration rf gain preamp"), [this] { return buildRxTab(); });
+    addPage(signalCategory, QStringLiteral("Filters"),
+        QStringLiteral("filter bandwidth low high cut mode"), [this] { return buildFiltersTab(); });
+    addPage(hardwareCategory, QStringLiteral("Antennas"),
+        QStringLiteral("antenna names ant1 ant2 rx in transverter"), [this] { return buildAntennaNamesTab(); });
+    addPage(hardwareCategory, QStringLiteral("Transverters"),
+        QStringLiteral("xvtr transverter if frequency offset power"), [this] { return buildXvtrTab(); });
     // External APD tab (#2186) — only present on radios that report
     // `apd configurable=1` (FLEX-8x00 series with SmartSDR 4.2.18+).
-    m_apdTabIndex = tabs->addTab(new QWidget, "APD");
-    m_deferredBuilders[m_apdTabIndex] = [this] { return buildApdTab(); };
-    tabs->setTabVisible(m_apdTabIndex, m_model->transmitModel().apdConfigurable());
+    QTreeWidgetItem* apdItem = addPage(hardwareCategory, QStringLiteral("APD"),
+        QStringLiteral("adaptive predistortion amplifier sampler linearization"), [this] { return buildApdTab(); });
+    m_apdPageIndex = m_pageIndexes.value(QStringLiteral("APD"));
+    apdItem->setHidden(!m_model->transmitModel().apdConfigurable());
     connect(&m_model->transmitModel(), &TransmitModel::apdStateChanged,
-            this, [this, tabs] {
-        tabs->setTabVisible(m_apdTabIndex, m_model->transmitModel().apdConfigurable());
+            this, [this, apdItem] {
+        apdItem->setHidden(!m_model->transmitModel().apdConfigurable());
     });
-    addDeferred("USB Cables",      [this] { return buildUsbCablesTab(); });
-    addDeferred("Peripherals",     [this] { return buildPeripheralsTab(); });
-    addDeferred("Themes",          [this] { return buildUiEnhancementsTab(); });
-    addDeferred("SmartLink",       [this] { return buildSmartLinkTab(); });
-    addDeferred("QRZ",             [this] { return buildQrzTab(); });
+    addPage(hardwareCategory, QStringLiteral("USB Cables"),
+        QStringLiteral("usb cable gpio bit bcd amplifier tuner accessory"), [this] { return buildUsbCablesTab(); });
+    addPage(hardwareCategory, QStringLiteral("Peripherals"),
+        QStringLiteral("controllers amplifier tuner antenna genius pgxl tgxl manual ip"), [this] { return buildPeripheralsTab(); });
+    addPage(onlineCategory, QStringLiteral("Appearance & Behavior"),
+        QStringLiteral("themes colors display font vision contrast click wheel ui enhancements"), [this] { return buildUiEnhancementsTab(); });
+    addPage(onlineCategory, QStringLiteral("SmartLink"),
+        QStringLiteral("remote internet certificate security pin wan"), [this] { return buildSmartLinkTab(); });
+    addPage(onlineCategory, QStringLiteral("QRZ & Callsigns"),
+        QStringLiteral("qrz callsign lookup spots contact online account"), [this] { return buildQrzTab(); });
 #ifdef HAVE_SERIALPORT
-    addDeferred("Serial",          [this] { return buildSerialTab(); });
+    addPage(hardwareCategory, QStringLiteral("Serial & Controllers"),
+        QStringLiteral("serial flexcontrol midi controller knob com port baud ptt cw"), [this] { return buildSerialTab(); });
 #endif
 
-    connect(tabs, &QTabWidget::currentChanged, this, &RadioSetupDialog::buildDeferredTab);
-
-    layout->addWidget(tabs);
+    m_navigation->expandAll();
+    connect(m_navigation, &QTreeWidget::currentItemChanged, this,
+            [this](QTreeWidgetItem* current, QTreeWidgetItem* previous) {
+        if (!current) {
+            return;
+        }
+        if (!current->parent()) {
+            QTreeWidgetItem* next = previous && m_navigation->itemAbove(current) == previous
+                ? m_navigation->itemBelow(current)
+                : m_navigation->itemAbove(current);
+            // Arrowing up onto the topmost "RADIO" header has nothing above it,
+            // so itemAbove() is null and the highlight would rest on the header.
+            // Clamp to the first child page below instead (#4183).
+            if (!next || !next->parent()) {
+                next = m_navigation->itemBelow(current);
+            }
+            if (next && next->parent()) {
+                m_navigation->setCurrentItem(next);
+            }
+            return;
+        }
+        const int index = current->data(0, Qt::UserRole).toInt();
+        buildDeferredTab(index);
+        m_pages->setCurrentIndex(index);
+        m_pageTitle->setText(current->text(0));
+    });
+    connect(search, &QLineEdit::textChanged, this, [this](const QString& text) {
+        const QString needle = text.trimmed();
+        QTreeWidgetItem* firstVisible = nullptr;
+        for (int i = 0; i < m_navigation->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* category = m_navigation->topLevelItem(i);
+            bool anyVisible = false;
+            for (int j = 0; j < category->childCount(); ++j) {
+                QTreeWidgetItem* item = category->child(j);
+                const QString haystack = item->text(0) + QStringLiteral(" ")
+                    + item->data(0, Qt::UserRole + 1).toString();
+                const bool matches = needle.isEmpty()
+                    || haystack.contains(needle, Qt::CaseInsensitive);
+                const bool apdRow = item == m_pageItems.value(m_apdPageIndex);
+                if (!apdRow || m_model->transmitModel().apdConfigurable()) {
+                    item->setHidden(!matches);
+                }
+                anyVisible = anyVisible || !item->isHidden();
+                if (!item->isHidden() && !firstVisible) {
+                    firstVisible = item;
+                }
+            }
+            category->setHidden(!anyVisible);
+            category->setExpanded(true);
+        }
+        // Stash the first match but do NOT make it current here: selecting it
+        // fires currentItemChanged → buildDeferredTab, which would eagerly
+        // construct and hardware-probe deferred pages (Audio, Serial,
+        // Peripherals) on every keystroke — the probe-on-navigate deferral
+        // #1776 exists to avoid. Enter commits the highlight instead (#4183).
+        // With an empty needle every page "matches", so leave the stash null —
+        // Enter with no query typed is then a no-op rather than jumping to (and
+        // building) the first page.
+        m_searchFirstMatch = needle.isEmpty() ? nullptr : firstVisible;
+    });
+    connect(search, &QLineEdit::returnPressed, this, [this] {
+        if (m_searchFirstMatch && !m_searchFirstMatch->isHidden()) {
+            m_navigation->setCurrentItem(m_searchFirstMatch);
+        }
+    });
+    auto* findAction = new QAction(this);
+    findAction->setShortcut(QKeySequence::Find);
+    findAction->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    connect(findAction, &QAction::triggered, search, [search] {
+        search->setFocus();
+        search->selectAll();
+    });
+    addAction(findAction);
+    m_navigation->setCurrentItem(firstItem);
+    layout->addWidget(content, 1);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
     AetherSDR::ThemeManager::instance().applyStyleSheet(buttons, "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
@@ -1214,7 +1384,193 @@ QWidget* RadioSetupDialog::buildNetworkTab()
         });
         grid->addWidget(enforceBtn, 0, 1);
 
-        grid->addWidget(new QLabel("Network MTU:"), 1, 0);
+        // 128-bit hex token generator — plenty for a local same-user secret.
+        auto genToken = []() -> QString {
+            quint64 a = QRandomGenerator::global()->generate64();
+            quint64 b = QRandomGenerator::global()->generate64();
+            return QStringLiteral("%1%2")
+                .arg(a, 16, 16, QLatin1Char('0'))
+                .arg(b, 16, 16, QLatin1Char('0'));
+        };
+        // The token field is created here (before the toggle) so the toggle's
+        // enable handler can auto-fill it — enabling the bridge without a
+        // token would leave it open, which defeats the point. The token lives
+        // in the OS secret store and reads ASYNCHRONOUSLY; tokenLoaded gates
+        // the auto-mint so a toggle fired before the read lands can't clobber
+        // an existing token.
+        auto* tokenEdit = new QLineEdit;
+        tokenEdit->setReadOnly(true);
+        tokenEdit->setPlaceholderText("(loading…)");
+        tokenEdit->setToolTip(
+            "Paste this into your AI assistant's MCP server config as the\n"
+            "AETHER_MCP_TOKEN environment variable. Only a client holding\n"
+            "this token can drive the radio. Stored in your OS secret store.");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(tokenEdit,
+            "QLineEdit { background: {{color.background.0}}; border: 1px solid {{color.background.2}}; "
+            "border-radius: 3px; color: {{color.text.primary}}; font-family: monospace; "
+            "font-size: 11px; padding: 3px 6px; }");
+        auto tokenLoaded = std::make_shared<bool>(false);
+        AutomationBridgeSettings::loadToken(this,
+            [tokenEdit, tokenLoaded](const QString& tok) {
+                tokenEdit->setText(tok);
+                tokenEdit->setPlaceholderText(
+                    "(none — enable the bridge or click Rotate)");
+                *tokenLoaded = true;
+            });
+
+        // Agent automation bridge (#3646) — the endpoint MCP clients (AI
+        // coding assistants) connect to for validating changes against the
+        // running app. Off by default; the operator opts in here. The
+        // AETHER_AUTOMATION launch env var still force-enables it regardless
+        // of this toggle (headless/CI path), so we reflect either source.
+        {
+            grid->addWidget(new QLabel("Agent Automation (MCP):"), 1, 0);
+            const bool bridgeOn = AutomationBridgeSettings::enabled()
+                || qEnvironmentVariableIsSet("AETHER_AUTOMATION");
+            auto* mcpBtn = new QPushButton(bridgeOn ? "Enabled" : "Disabled");
+            mcpBtn->setCheckable(true);
+            mcpBtn->setChecked(bridgeOn);
+            AetherSDR::ThemeManager::instance().applyStyleSheet(mcpBtn, "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
+                "border-radius: 3px; color: {{color.text.primary}}; font-size: 11px; font-weight: bold; "
+                "padding: 3px 10px; }"
+                "QPushButton:checked { background: #1a5030; color: {{color.accent.success}}; "
+                "border: 1px solid #20a040; }");
+            mcpBtn->setToolTip(
+                "Enable the in-app automation bridge so an AI coding assistant "
+                "(via the MCP server, tools/aether_mcp.py) can introspect and\n"
+                "drive this app to validate changes. Off by default. Transmit-"
+                "keying controls stay blocked unless the app is launched with\n"
+                "AETHER_AUTOMATION_ALLOW_TX. See docs/automation-bridge.md.");
+            // Env-var force-enable wins and can't be turned off from the UI —
+            // make that visible rather than letting a toggle silently no-op.
+            if (qEnvironmentVariableIsSet("AETHER_AUTOMATION")) {
+                mcpBtn->setEnabled(false);
+                mcpBtn->setToolTip(mcpBtn->toolTip()
+                    + "\n\nForced on by the AETHER_AUTOMATION launch environment variable.");
+            }
+            connect(mcpBtn, &QPushButton::toggled, this,
+                    [this, mcpBtn, tokenEdit, genToken, tokenLoaded](bool on) {
+                mcpBtn->setText(on ? "Enabled" : "Disabled");
+                AutomationBridgeSettings::setEnabled(on);
+                // Enabling with no token yet → mint one so the bridge is never
+                // exposed without auth. Only when the async token read has
+                // landed (tokenLoaded) so we can't clobber an existing token.
+                if (on && *tokenLoaded && tokenEdit->text().isEmpty()) {
+                    const QString tok = genToken();
+                    tokenEdit->setText(tok);
+                    AutomationBridgeSettings::saveToken(tok);
+                    QGuiApplication::clipboard()->setText(tok);
+                    emit automationBridgeTokenRotated(tok);
+                }
+                emit automationBridgeToggled(on);
+            });
+            grid->addWidget(mcpBtn, 1, 1);
+        }
+
+        // Access token row — display the shared secret with Copy + Rotate.
+        // Rotate makes a new token and applies it immediately, locking out any
+        // client still using the old one.
+        {
+            grid->addWidget(new QLabel("Access Token:"), 2, 0);
+            auto* tokenRow = new QWidget;
+            auto* tokLay = new QHBoxLayout(tokenRow);
+            tokLay->setContentsMargins(0, 0, 0, 0);
+            tokLay->setSpacing(6);
+
+            auto* copyBtn = new QPushButton("Copy");
+            auto* rotateBtn = new QPushButton("Rotate");
+            for (auto* b : {copyBtn, rotateBtn})
+                AetherSDR::ThemeManager::instance().applyStyleSheet(b,
+                    "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
+                    "border-radius: 3px; color: {{color.text.primary}}; font-size: 11px; "
+                    "padding: 3px 10px; }");
+            copyBtn->setToolTip("Copy the token to the clipboard.");
+            rotateBtn->setToolTip(
+                "Generate a new token and apply it immediately. Any client still\n"
+                "using the old token is locked out until you update its config.");
+
+            connect(copyBtn, &QPushButton::clicked, this, [tokenEdit]() {
+                if (!tokenEdit->text().isEmpty())
+                    QGuiApplication::clipboard()->setText(tokenEdit->text());
+            });
+            connect(rotateBtn, &QPushButton::clicked, this,
+                    [this, tokenEdit, genToken]() {
+                const QString tok = genToken();
+                tokenEdit->setText(tok);
+                AutomationBridgeSettings::saveToken(tok);
+                QGuiApplication::clipboard()->setText(tok);
+                emit automationBridgeTokenRotated(tok);
+            });
+
+            tokLay->addWidget(tokenEdit, 1);
+            tokLay->addWidget(copyBtn);
+            tokLay->addWidget(rotateBtn);
+            grid->addWidget(tokenRow, 2, 1);
+        }
+
+        // Allow TX via MCP — the transmit-keying guard. Off by default; the
+        // bridge refuses MOX/PTT/TUNE/ATU/CWX unless this (or the
+        // AETHER_AUTOMATION_ALLOW_TX env var) is set. Checking the box the
+        // first time raises a confirmation with the operator-responsibility
+        // warning; once confirmed the choice persists and is not re-prompted.
+        {
+            grid->addWidget(new QLabel("Allow TX via MCP:"), 3, 0);
+            auto* txCheck = new QCheckBox("Enable transmit control");
+            const bool envForcesTx = qEnvironmentVariableIsSet("AETHER_AUTOMATION_ALLOW_TX");
+            txCheck->setChecked(AutomationBridgeSettings::txAllowed() || envForcesTx);
+            txCheck->setToolTip(
+                "Let an MCP client key the transmitter (MOX/PTT/TUNE/ATU/CWX).\n"
+                "OFF by default — the bridge blocks all transmit-keying otherwise.\n"
+                "A force-unkey watchdog stays armed whenever this is on. You are\n"
+                "responsible for anything transmitted. See docs/automation-bridge.md.");
+            AetherSDR::ThemeManager::instance().applyStyleSheet(txCheck,
+                "QCheckBox { color: {{color.text.primary}}; font-size: 11px; }"
+                "QCheckBox::indicator { width: 14px; height: 14px; }");
+            if (envForcesTx) {
+                txCheck->setEnabled(false);
+                txCheck->setToolTip(txCheck->toolTip()
+                    + "\n\nForced on by the AETHER_AUTOMATION_ALLOW_TX launch variable.");
+            }
+            connect(txCheck, &QCheckBox::toggled, this, [this, txCheck](bool on) {
+                if (on && !AutomationBridgeSettings::txAck()) {
+                    // First-time enable → confirm. Operator must acknowledge.
+                    QMessageBox box(this);
+                    box.setIcon(QMessageBox::Warning);
+                    box.setWindowTitle("Allow TX via MCP?");
+                    box.setText("Allow an AI assistant / MCP client to key the transmitter?");
+                    box.setInformativeText(
+                        "This lets any MCP client holding the access token drive "
+                        "transmit-keying controls — MOX/PTT, TUNE, the ATU, and CWX "
+                        "send — on your radio. Automated software will be able to put "
+                        "a signal on the air.\n\n"
+                        "A force-unkey watchdog stays armed while this is enabled, but "
+                        "it is a backstop, not a guarantee. You, the operator, are "
+                        "ultimately responsible for all transmissions from your station "
+                        "— including their content, timing, frequency, power, and "
+                        "compliance with your license and local regulations.\n\n"
+                        "Only enable this if you understand and accept that "
+                        "responsibility. You can turn it off again at any time.");
+                    auto* confirm = box.addButton("Confirm — allow TX", QMessageBox::AcceptRole);
+                    box.addButton("Cancel", QMessageBox::RejectRole);
+                    box.setDefaultButton(qobject_cast<QPushButton*>(box.buttons().value(1)));
+                    box.exec();
+                    if (box.clickedButton() != confirm) {
+                        // Cancelled — revert without persisting or emitting.
+                        QSignalBlocker blocker(txCheck);
+                        txCheck->setChecked(false);
+                        return;
+                    }
+                    // Confirmed — remember the acknowledgement so we never
+                    // prompt again on a future enable.
+                    AutomationBridgeSettings::setTxAck(true);
+                }
+                AutomationBridgeSettings::setTxAllowed(on);
+                emit automationBridgeTxAllowedChanged(on);
+            });
+            grid->addWidget(txCheck, 3, 1);
+        }
+
+        grid->addWidget(new QLabel("Network MTU:"), 4, 0);
         auto* mtuSpin = new QSpinBox;
         mtuSpin->setRange(576, 9000);
         mtuSpin->setValue(AppSettings::instance().value("NetworkMtu", "1450").toInt());
@@ -1226,7 +1582,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
             AppSettings::instance().setValue("NetworkMtu", QString::number(val));
             AppSettings::instance().save();
         });
-        grid->addWidget(mtuSpin, 1, 1);
+        grid->addWidget(mtuSpin, 4, 1);
 
         // VITA-49 UDP receive buffer (SO_RCVBUF). Snap-to-preset slider; the
         // kernel clamps the grant at net.core.rmem_max, so we show the granted
@@ -1243,7 +1599,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
             return QStringLiteral("%1 KB").arg(b / 1024);
         };
 
-        grid->addWidget(new QLabel("VITA-49 RX buffer:"), 2, 0);
+        grid->addWidget(new QLabel("VITA-49 RX buffer:"), 5, 0);
         auto* bufRow = new QWidget;
         auto* bufLay = new QHBoxLayout(bufRow);
         bufLay->setContentsMargins(0, 0, 0, 0);
@@ -1271,7 +1627,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
         bufValLabel->setMinimumWidth(48);
         bufLay->addWidget(bufSlider, 1);
         bufLay->addWidget(bufValLabel);
-        grid->addWidget(bufRow, 2, 1);
+        grid->addWidget(bufRow, 5, 1);
 
         auto* bufGrantedLabel = new QLabel;
         if (m_model && m_model->panStream()) {
@@ -1279,7 +1635,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
             bufGrantedLabel->setText(g > 0 ? QString("granted: %1").arg(fmtBytes(g))
                                            : QStringLiteral("granted: — (applies on connect)"));
         }
-        grid->addWidget(bufGrantedLabel, 3, 1);
+        grid->addWidget(bufGrantedLabel, 6, 1);
 
         connect(bufSlider, &QSlider::valueChanged, this,
                 [this, bufValLabel, fmtBytes](int idx) {
@@ -3079,11 +3435,72 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
 
     QVBoxLayout* kiwiRowsLayout = nullptr;
 
+#ifdef HAVE_KEYCHAIN
+    const QString kiwiPasswordHelpText =
+        QStringLiteral("Configure receive-only KiwiSDR servers. Passwords "
+                       "are saved separately for each receiver in the "
+                       "operating system credential store when available. "
+                       "The status below each password confirms the result.");
+    const QString kiwiPasswordDescription =
+        QStringLiteral("Optional password for this KiwiSDR receiver. Type "
+                       "over the current value to replace it; the storage "
+                       "status below confirms whether the operating system "
+                       "credential store accepted it.");
+#else
+    const QString kiwiPasswordHelpText =
+        QStringLiteral("Configure receive-only KiwiSDR servers. This build "
+                       "keeps passwords only for the current session.");
+    const QString kiwiPasswordDescription =
+        QStringLiteral("Optional password for this KiwiSDR receiver. This "
+                       "build keeps it only for the current session.");
+#endif
+
     if (m_kiwiSdrManager) {
         auto* kiwiGroup = new QGroupBox("KiwiSDR RX Antennas");
         kiwiGroup->setStyleSheet(kGroupStyle);
         auto* kiwiLayout = new QVBoxLayout(kiwiGroup);
         kiwiLayout->setSpacing(6);
+
+        auto* kiwiHelp = new QLabel(
+            kiwiPasswordHelpText);
+        kiwiHelp->setWordWrap(true);
+        kiwiHelp->setAccessibleName("KiwiSDR receiver configuration help");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            kiwiHelp,
+            "QLabel { color: {{color.text.secondary}}; font-size: 11px; "
+            "padding: 0 4px 4px 4px; }");
+        kiwiLayout->addWidget(kiwiHelp);
+
+        auto* kiwiCredentialNotice = new QLabel;
+        kiwiCredentialNotice->setWordWrap(true);
+        kiwiCredentialNotice->setAccessibleName(
+            "KiwiSDR credential storage notice");
+        kiwiCredentialNotice->setVisible(false);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            kiwiCredentialNotice,
+            "QLabel { color: {{color.accent.danger}}; font-size: 11px; "
+            "padding: 4px; }");
+        kiwiLayout->addWidget(kiwiCredentialNotice);
+        connect(
+            m_kiwiSdrManager,
+            &KiwiSdrManager::profilePasswordPersistenceChanged,
+            kiwiCredentialNotice,
+            [kiwiCredentialNotice](
+                const QString& id, KiwiSdrPasswordPersistenceState state,
+                const QString& detail) {
+                if (state != KiwiSdrPasswordPersistenceState::Error) {
+                    if (kiwiCredentialNotice->property("profileId").toString()
+                        == id) {
+                        kiwiCredentialNotice->clear();
+                        kiwiCredentialNotice->setVisible(false);
+                    }
+                    return;
+                }
+                kiwiCredentialNotice->setProperty("profileId", id);
+                kiwiCredentialNotice->setText(detail);
+                kiwiCredentialNotice->setAccessibleDescription(detail);
+                kiwiCredentialNotice->setVisible(true);
+            });
 
         auto* kiwiScroll = new QScrollArea;
         kiwiScroll->setWidgetResizable(true);
@@ -3290,7 +3707,8 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
         };
 
         *refreshKiwi = [this, kiwiRowsLayout, stateText, styleKiwiEdit,
-                        styleKiwiButton, styleKiwiIconButton] {
+                        styleKiwiButton, styleKiwiIconButton,
+                        kiwiPasswordDescription] {
             while (QLayoutItem* item = kiwiRowsLayout->takeAt(0)) {
                 if (QWidget* widget = item->widget()) {
                     widget->deleteLater();
@@ -3300,55 +3718,209 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
 
             const QVector<KiwiSdrAntennaProfile> profiles =
                 m_kiwiSdrManager->profiles();
-            for (int row = 0; row < profiles.size(); ++row) {
-                const KiwiSdrAntennaProfile profile = profiles[row];
+            auto addSectionHeader = [kiwiRowsLayout](const QString& text) {
+                auto* header = new QLabel(text);
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    header,
+                    "QLabel { color: {{color.accent.bright}}; font-size: 11px; "
+                    "font-weight: bold; padding: 4px 2px 1px 2px; }");
+                kiwiRowsLayout->addWidget(header);
+            };
+            auto addFieldLabel = [](QGridLayout* layout, const QString& text,
+                                    int column) {
+                auto* label = new QLabel(text);
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    label,
+                    "QLabel { color: {{color.text.secondary}}; font-size: 10px; "
+                    "font-weight: bold; }");
+                layout->addWidget(label, 1, column);
+            };
+            auto passwordPersistenceText = [](KiwiSdrPasswordPersistenceState state,
+                                              const QString& detail) {
+                switch (state) {
+                case KiwiSdrPasswordPersistenceState::Loading:
+                    return QStringLiteral("Loading secure password…");
+                case KiwiSdrPasswordPersistenceState::NoPassword:
+                    return QStringLiteral("No password stored");
+                case KiwiSdrPasswordPersistenceState::Saving:
+                    return QStringLiteral("Saving securely…");
+                case KiwiSdrPasswordPersistenceState::Stored:
+                    return QStringLiteral("Stored securely");
+                case KiwiSdrPasswordPersistenceState::SessionOnly:
+                    return QStringLiteral("Current session only");
+                case KiwiSdrPasswordPersistenceState::Error:
+                    return detail.isEmpty()
+                        ? QStringLiteral("Password was not stored")
+                        : detail;
+                }
+                return QString();
+            };
+
+            addSectionHeader("CONFIGURED RECEIVERS");
+            if (profiles.isEmpty()) {
+                auto* empty = new QLabel("No KiwiSDR receivers configured.");
+                empty->setAccessibleName("No configured KiwiSDR receivers");
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    empty,
+                    "QLabel { color: {{color.text.label}}; font-size: 12px; "
+                    "padding: 8px; }");
+                kiwiRowsLayout->addWidget(empty);
+            }
+
+            for (const KiwiSdrAntennaProfile& profile : profiles) {
 
                 auto* rowFrame = new QFrame;
                 rowFrame->setObjectName("kiwiAntennaRow");
+                rowFrame->setAccessibleName(
+                    QStringLiteral("KiwiSDR receiver %1").arg(profile.name));
                 rowFrame->setStyleSheet(kKiwiRowStyle);
                 auto* rowLayout = new QGridLayout(rowFrame);
-                rowLayout->setContentsMargins(6, 5, 6, 5);
-                rowLayout->setHorizontalSpacing(6);
-                rowLayout->setVerticalSpacing(3);
+                rowLayout->setContentsMargins(10, 8, 10, 8);
+                rowLayout->setHorizontalSpacing(8);
+                rowLayout->setVerticalSpacing(4);
                 rowLayout->setColumnStretch(0, 1);
+                rowLayout->setColumnStretch(1, 1);
+                rowLayout->setColumnStretch(2, 1);
+
+                auto* title = new QLabel(profile.name);
+                title->setAccessibleName("KiwiSDR receiver name");
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    title,
+                    "QLabel { color: {{color.text.primary}}; font-size: 14px; "
+                    "font-weight: bold; }");
+                rowLayout->addWidget(title, 0, 0, 1, 2);
+
+                const KiwiSdrClient::State kiwiState =
+                    m_kiwiSdrManager->state(profile.id);
+                auto* status = new QLabel(stateText(profile.id));
+                status->setAccessibleName("KiwiSDR antenna status");
+                status->setAccessibleDescription(status->text());
+                QString statusColor = QStringLiteral("{{color.text.secondary}}");
+                if (kiwiState == KiwiSdrClient::State::Connected
+                    || kiwiState == KiwiSdrClient::State::Camping) {
+                    statusColor = QStringLiteral("{{color.accent.success}}");
+                } else if (kiwiState == KiwiSdrClient::State::Error) {
+                    statusColor = QStringLiteral("{{color.accent.danger}}");
+                } else if (kiwiState == KiwiSdrClient::State::Connecting
+                           || kiwiState == KiwiSdrClient::State::Waiting) {
+                    statusColor = QStringLiteral("{{color.accent.bright}}");
+                }
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    status,
+                    QStringLiteral("QLabel { color: %1; font-size: 12px; "
+                                   "padding-left: 6px; }")
+                        .arg(statusColor));
+                status->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+                status->setWordWrap(true);
+                status->setToolTip(status->text());
+                rowLayout->addWidget(status, 0, 2, 1, 2);
+
+                addFieldLabel(rowLayout, "NAME", 0);
+                addFieldLabel(rowLayout, "SERVER", 1);
+                addFieldLabel(rowLayout, "PASSWORD", 2);
 
                 auto* nameEdit = new QLineEdit(profile.name);
                 nameEdit->setMaxLength(16);
-                nameEdit->setPlaceholderText("Custom Name");
                 nameEdit->setAccessibleName("KiwiSDR antenna name");
                 nameEdit->setAccessibleDescription(
                     "Required display name for this KiwiSDR receive antenna.");
                 styleKiwiEdit(nameEdit);
-                rowLayout->addWidget(nameEdit, 0, 0);
-
-                auto* status = new QLabel(stateText(profile.id));
-                status->setAccessibleName("KiwiSDR antenna status");
-                status->setAccessibleDescription(status->text());
-                status->setStyleSheet(
-                    "QLabel { color: #c8d8e8; font-size: 12px; padding-left: 6px; }");
-                status->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-                status->setWordWrap(true);
-                status->setToolTip(status->text());
-                rowLayout->addWidget(status, 0, 1, 1, 3);
+                rowLayout->addWidget(nameEdit, 2, 0);
 
                 auto* endpointEdit = new QLineEdit(profile.endpoint);
                 endpointEdit->setAccessibleName("KiwiSDR server");
                 endpointEdit->setAccessibleDescription(
                     "Hostname or hostname:port for this KiwiSDR endpoint.");
                 styleKiwiEdit(endpointEdit);
-                rowLayout->addWidget(endpointEdit, 1, 0);
+                rowLayout->addWidget(endpointEdit, 2, 1);
+
+                auto* passwordEdit = new QLineEdit(
+                    m_kiwiSdrManager->profilePassword(profile.id));
+                passwordEdit->setEchoMode(QLineEdit::Password);
+                passwordEdit->setMaxLength(256);
+                passwordEdit->setObjectName(
+                    QStringLiteral("kiwiPassword_%1").arg(profile.id));
+                passwordEdit->setAccessibleName("KiwiSDR password");
+                passwordEdit->setAccessibleDescription(
+                    kiwiPasswordDescription);
+                if (!m_kiwiSdrManager->isProfilePasswordLoaded(profile.id)) {
+                    passwordEdit->setPlaceholderText("Loading secure password…");
+                    passwordEdit->setEnabled(false);
+                }
+                styleKiwiEdit(passwordEdit);
+                rowLayout->addWidget(passwordEdit, 2, 2, 1, 2);
+
+                const KiwiSdrPasswordPersistenceState persistenceState =
+                    m_kiwiSdrManager->profilePasswordPersistenceState(
+                        profile.id);
+                auto* passwordStatus = new QLabel(passwordPersistenceText(
+                    persistenceState,
+                    m_kiwiSdrManager->profilePasswordPersistenceDetail(
+                        profile.id)));
+                passwordStatus->setObjectName(
+                    QStringLiteral("kiwiPasswordStatus_%1").arg(profile.id));
+                passwordStatus->setAccessibleName(
+                    "KiwiSDR password storage status");
+                passwordStatus->setAccessibleDescription(
+                    passwordStatus->text());
+                passwordStatus->setWordWrap(true);
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    passwordStatus,
+                    persistenceState == KiwiSdrPasswordPersistenceState::Error
+                        ? "QLabel { color: {{color.accent.danger}}; "
+                          "font-size: 10px; padding: 0 2px; }"
+                        : "QLabel { color: {{color.text.secondary}}; "
+                          "font-size: 10px; padding: 0 2px; }");
+                rowLayout->addWidget(passwordStatus, 3, 2, 1, 2);
+                connect(
+                    m_kiwiSdrManager,
+                    &KiwiSdrManager::profilePasswordChanged,
+                    passwordEdit,
+                    [manager = m_kiwiSdrManager, profileId = profile.id,
+                     passwordEdit](const QString& changedId) {
+                        if (changedId != profileId) {
+                            return;
+                        }
+                        const QSignalBlocker blocker(passwordEdit);
+                        passwordEdit->setText(
+                            manager->profilePassword(profileId));
+                        passwordEdit->setPlaceholderText(QString());
+                        passwordEdit->setEnabled(true);
+                    });
+                connect(
+                    m_kiwiSdrManager,
+                    &KiwiSdrManager::profilePasswordPersistenceChanged,
+                    passwordStatus,
+                    [profileId = profile.id, passwordStatus,
+                     passwordPersistenceText](
+                        const QString& changedId,
+                        KiwiSdrPasswordPersistenceState state,
+                        const QString& detail) {
+                        if (changedId != profileId) {
+                            return;
+                        }
+                        const QString text =
+                            passwordPersistenceText(state, detail);
+                        passwordStatus->setText(text);
+                        passwordStatus->setAccessibleDescription(text);
+                        AetherSDR::ThemeManager::instance().applyStyleSheet(
+                            passwordStatus,
+                            state == KiwiSdrPasswordPersistenceState::Error
+                                ? "QLabel { color: {{color.accent.danger}}; "
+                                  "font-size: 10px; padding: 0 2px; }"
+                                : "QLabel { color: {{color.text.secondary}}; "
+                                  "font-size: 10px; padding: 0 2px; }");
+                    });
 
                 auto* autoCheck = new QCheckBox;
-                autoCheck->setText("Auto");
+                autoCheck->setText("Auto-connect");
                 autoCheck->setChecked(profile.autoConnect);
                 autoCheck->setAccessibleName("Auto connect KiwiSDR antenna");
                 AetherSDR::ThemeManager::instance().applyStyleSheet(autoCheck,
                     "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
                     + kCheckBoxIndicator);
-                rowLayout->addWidget(autoCheck, 1, 1, Qt::AlignCenter);
+                rowLayout->addWidget(autoCheck, 4, 0, 1, 2, Qt::AlignLeft);
 
-                const KiwiSdrClient::State kiwiState =
-                    m_kiwiSdrManager->state(profile.id);
                 const bool activeSession =
                     kiwiState == KiwiSdrClient::State::Connecting
                     || kiwiState == KiwiSdrClient::State::Waiting
@@ -3359,14 +3931,14 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                     activeSession ? "Disconnect KiwiSDR antenna"
                                   : "Connect KiwiSDR antenna");
                 styleKiwiButton(connectButton);
-                rowLayout->addWidget(connectButton, 1, 2);
+                rowLayout->addWidget(connectButton, 4, 2);
 
                 auto* removeButton = new QPushButton;
                 removeButton->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
                 removeButton->setToolTip("Remove");
                 removeButton->setAccessibleName("Remove KiwiSDR antenna");
                 styleKiwiIconButton(removeButton);
-                rowLayout->addWidget(removeButton, 1, 3);
+                rowLayout->addWidget(removeButton, 4, 3);
                 kiwiRowsLayout->addWidget(rowFrame);
 
                 auto updateProfile = [this, profile, nameEdit, endpointEdit,
@@ -3402,6 +3974,11 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                         this, updateProfile);
                 connect(endpointEdit, &QLineEdit::returnPressed,
                         this, updateProfile);
+                connect(passwordEdit, &QLineEdit::editingFinished,
+                        this, [this, profile, passwordEdit] {
+                    m_kiwiSdrManager->setProfilePassword(
+                        profile.id, passwordEdit->text());
+                });
                 connect(autoCheck, &QCheckBox::toggled,
                         this, [updateProfile](bool) { updateProfile(); });
                 connect(connectButton, &QPushButton::clicked,
@@ -3418,14 +3995,21 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                 });
             }
 
+            addSectionHeader("ADD RECEIVER");
             auto* rowFrame = new QFrame;
             rowFrame->setObjectName("kiwiAntennaRow");
             rowFrame->setStyleSheet(kKiwiRowStyle);
             auto* rowLayout = new QGridLayout(rowFrame);
-            rowLayout->setContentsMargins(6, 5, 6, 5);
-            rowLayout->setHorizontalSpacing(6);
-            rowLayout->setVerticalSpacing(3);
+            rowLayout->setContentsMargins(10, 8, 10, 8);
+            rowLayout->setHorizontalSpacing(8);
+            rowLayout->setVerticalSpacing(4);
             rowLayout->setColumnStretch(0, 1);
+            rowLayout->setColumnStretch(1, 1);
+            rowLayout->setColumnStretch(2, 1);
+
+            addFieldLabel(rowLayout, "NAME", 0);
+            addFieldLabel(rowLayout, "SERVER", 1);
+            addFieldLabel(rowLayout, "PASSWORD", 2);
 
             auto* nameEdit = new QLineEdit;
             nameEdit->setMaxLength(16);
@@ -3434,7 +4018,7 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
             nameEdit->setAccessibleDescription(
                 "Required display name for the new KiwiSDR receive antenna.");
             styleKiwiEdit(nameEdit);
-            rowLayout->addWidget(nameEdit, 0, 0);
+            rowLayout->addWidget(nameEdit, 2, 0);
 
             auto* endpointEdit = new QLineEdit;
             endpointEdit->setPlaceholderText("host:8073");
@@ -3442,19 +4026,29 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
             endpointEdit->setAccessibleDescription(
                 "Hostname or hostname:port for the new KiwiSDR receive antenna.");
             styleKiwiEdit(endpointEdit);
-            rowLayout->addWidget(endpointEdit, 1, 0);
+            rowLayout->addWidget(endpointEdit, 2, 1);
+
+            auto* passwordEdit = new QLineEdit;
+            passwordEdit->setEchoMode(QLineEdit::Password);
+            passwordEdit->setMaxLength(256);
+            passwordEdit->setObjectName("newKiwiPassword");
+            passwordEdit->setAccessibleName("New KiwiSDR password");
+            passwordEdit->setAccessibleDescription(
+                kiwiPasswordDescription);
+            styleKiwiEdit(passwordEdit);
+            rowLayout->addWidget(passwordEdit, 2, 2);
 
             auto* autoCheck = new QCheckBox;
-            autoCheck->setText("Auto");
+            autoCheck->setText("Auto-connect");
             autoCheck->setAccessibleName("Auto connect new KiwiSDR antenna");
             AetherSDR::ThemeManager::instance().applyStyleSheet(autoCheck,
                 "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
                 + kCheckBoxIndicator);
-            rowLayout->addWidget(autoCheck, 1, 1, Qt::AlignCenter);
+            rowLayout->addWidget(autoCheck, 3, 0, Qt::AlignLeft);
 
             auto committed = std::make_shared<bool>(false);
-            auto commitNewRow = [this, nameEdit, endpointEdit, autoCheck,
-                                 committed] {
+            auto commitNewRow = [this, nameEdit, endpointEdit, passwordEdit,
+                                 autoCheck, committed] {
                 if (*committed) {
                     return;
                 }
@@ -3466,45 +4060,51 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                 }
                 *committed = true;
                 const QString id = m_kiwiSdrManager->addProfile(name, endpoint);
-                if (autoCheck->isChecked()) {
-                    KiwiSdrAntennaProfile profile = m_kiwiSdrManager->profile(id);
-                    profile.autoConnect = true;
-                    m_kiwiSdrManager->updateProfile(profile);
+                if (id.isEmpty()) {
+                    *committed = false;
+                    return;
                 }
+                m_kiwiSdrManager->setProfilePassword(id, passwordEdit->text());
+                KiwiSdrAntennaProfile profile = m_kiwiSdrManager->profile(id);
+                profile.autoConnect = autoCheck->isChecked();
+                m_kiwiSdrManager->updateProfile(profile);
             };
 
             // Browse the public KiwiSDR directory to fill in a receiver. Only
             // API-permitting receivers are listed (web-only operators honored).
-            // Picking one adds the profile immediately — no extra Tab/confirm.
+            // Picking one fills the fields; Add receiver commits the profile.
             auto* browseButton = new QPushButton("Browse public…");
             browseButton->setAccessibleName("Browse public KiwiSDR receivers");
             browseButton->setAccessibleDescription(
                 "Choose from the public KiwiSDR directory; receivers whose "
                 "operator disabled the external API are not shown.");
-            rowLayout->addWidget(browseButton, 0, 1);
+            styleKiwiButton(browseButton);
+            rowLayout->addWidget(browseButton, 3, 1);
             connect(browseButton, &QPushButton::clicked, this,
-                    [this, nameEdit, endpointEdit, commitNewRow] {
+                    [this, nameEdit, endpointEdit] {
                 KiwiPublicReceiverPicker picker(this);
                 if (picker.exec() == QDialog::Accepted
                     && !picker.selectedEndpoint().isEmpty()) {
                     endpointEdit->setText(picker.selectedEndpoint());
-                    if (nameEdit->text().trimmed().isEmpty())
+                    if (nameEdit->text().trimmed().isEmpty()) {
                         nameEdit->setText(picker.selectedName());
-                    commitNewRow();  // add directly; no Tab-out needed
+                    }
                 }
             });
+
+            auto* addButton = new QPushButton("Add receiver");
+            addButton->setAccessibleName("Add KiwiSDR receiver");
+            styleKiwiButton(addButton);
+            rowLayout->addWidget(addButton, 3, 2);
+            connect(addButton, &QPushButton::clicked, this, commitNewRow);
             kiwiRowsLayout->addWidget(rowFrame);
 
-            connect(nameEdit, &QLineEdit::editingFinished,
-                    this, commitNewRow);
             connect(nameEdit, &QLineEdit::returnPressed,
-                    this, commitNewRow);
-            connect(endpointEdit, &QLineEdit::editingFinished,
                     this, commitNewRow);
             connect(endpointEdit, &QLineEdit::returnPressed,
                     this, commitNewRow);
-            connect(autoCheck, &QCheckBox::toggled,
-                    this, [commitNewRow](bool) { commitNewRow(); });
+            connect(passwordEdit, &QLineEdit::returnPressed,
+                    this, commitNewRow);
 
             kiwiRowsLayout->addStretch(1);
         };
@@ -6038,7 +6638,7 @@ void RadioSetupDialog::buildDeferredTab(int index)
     if (it == m_deferredBuilders.end())
         return;                             // already built or out of range
 
-    QWidget* placeholder = m_tabs->widget(index);
+    QWidget* placeholder = m_pages->widget(index);
     QWidget* content = it.value()();        // run the real builder
     auto* lay = new QVBoxLayout(placeholder);
     lay->setContentsMargins(0, 0, 0, 0);
@@ -6051,12 +6651,24 @@ void RadioSetupDialog::buildDeferredTab(int index)
 
 void RadioSetupDialog::selectTab(const QString& tabName)
 {
-    if (!m_tabs) return;
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        if (m_tabs->tabText(i) == tabName) {
-            m_tabs->setCurrentIndex(i);
-            return;
-        }
+    if (!m_navigation) {
+        return;
+    }
+
+    static const QHash<QString, QString> kLegacyPageNames = {
+        {QStringLiteral("TX"), QStringLiteral("Transmit")},
+        {QStringLiteral("RX"), QStringLiteral("Receive")},
+        {QStringLiteral("Phone/CW"), QStringLiteral("Phone & CW")},
+        {QStringLiteral("XVTR"), QStringLiteral("Transverters")},
+        {QStringLiteral("Themes"), QStringLiteral("Appearance & Behavior")},
+        {QStringLiteral("QRZ"), QStringLiteral("QRZ & Callsigns")},
+        {QStringLiteral("Serial"), QStringLiteral("Serial & Controllers")}
+    };
+    const QString pageName = kLegacyPageNames.value(tabName, tabName);
+    const int index = m_pageIndexes.value(pageName, -1);
+    if (QTreeWidgetItem* item = m_pageItems.value(index, nullptr)) {
+        m_navigation->setCurrentItem(item);
+        m_navigation->scrollToItem(item, QAbstractItemView::PositionAtCenter);
     }
 }
 

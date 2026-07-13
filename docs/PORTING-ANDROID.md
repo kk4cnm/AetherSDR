@@ -24,6 +24,7 @@ reaches parity.
 | Panadapter / waterfall | working via **CPU renderer** (QPainter). QRhiWidget GPU path composites black on Android (Qt 6.8.2 / Mali-G610) — forced off, see `AETHER_GPU_SPECTRUM_ANDROID_FORCE` |
 | RX audio (remote audio via QAudioSink) | working, uncompressed streams (needs WifiLock — see below) |
 | TX: device mic + on-screen PTT | ported (`RECORD_AUDIO` manifest + runtime permission requested at startup) |
+| D-STAR / ThumbDV digital voice | off (`ENABLE_DSTAR=OFF`) — USB-serial dongle feature; vendored `smartsdr-dsp` uses `sys/termios.h`, absent in Android bionic |
 | SmartLink (WAN) | deferred — needs Opus for Android + Qt6Keychain replacement |
 | Client DSP strip / NR2 / RNNoise | compiles; FFTW absent → fallback FFT |
 | DFNR / specbleach / BNR / RADE / MQTT | off (`ENABLE_*=OFF`) |
@@ -72,7 +73,8 @@ export ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools
   -DANDROID_SDK_ROOT=$ANDROID_SDK_ROOT \
   -DANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.1.10909125 \
   -DCMAKE_BUILD_TYPE=Release \
-  -DENABLE_RADE=OFF -DENABLE_MQTT=OFF -DENABLE_SPECBLEACH=OFF -DENABLE_DFNR=OFF
+  -DENABLE_RADE=OFF -DENABLE_MQTT=OFF -DENABLE_SPECBLEACH=OFF -DENABLE_DFNR=OFF \
+  -DENABLE_DSTAR=OFF
 
 cmake --build build-android
 # APK lands in build-android/android-build/build/outputs/apk/

@@ -295,7 +295,7 @@ SpectrumOverlayMenu::SpectrumOverlayMenu(QWidget* parent)
         {"ANT",       1, nullptr},   // 3 — toggleAntPanel
         {"Display",   4, nullptr},   // 4 — toggleDisplayPanel
         {"Memory",    5, nullptr},   // 6 — toggleMemoryPanel
-        // MEM+ moved into MemoryBrowsePanel (bottom button — doesn't scroll).
+        // Add Memory lives at the top of MemoryBrowsePanel, outside the scrolling rows.
         {"DAX",       3, nullptr},   // 6 — toggleDaxPanel
     };
 
@@ -2182,6 +2182,23 @@ void SpectrumOverlayMenu::syncNoiseFloorPosition(int pos)
     if (m_floorLabel) {
         m_floorLabel->setText(QString::number(clamped));
     }
+}
+
+void SpectrumOverlayMenu::syncPanProcessingSettings(int avg, int fps,
+                                                     bool weightedAvg)
+{
+    if (!m_avgSlider || !m_fpsSlider || !m_weightedAvgBtn) {
+        return;
+    }
+
+    const QSignalBlocker avgBlocker(m_avgSlider);
+    const QSignalBlocker fpsBlocker(m_fpsSlider);
+    const QSignalBlocker weightedBlocker(m_weightedAvgBtn);
+    m_avgSlider->setValue(avg);
+    m_avgLabel->setText(QString::number(avg));
+    m_fpsSlider->setValue(fps);
+    m_fpsLabel->setText(QString::number(fps));
+    m_weightedAvgBtn->setChecked(weightedAvg);
 }
 
 void SpectrumOverlayMenu::syncDssFloorDepth(int dB)

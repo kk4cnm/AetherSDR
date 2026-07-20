@@ -20,12 +20,14 @@
 #include "MainWindow.h"
 
 #include "AetherDspWidget.h"
+#include "DisplayStatusGate.h"       // #4261 adaptive-throttle echo gate
 #include "Ax25HfPacketDecodeDialog.h"
 #include "AppletPanel.h"
 #include "MainWindowHelpers.h"
 #include "PanadapterApplet.h"
 #include "PanadapterStack.h"
 #include "RadioSetupDialog.h"
+#include "GpsLocationDialog.h"
 #include "RxApplet.h"
 #include "AmpApplet.h"
 #include "HealthApplet.h"
@@ -177,6 +179,11 @@ double quantizeIncrementalFollowDelta(double overshootMhz, double stepMhz)
 }
 
 } // namespace
+
+void MainWindow::showGpsLocationDialog()
+{
+    showOrRaisePersistent(m_gpsLocationDialog, &m_radioModel);
+}
 
 int MainWindow::centerLockSliceForPan(const QString& panId) const
 {
@@ -1328,6 +1335,9 @@ void MainWindow::onSliceAdded(SliceModel* s)
         syncTxWaterfallSliceToSpectrums();
         updateSplitState();
 
+        // TX flag just moved — keyer availability follows the TX slice (#4173).
+        updateKeyerAvailability();
+
         // Active follows TX slice (#1351) — switch the displayed/active slice
         // when an external program (e.g. WSJT-X) moves the TX flag
         if (tx && s->sliceId() != m_activeSliceId
@@ -1363,9 +1373,6 @@ void MainWindow::onSliceAdded(SliceModel* s)
             refreshCwDecodeState();
             refreshRttyDecodeState();
 
-            // Update CWX/DVK indicator availability for new mode
-            updateKeyerAvailability(mode);
-
             // Disable client-side DSP in digital and CW modes — NR2/RN2/BNR
             // corrupt digital data (#534) and suppress CW tones (#784)
             bool disableDsp = (mode == "DIGU" || mode == "DIGL" || mode == "RTTY"
@@ -1383,6 +1390,11 @@ void MainWindow::onSliceAdded(SliceModel* s)
                     QMetaObject::invokeMethod(m_audio, [this]() { m_audio->setNvAfxEnabled(false); });
             }
         }
+
+        // CWX/DVK availability and their F1-F12 shortcuts follow the TX slice,
+        // so re-evaluate only when the TX slice changes mode (#4173).
+        if (s->isTxSlice())
+            updateKeyerAvailability();
 #ifdef HAVE_RADE
         if (mode.startsWith("FDV"))
             activateFdvDisplay(s->sliceId());
@@ -1533,9 +1545,46 @@ void MainWindow::onSliceRemoved(int id)
     }
     m_centerLockTuneHoldBySlice.remove(id);
 
-    m_kiwiSdrVirtualPreviousMute.remove(id);
-    if (m_kiwiSdrManager) {
-        m_kiwiSdrManager->clearSliceAssignment(id);
+    // A band-stack recall (band_persistence) DROPS and RE-CREATES the slice
+    // (same id, new band) instead of retuning it, which would tear down a
+    // KiwiSDR replacement on the removal. Defer that teardown across the
+    // remove->re-add so onSliceAdded can re-bind the Kiwi (retuned to the new
+    // band) instead of reverting to a plain Flex slice (#4158). m_kiwiRebind is
+    // the pure policy — see KiwiRebindTracker; identity is gated on band-recall
+    // intent and generation, not slice id + time.
+    //
+    // `live` distinguishes a genuine removal (the slice has already left the
+    // model, so slice(id) is null) from the reconnect stale-slice prune (a
+    // sliceRemoved(oldId) whose id already belongs to a live new-session slice)
+    // — same guard the center-lock logic above uses. Only a live Kiwi removal
+    // defers; the prune keeps the pre-existing immediate cleanup and never
+    // enters the grace path, so a stale prune can't later clear a live
+    // assignment.
+    const bool liveRemoval = !m_radioModel.slice(id);
+    const QString kiwiRebindProfile = (liveRemoval && m_kiwiSdrManager)
+        ? m_kiwiSdrManager->assignedProfileForSlice(id) : QString();
+    const auto rebindAction =
+        m_kiwiRebind.onSliceRemoved(id, liveRemoval, kiwiRebindProfile);
+    if (rebindAction.kind == KiwiRebindTracker::RemoveAction::Defer) {
+        // Leave the assignment (and Kiwi connection) and the pre-Kiwi mute
+        // intact during the window so a re-bind is seamless. If no recreation
+        // re-binds it, the generation-safe expiry finalizes the teardown.
+        const quint64 generation = rebindAction.generation;
+        QTimer::singleShot(kKiwiSdrRebindGraceMs, this, [this, id, generation]() {
+            if (!m_kiwiRebind.onGraceExpired(id, generation)) {
+                return;
+            }
+            m_kiwiSdrVirtualPreviousMute.remove(id);
+            if (m_kiwiSdrManager) {
+                m_kiwiSdrManager->clearSliceAssignment(id);
+            }
+            syncKiwiSdrPanadapterUiStates();
+        });
+    } else {
+        m_kiwiSdrVirtualPreviousMute.remove(id);
+        if (m_kiwiSdrManager) {
+            m_kiwiSdrManager->clearSliceAssignment(id);
+        }
     }
     syncKiwiSdrPanadapterUiStates();
 
@@ -2073,6 +2122,86 @@ void MainWindow::runProfileLoadRecoveryPass(const QString& profileType,
     }
 }
 
+void MainWindow::wirePanDisplayStatus(PanadapterApplet* applet,
+                                      PanadapterModel* pan)
+{
+    if (!applet || !pan) {
+        return;
+    }
+    SpectrumWidget* sw = applet->spectrumWidget();
+    if (!sw) {
+        return;
+    }
+
+    const QString panId = applet->panId();
+    QVector<QMetaObject::Connection> oldConnections =
+        m_panDisplayStatusConnections.take(panId);
+    for (const QMetaObject::Connection& connection : oldConnections) {
+        QObject::disconnect(connection);
+    }
+
+    QVector<QMetaObject::Connection> connections;
+    connections.reserve(4);
+    connections.append(connect(
+        pan, &PanadapterModel::averageReported,
+        sw, [sw](int average) {
+            if (average >= 0) {
+                sw->setFftAverage(average);
+            }
+        }));
+    connections.append(connect(
+        pan, &PanadapterModel::weightedAverageReported,
+        sw, [sw, pan](bool weighted) {
+            // Guard on "known" like the other three fields, so an unreported
+            // value doesn't paint a definitive unchecked box (#4261).
+            if (pan->weightedAverageKnown()) {
+                sw->setFftWeightedAvg(weighted);
+            }
+        }));
+    connections.append(connect(
+        pan, &PanadapterModel::fpsReported,
+        sw, [this, sw](int fps) {
+            // The adaptive cap is transient client transport state: suppress only
+            // the cap's own echo so the pre-cap radio value stays the restore
+            // target, but let a genuine radio/profile update through even while
+            // throttled (#4261 — otherwise it's lost when the throttle lifts).
+            if (applyThrottledDisplayReport(m_adaptiveThrottleActive,
+                                            m_adaptiveFpsCap, fps)) {
+                sw->setFftFps(fps);
+            }
+        }));
+    connections.append(connect(
+        pan, &PanadapterModel::waterfallLineDurationReported,
+        sw, [this, sw](int lineDurationMs) {
+            if (applyThrottledDisplayReport(
+                    m_adaptiveThrottleActive,
+                    m_radioModel.adaptiveWfMsForCap(m_adaptiveFpsCap),
+                    lineDurationMs)) {
+                sw->setWfLineDuration(lineDurationMs);
+            }
+        }));
+    m_panDisplayStatusConnections.insert(panId, connections);
+
+    // Reclaimed pans already hold their latest status and do not necessarily
+    // emit a new report after reconnect. Seed the view immediately.
+    if (pan->average() >= 0) {
+        sw->setFftAverage(pan->average());
+    }
+    if (pan->weightedAverageKnown()) {
+        sw->setFftWeightedAvg(pan->weightedAverage());
+    }
+    if (applyThrottledDisplayReport(m_adaptiveThrottleActive,
+                                    m_adaptiveFpsCap, pan->fps())) {
+        sw->setFftFps(pan->fps());
+    }
+    if (applyThrottledDisplayReport(
+            m_adaptiveThrottleActive,
+            m_radioModel.adaptiveWfMsForCap(m_adaptiveFpsCap),
+            pan->waterfallLineDuration())) {
+        sw->setWfLineDuration(pan->waterfallLineDuration());
+    }
+}
+
 
 void MainWindow::wirePanadapter(PanadapterApplet* applet)
 {
@@ -2340,7 +2469,7 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
         // correct radio-reported range via the pendingDbm guard. (#3034)
         sw->setDbmRange(pan->minDbm(), pan->maxDbm());
 
-        wirePanReconcilers(applet, pan);
+        wirePanDisplayStatus(applet, pan);
     }
     syncTxWaterfallSliceToSpectrums();
 
@@ -3086,19 +3215,15 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
 
         // Persist all defaults to AppSettings
         auto& s = AppSettings::instance();
-        s.setValue(sw->settingsKey("DisplayFftAverage"),          "0");
-        s.setValue(sw->settingsKey("DisplayFftFps"),              "25");
         s.setValue(sw->settingsKey("DisplayFftFillAlpha"),        "0.70");
         s.setValue(sw->settingsKey("DisplayFftFillColor"),        "#00e5ff");
         s.setValue(sw->settingsKey("DisplayFftLineWidth"),        "2.0");
-        s.setValue(sw->settingsKey("DisplayFftWeightedAvg"),      "False");
         s.setValue(sw->settingsKey("DisplayFftHeatMap"),          "True");
         s.setValue(sw->settingsKey("DisplayWfColorScheme"),       "0");
         s.setValue(sw->settingsKey("DisplayWfColorGain"),         "50");
         s.setValue(sw->settingsKey("DisplayWfBlackLevel"),        "15");
         s.setValue(sw->settingsKey("DisplayWfAutoBlack"),         "True");
         s.setValue(sw->settingsKey("DisplayWfAutoBlackRadioSide"), "False");
-        s.setValue(sw->settingsKey("DisplayWfLineDuration"),      "100");
         s.setValue(sw->settingsKey("WaterfallBlankingEnabled"),   "False");
         s.setValue(sw->settingsKey("WaterfallBlankingThreshold"), "1.15");
         s.setValue(sw->settingsKey("WaterfallBlankingMode"),      "0");
@@ -3566,6 +3691,16 @@ void MainWindow::wirePanadapter(PanadapterApplet* applet)
                 << " xvtr=" << xvtrForBandSummary(bandName, xvtrs);
             clearSwrSweepForBandChange(-1, applet->panId(), bandName);
             m_bandSettings.setCurrentBand(bandName);
+            // A band recall makes the radio drop+re-create this pan's slice;
+            // mark the pan (positive band-recall intent) so onSliceAdded re-binds
+            // a KiwiSDR replacement onto the recreated slice instead of reverting
+            // to Flex (#4158). One-shot: consumed by the re-bind, or expired here
+            // so a recall on a non-Kiwi slice can't leave the marker stale.
+            m_kiwiRebind.noteBandRecall(applet->panId());
+            QTimer::singleShot(kKiwiSdrRebindGraceMs, this,
+                               [this, panId = applet->panId()]() {
+                m_kiwiRebind.clearBandRecall(panId);
+            });
             m_radioModel.sendCommand(
                 QString("display pan set %1 band=%2").arg(applet->panId()).arg(stackKey));
             QTimer::singleShot(300, this, [this, panId = applet->panId()]() {
@@ -4223,7 +4358,8 @@ void MainWindow::wireMeters()
             this, [this](float fwd, float swr) {
         if (m_radioModel.amplifier().present() && m_radioModel.amplifier().operate())
             return;
-        m_appletPanel->sMeterWidget()->setTxMeters(fwd, swr);
+        m_appletPanel->setStandardRadioMeterTxValues(
+            fwd, m_radioModel.meterModel().fwdPowerInstant(), swr);
 #ifdef HAVE_HIDAPI
         m_tmate2TxWatts = fwd;
         if (m_radioModel.transmitModel().isTransmitting()) {
@@ -4232,10 +4368,21 @@ void MainWindow::wireMeters()
         }
 #endif
     });
+    connect(&m_radioModel.meterModel(),
+            &MeterModel::directionalPowerMetersChanged,
+            this, [this](float fwd, float reflected, float swr,
+                         bool reflectedPowerMeasured) {
+        if (m_radioModel.amplifier().present()
+            && m_radioModel.amplifier().operate()) {
+            return;
+        }
+        m_appletPanel->setCrossNeedleDirectionalValues(
+            fwd, reflected, swr, reflectedPowerMeasured);
+    });
     connect(&m_radioModel.meterModel(), &MeterModel::micMetersChanged,
             m_appletPanel->sMeterWidget(), &SMeterWidget::setMicMeters);
     connect(&m_radioModel.transmitModel(), &TransmitModel::moxChanged,
-            m_appletPanel->sMeterWidget(), &SMeterWidget::setTransmitting);
+            m_appletPanel, &AppletPanel::setMeterTransmitting);
 
     // ── Tuner: MeterModel TX meters → TunerApplet gauges ────────────────
     // Use TGXL-specific meters when available (disambiguated from PGXL by handle)
@@ -4339,10 +4486,10 @@ void MainWindow::wireMeters()
             }
             // Ensure S-Meter is in TX mode when PGXL reports transmitting
             if (kvs.value("state").startsWith("TRANSMIT"))
-                m_appletPanel->sMeterWidget()->setTransmitting(true);
+                m_appletPanel->setMeterTransmitting(true);
             else if (kvs.contains("state") && !kvs.value("state").startsWith("TRANSMIT"))
-                m_appletPanel->sMeterWidget()->setTransmitting(false);
-            m_appletPanel->sMeterWidget()->setTxMeters(watts, swr);
+                m_appletPanel->setMeterTransmitting(false);
+            m_appletPanel->setMeterTxValues(watts, swr);
 #ifdef HAVE_HIDAPI
             m_tmate2TxWatts = watts;
             if (m_radioModel.transmitModel().isTransmitting()) {
@@ -4421,7 +4568,7 @@ void MainWindow::wireMeters()
                             && m_radioModel.amplifier().operate();
         m_appletPanel->txApplet()->setPowerScale(maxW, ampActive);
         m_appletPanel->tunerApplet()->setPowerScale(maxW, ampActive);
-        m_appletPanel->sMeterWidget()->setPowerScale(maxW, ampActive);
+        m_appletPanel->setMeterPowerScale(maxW, ampActive);
         m_appletPanel->healthApplet()->setPowerScale(maxW, ampActive);
     };
     connect(&m_radioModel.amplifier(), &AmpModel::presenceChanged, this, updatePowerScale);
@@ -4485,7 +4632,7 @@ void MainWindow::wireMeters()
         // exciter output when it's STANDBY (txMetersChanged already handles that
         // path, so we just stop overriding it here).
         if (m_radioModel.amplifier().present() && m_radioModel.amplifier().operate()) {
-            m_appletPanel->sMeterWidget()->setTxMeters(fwdPwr, swr);
+            m_appletPanel->setMeterTxValues(fwdPwr, swr);
 #ifdef HAVE_HIDAPI
             m_tmate2TxWatts = fwdPwr;
             if (m_radioModel.transmitModel().isTransmitting()) {

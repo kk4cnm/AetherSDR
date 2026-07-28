@@ -26,8 +26,10 @@ reaches parity.
 | TX: device mic + on-screen PTT | ported (`RECORD_AUDIO` manifest + runtime permission requested at startup) |
 | D-STAR / ThumbDV digital voice | off (`ENABLE_DSTAR=OFF`) — USB-serial dongle feature; vendored `smartsdr-dsp` uses `sys/termios.h`, absent in Android bionic |
 | SmartLink (WAN) | deferred — needs Opus for Android + Qt6Keychain replacement |
-| Client DSP strip / NR2 / RNNoise | compiles; FFTW absent → fallback FFT |
+| Client DSP strip / NR2 / RNNoise | compiles; uses real FFTW (cross-built, see below) since v26.7.4 sync |
 | DFNR / specbleach / BNR / RADE / MQTT | off (`ENABLE_*=OFF`) |
+| Copy Assist ASR (whisper.cpp) | off (`ENABLE_ASR=OFF`) — desktop feature for now; GUI code is `AETHER_ASR_ENABLED`-guarded so it compiles out cleanly |
+| Hermes-Lite 2 backend (WDSP) | **compiles and links** — plain Qt UDP + portable C11 WDSP. Untested on hardware; vendored WDSP hard-requires FFTW3, which is why FFTW is now mandatory |
 | DAX virtual audio, CAT serial ports, TCI | not applicable on Android |
 | MIDI, FlexControl, USB HID knobs, evdev | compiled out (no ALSA/hidapi/evdev) |
 
@@ -64,6 +66,25 @@ workspace root for the exact bootstrap):
   `build-tools;35.0.0`, `ndk;26.1.10909125`
 - OpenJDK 17 (Gradle/AGP are not happy on newer JDKs)
 
+FFTW3 must be cross-built once first (the vendored WDSP library — pulled
+in unconditionally since upstream v26.7.4 — hard-requires it at
+configure time). From the workspace root, with the fftw source unpacked
+in `android-deps/src/` (`brew fetch --build-from-source fftw` downloads
+a checksum-verified tarball into the Homebrew cache):
+
+```sh
+export SDK=/opt/homebrew/share/android-commandlinetools
+cd android-deps
+cmake -S src/fftw-3.3.11 -B build-fftw -GNinja \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+  -DCMAKE_TOOLCHAIN_FILE=$SDK/ndk/26.1.10909125/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-28 \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+  -DENABLE_THREADS=OFF -DBUILD_TESTS=OFF -DENABLE_NEON=ON \
+  -DCMAKE_INSTALL_PREFIX=$PWD/fftw3-android-arm64
+cmake --build build-fftw && cmake --install build-fftw
+```
+
 ```sh
 export JAVA_HOME=/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home
 export ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools
@@ -74,7 +95,9 @@ export ANDROID_SDK_ROOT=/opt/homebrew/share/android-commandlinetools
   -DANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.1.10909125 \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_RADE=OFF -DENABLE_MQTT=OFF -DENABLE_SPECBLEACH=OFF -DENABLE_DFNR=OFF \
-  -DENABLE_DSTAR=OFF
+  -DENABLE_DSTAR=OFF -DENABLE_ASR=OFF \
+  -DFFTW3_LIB=$HOME/aethersdr-port/android-deps/fftw3-android-arm64/lib/libfftw3.a \
+  -DFFTW3_INC=$HOME/aethersdr-port/android-deps/fftw3-android-arm64/include
 
 cmake --build build-android
 # APK lands in build-android/android-build/build/outputs/apk/
@@ -105,6 +128,8 @@ adb install -r build-android/android-build/build/outputs/apk/debug/android-build
 4. **Lifecycle** — handle `applicationStateChanged` (pause streams in
    background or hold a foreground service), audio focus, and a
    `WAKE_LOCK`/`keepScreenOn` toggle while connected.
-5. **FFTW for Android** — optional; NR2 currently uses the fallback FFT.
+5. **Hermes-Lite 2 on Android** — builds since the v26.7.4 sync (WDSP +
+   FFTW cross-build); needs on-hardware validation before calling it a
+   feature. FFTW itself is done (see Building).
 6. **Phase 2** — QML shell: connection page, slice tuning, PTT, S-meter,
    panadapter as a `QQuickRhiItem`.

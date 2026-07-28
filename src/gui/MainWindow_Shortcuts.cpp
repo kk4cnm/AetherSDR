@@ -531,7 +531,9 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         QToolTip::hideText();
     }
     if (obj == m_networkLabel && event->type() == QEvent::ToolTip) {
-        const QString tooltip = buildNetworkTooltip(m_radioModel);
+        const QString tooltip = buildNetworkTooltip(m_radioModel,
+                                                     m_adaptiveFpsCap,
+                                                     m_radioModel.pendingThrottleLift());
         m_networkLabel->setToolTip(tooltip);
         auto* helpEvent = static_cast<QHelpEvent*>(event);
         QToolTip::showText(helpEvent->globalPos(), tooltip, m_networkLabel);
@@ -549,6 +551,14 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         toggleConnectionDialog();
         return true;
     }
+#ifdef AETHER_ASR_ENABLED
+    if (obj == m_asrIndicator && event->type() == QEvent::MouseButtonPress) {
+        if (!m_asrIndicator->isEnabled()) return true;
+        showCopyAssist();           // toggles the docked Copy Assist panel
+        updateKeyerAvailability();  // refresh the indicator's active/available style
+        return true;
+    }
+#endif
     if (obj == m_cwxIndicator && event->type() == QEvent::MouseButtonPress) {
         if (!m_cwxIndicator->isEnabled()) return true;
         bool show = !m_cwxPanel->isVisible();
@@ -1025,9 +1035,12 @@ void MainWindow::registerShortcutActions()
 
         const double currentBw = sw->bandwidthMhz();
         // Clamp to limits so the final keypress snaps to exact min/max (#1458).
+        // Per-pan limits: the backend's reported range when it gave one, so a
+        // keyboard zoom stops where the receiver's data stops rather than at the
+        // FlexLib table's guess for an unrecognised model.
         const double newBw = std::clamp(currentBw * factor,
-                                        m_radioModel.minPanBandwidthMhz(),
-                                        m_radioModel.maxPanBandwidthMhz());
+                                        m_radioModel.panMinBandwidthMhz(s->panId()),
+                                        m_radioModel.panMaxBandwidthMhz(s->panId()));
         if (newBw == currentBw) return;  // already at the hard limit
 
         double newCenter = sw->centerMhz();
@@ -1306,7 +1319,7 @@ int MainWindow::fireShortcutAction(const QString& id, bool allowTx)
         return ShortcutFireNoDirectHandler;
     }
     a->handler();
-    return ShortcutFireOk;
+    return a->keysTx ? ShortcutFireTxOk : ShortcutFireOk;
 }
 
 void MainWindow::togglePanZoomModeForPan(const QString& panId, bool segmentZoom)

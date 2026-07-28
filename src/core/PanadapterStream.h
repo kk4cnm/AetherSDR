@@ -66,11 +66,14 @@ public:
 
     QHostAddress localAddress() const { return m_localAddress; }
     quint16 localPort() const { return m_localPort; }
-    bool    hasReceivedPackets() const { return m_hasReceivedPacket; }
+    bool    hasReceivedPackets() const { return m_hasReceivedPacket.load(); }
     bool    isRunning() const;
 
     // Update the dBm range used to scale incoming FFT bins for a specific stream.
     void setDbmRange(quint32 streamId, float minDbm, float maxDbm, bool waitForEcho = false);
+    // Abandon an in-flight client range request so the next radio-authoritative
+    // range can update the FFT decoder immediately (for example, on a band change).
+    bool cancelPendingDbmRange(quint32 streamId);
     // Update the ypixels used to scale FFT bin values for a specific stream.
     // The radio encodes FFT bins as pixel Y positions (0 = top/max_dbm,
     // ypixels-1 = bottom/min_dbm), NOT as 0-65535 uint16 range.
@@ -136,6 +139,7 @@ public:
         Bridge = 0,   // DAX virtual-audio bridge (macOS CoreAudio / PipeWire)
         Tci    = 1,   // TCI server audio clients (WSJT-X etc.)
         Rade   = 2,   // RADE digital-voice engine
+        Clock  = 3,   // AetherClock time-signal decode engine
     };
     static const char* daxConsumerName(DaxConsumer who);
 
@@ -188,6 +192,7 @@ public:
     // the network worker thread (the socket lives there). Persistence is the
     // caller's responsibility (NetworkSettings, on the GUI thread). (#3810)
     Q_INVOKABLE void setReceiveBufferSizeBytes(int bytes);
+
     // Kernel-granted SO_RCVBUF after the last apply (may be < requested when
     // capped by net.core.rmem_max). 0 until the first bind. Safe from any thread.
     int grantedReceiveBufferBytes() const { return m_grantedRcvBufBytes.load(); }
@@ -358,6 +363,7 @@ private:
     QElapsedTimer             m_orphanClock;   // monotonic source for lastSeenMs
     QUdpSocket*     m_socket{nullptr};
     quint16         m_localPort{0};
+
     QMap<quint32, QPair<float,float>> m_dbmRanges;  // streamId → (min, max)
     QMap<quint32, QPair<float,float>> m_pendingDbmRanges;  // streamId → pending echoed range
     QMap<quint32, int> m_yPixels;  // streamId → ypixels for FFT bin scaling
@@ -441,7 +447,10 @@ private:
     QHostAddress m_radioAddress;
     quint16      m_radioPort{0};
     QHostAddress m_localAddress;
-    bool         m_hasReceivedPacket{false};
+    // Written on the network thread (first datagram), read from the GUI thread via
+    // hasReceivedPackets() (the connect health watchdog). Atomic for the same
+    // reason RadioConnection::m_syntheticDemo is.
+    std::atomic<bool> m_hasReceivedPacket{false};
 
     // WAN UDP registration and keepalive
     QTimer*  m_wanRegisterTimer{nullptr};   // 50ms: "client udp_register" until first packet

@@ -7,6 +7,7 @@
 #include <QElapsedTimer>
 #include <QMutex>
 #include <QJsonObject>
+#include <QPoint>
 #include <QString>
 
 #ifdef HAVE_WEBSOCKETS
@@ -19,6 +20,7 @@ class QWebSocket;
 #include <vector>
 
 #include "IConnectionAutomation.h"  // complete type: inline setter calls asQObject()
+#include "MemoryTelemetry.h"
 
 class QLocalServer;
 class QLocalSocket;
@@ -28,8 +30,10 @@ class QTimer;
 namespace AetherSDR {
 
 class RadioModel;
+class SliceModel;
 class AudioEngine;
 class QsoRecorder;
+class AetherClockModel;
 
 // In-app, agent-first automation bridge (issue #3646, Phases 0-1).
 //
@@ -161,6 +165,14 @@ class QsoRecorder;
 //   drag <target> <dx> <dy>        -> synthesize press→move→release so resize
 //                                     grips / slider handles are provable end-to-
 //                                     end. `mouse` is an alias.
+//   dragAt <target> <x> <y> <dx> <dy> [modifiers]
+//                                  -> drag from a target-local point, optionally
+//                                     with control/meta/shift/alt held. This
+//                                     reaches modifier-only custom-widget paths.
+//   gesture begin <target> [x y]   -> hold a real left-button press open across
+//   gesture move <dx> <dy>            requests on the SAME client connection;
+//   gesture end [dx dy]               end/cancel/disconnect/error/timeout always
+//   gesture cancel|status             release it. Enables delayed-event proof.
 //   showMenu <target>              -> pop a QToolButton/QPushButton drop-down,
 //                                     posted onto the GUI loop with the window
 //                                     raised (crash-safe on backgrounded macOS).
@@ -236,6 +248,9 @@ public:
     // "no radio model" rather than crashing).
     void setRadioModel(RadioModel* model) { m_radioModel = model; }
     void setAudioEngine(AudioEngine* audio) { m_audioEngine = audio; }
+    // AetherClock model handle for "get clock"; may be null (reports
+    // "no clock model available" until the applet wires it).
+    void setClockModel(AetherClockModel* model);  // out-of-line: QPointer needs the complete type
     // QSO recorder handle for the record() verb (start/stop/status/path).
     void setQsoRecorder(QsoRecorder* rec) { m_qsoRecorder = rec; }
     // Real connection hook for the connect/disconnect/dialog verbs. The bridge
@@ -262,9 +277,29 @@ public:
     {
         m_sliceCenterLockHandler = std::move(handler);
     }
-    void setTuneHandler(std::function<QJsonObject(double)> handler)
+    // (sliceIdA, sliceIdB, on) — engage/dissolve the cross-pan Slice Link.
+    void setSliceLinkHandler(std::function<QJsonObject(int, int, bool)> handler)
+    {
+        m_sliceLinkHandler = std::move(handler);
+    }
+    // (sliceId) -> linked peer slice id, or -1. Feeds the slice snapshots.
+    void setSliceLinkPeerQuery(std::function<int(int)> query)
+    {
+        m_sliceLinkPeerQuery = std::move(query);
+    }
+    // (mhz, sliceId) — sliceId -1 targets the active slice.
+    void setTuneHandler(std::function<QJsonObject(double, int)> handler)
     {
         m_tuneHandler = std::move(handler);
+    }
+    void setTargetTuneHandler(std::function<QJsonObject(double)> handler)
+    {
+        m_targetTuneHandler = std::move(handler);
+    }
+    void setMemoryActivateHandler(
+        std::function<QJsonObject(int, const QString&)> handler)
+    {
+        m_memoryActivateHandler = std::move(handler);
     }
     void setReceiveSyncSnapshotHandler(std::function<QJsonObject()> handler)
     {
@@ -280,6 +315,13 @@ public:
     {
         m_txTimerSnapshotHandler = std::move(handler);
     }
+    // Read-only TCI route-state provider. MainWindow supplies this from the
+    // active session's TciServer so AutomationServer stays independent of the
+    // external protocol implementation.
+    void setTciRouteSnapshotHandler(std::function<QJsonObject()> handler)
+    {
+        m_tciRouteSnapshotHandler = std::move(handler);
+    }
 
     // Shared-secret auth (#3646). When set to a non-empty token, every verb
     // except `ping` must carry a matching `token` field or it's rejected —
@@ -292,10 +334,10 @@ public:
     QString authToken() const { return m_authToken; }
 
     // Runtime TX-automation gate (#3646). Mirrors AETHER_AUTOMATION_ALLOW_TX
-    // but operator-driven from Radio Setup → Network. Enabling arms the
-    // force-unkey watchdog; disabling force-unkeys immediately and disarms it.
-    // The env var still force-enables at start(); this lets the GUI toggle it
-    // live on a running bridge. Idempotent.
+    // but operator-driven from Radio Setup → Network. This is permission only:
+    // the force-unkey watchdog takes ownership when a TX-capable bridge action
+    // is accepted, never merely because the gate is enabled. The env var still
+    // force-enables at start(); this lets the GUI toggle it live. Idempotent.
     void setTxAllowed(bool allowed);
     bool txAllowed() const { return m_txAllowed; }
 
@@ -322,6 +364,8 @@ private slots:
     void onLogDrain();
 
 private:
+    friend class AutomationServerTestAccess;
+
     // Dispatch a single request line and return the response object. The socket
     // is needed for stateful per-client verbs (log subscribe/unsubscribe).
     QJsonObject handleLine(const QByteArray& line, QLocalSocket* sock);
@@ -351,7 +395,7 @@ private:
     QJsonObject saveWidgetGrab(QWidget* w, const QString& label,
                                const QString& path) const;
     QJsonObject doInvoke(const QString& target, const QString& action,
-                         const QString& value) const;
+                         const QString& value);
     // close <target>: close the target's top-level window (deferred to a clean
     // main-loop turn so a confirm-dialog closeEvent can't re-enter the socket
     // callback). Reaches the custom frameless title-bar close that `invoke …
@@ -360,7 +404,24 @@ private:
     // drag <target> <dx> <dy> | mouse <target> <dx> <dy>: synthesize a
     // press → move → release gesture so resize grips and slider handles are
     // provable end-to-end, not just via seed + read-back. (#3646 fidelity)
-    QJsonObject doDrag(const QString& target, const QString& value) const;
+    // Non-const: a drag can land on a TX-keying control, so these claim the
+    // transmission for the watchdog (markTxBridgeInitiated()). doWheel stays
+    // const — it drives no keying path.
+    QJsonObject doDrag(const QString& target, const QString& value);
+    QJsonObject doDragAt(const QString& target, const QString& value);
+    QJsonObject doWheel(const QString& target, const QString& value) const;
+    // Phaseful pointer gesture (#4353). The owning QLocalSocket stays connected
+    // between begin/move/end so unrelated bridge clients and queued model/radio
+    // events can interleave while a slider is genuinely down. A single global
+    // owner avoids contradictory synthetic left-button states. Every terminal
+    // and error path calls cancelGesture(), which sends the release before
+    // forgetting the state.
+    QJsonObject doGesture(const QString& action, const QString& target,
+                          const QString& value, QLocalSocket* sock);
+    void cancelGesture(QLocalSocket* owner, const QString& reason);
+    QJsonObject pointerSafetyError(const QWidget* widget,
+                                   const QString& target,
+                                   const QString& verb) const;
     // hover <target> [leave]: synthesize pointer hover over a widget so
     // hover-driven UI (e.g. the HGauge mouse-over value readout on the TX
     // SWR/power/ALC meters) is provable end-to-end. Bare form sends a
@@ -413,7 +474,7 @@ private:
     // "containerClose" and only the first is reachable by invoke). TX-gated on the
     // whole ancestor chain; disabled widgets and (with the power ceiling armed)
     // the RF/Tune power sliders are refused.
-    QJsonObject doClickAt(const QString& target, const QString& value) const;
+    QJsonObject doClickAt(const QString& target, const QString& value);
     // pan close <panId|index|active|all>: tear down a panadapter regardless of
     // how it was opened. Sends `display pan remove` AND `display panafall remove`
     // (the FlexLib-correct pair) so a panafall-created pan closes too. The
@@ -459,7 +520,21 @@ private:
     //                     waterfall the client view had already purged.
     //   streams reset   — clear the Layer-A orphan tally to re-baseline.
     QJsonObject doStreams(const QString& action);
+    // Cross-platform process + subsystem memory profiler (the `memprofile`
+    // verb — distinct from the `memory` frequency-recall verb). `start` samples
+    // on a bounded main-thread timer; `report`/`stop` return deltas, slopes, fit
+    // confidence, object-class growth, and raw samples on request.
+    QJsonObject doMemoryProfile(const QString& action, const QString& value);
+    QJsonObject memorySnapshot() const;
+    // Takes one snapshot, appends it to the bounded series, and returns it so
+    // callers that also need to return the snapshot don't take a second one.
+    QJsonObject recordMemorySample();
     QJsonObject doTci(const QString& action, const QString& value);
+#ifdef HAVE_WEBSOCKETS
+    void appendTciTrace(const QString& direction, const QString& text);
+    void sendTciSimText(const QString& text);
+    QJsonObject tciTraceSnapshot(int limit = 100) const;
+#endif
     QJsonObject doAudioCapture(const QString& action,
                                const QString& arg,
                                const QString& path) const;
@@ -490,6 +565,15 @@ private:
     QJsonObject doAtu(const QString& action);
 
     void forceUnkey(const char* reason);  // emergency all-stop (tune/mox/two-tone)
+    // Claim the in-progress transmission for the bridge, so onTxWatchdog()
+    // polices it. Call AFTER issuing a TX-capable action. Refuses to claim a
+    // transmission that predates the request — see m_txKeyedAtRequestStart.
+    void markTxBridgeInitiated();
+    void clearTxBridgeInitiated();
+    // Whether the radio is keyed AND this bridge is what keyed it. Gates the
+    // force-unkey on bridge stop / TX-permission revoke so neither one ends an
+    // operator, DAX, TCI, or beacon transmission that the bridge never started.
+    bool txBridgeOwnsCurrentTransmit() const;
 
     // Slice lifecycle/config actions, disconnected-only fixtures, and VFO tuning.
     // RX/config only; none of these key the transmitter.
@@ -497,7 +581,12 @@ private:
     // Disconnected-only GPS status fixtures for the 6000-series
     // hemisphere/minutes format and 8000-series decimal-degree format.
     QJsonObject doGps(const QString& action, const QString& format);
-    QJsonObject doTune(const QString& value);
+    QJsonObject doTune(const QString& value, const QString& id);
+    QJsonObject doTargetTune(const QString& value);
+    QJsonObject doMemory(const QString& action, const QString& arg);
+    // Demo fault injection (RFC #4288 #4): route a fault to backend->
+    // invokeExtension("sim", …). No-op error on non-Sim backends.
+    QJsonObject doSimFault(const QString& fault, const QString& arg);
     // Semantic transmitter keying (#3646 fidelity): `key ptt on|off` / `key mox`
     // route to RadioModel::setTransmit — the exact calls the space-bar PTT filter
     // and the mox_toggle shortcut make, but reachable headlessly. Keying is gated
@@ -529,7 +618,10 @@ private:
     // Fire a ShortcutManager action by id — the MIDI-controller dispatch path —
     // for actions with no key sequence and no menu entry (Band Zoom, Segment
     // Zoom, …). TX-keying ids stay behind AETHER_AUTOMATION_ALLOW_TX. (#4057)
-    QJsonObject doShortcut(const QString& id) const;
+    QJsonObject doShortcut(const QString& id);
+    // Inject a learned VFO Tune Knob MIDI CC value through the controller
+    // decoder. Automation-only, RX-only, and never persists a binding.
+    QJsonObject doMidi(const QString& action, const QString& value) const;
     // Resolve the top-level window a window-scoped verb (resize/window) acts on:
     // the target's window() if given, else the QMainWindow (or first visible real
     // top-level). Shared by doResize and doWindow.
@@ -560,9 +652,24 @@ private:
     QString       m_discoveryEntry;   // this instance's <pid>.json in m_discoveryDir
     QString       m_label;            // AETHER_AUTOMATION_LABEL (human instance tag)
     QHash<QLocalSocket*, QByteArray> m_buffers;  // per-client read buffer
+    struct PointerGesture {
+        QPointer<QLocalSocket> owner;
+        QPointer<QWidget> widget;
+        QString target;
+        QPoint startLocal;
+        QPoint globalStart;
+        QPoint offset;
+    };
+    PointerGesture m_pointerGesture;
+    QTimer* m_pointerGestureTimer{nullptr};
+    // Tool-call round trips can take several seconds each in an agent host.
+    // One minute leaves room for an independent request plus observation while
+    // still bounding an abandoned synthetic press.
+    static constexpr int kPointerGestureLeaseMs = 60000;
     QPointer<RadioModel> m_radioModel;           // for get(); may be null
     QPointer<AudioEngine> m_audioEngine;          // for get audio; may be null
     QPointer<QsoRecorder> m_qsoRecorder;          // for record(); may be null
+    QPointer<AetherClockModel> m_clockModel;      // for get clock; may be null
     IConnectionAutomation* m_connection = nullptr;  // connect/disconnect verbs
     QPointer<QObject> m_connectionGuard;            // auto-nulls when the impl is destroyed
     // Returns the connection hook only while its implementor is alive, so every
@@ -575,10 +682,17 @@ private:
     QPointer<QObject> m_connectionDialogHost;    // MainWindow show/hide invokables
     std::function<QJsonObject(const QString&)> m_sliceReceiveSourceHandler;
     std::function<QJsonObject(int, bool)> m_sliceCenterLockHandler;
-    std::function<QJsonObject(double)> m_tuneHandler;
+    std::function<QJsonObject(int, int, bool)> m_sliceLinkHandler;
+    std::function<int(int)> m_sliceLinkPeerQuery;
+    // linked peer slice id for a snapshot, or -1 (no link / no GUI query).
+    int sliceLinkPeerOf(const SliceModel* s) const;
+    std::function<QJsonObject(double, int)> m_tuneHandler;
+    std::function<QJsonObject(double)> m_targetTuneHandler;
+    std::function<QJsonObject(int, const QString&)> m_memoryActivateHandler;
     std::function<QJsonObject()> m_receiveSyncSnapshotHandler;
     std::function<QJsonObject()> m_kiwiSdrSnapshotHandler;
     std::function<QJsonObject()> m_txTimerSnapshotHandler;
+    std::function<QJsonObject()> m_tciRouteSnapshotHandler;
     QJsonObject m_lastWaveformCommand;
 
     // Agent station identity (#3646). The bridge sets the per-GUI-client station
@@ -606,12 +720,35 @@ private:
     QString m_tciSimProfile{QStringLiteral("wsjtx")};
     QString m_tciSimCloseReason;
     QElapsedTimer m_tciSimTimer;
+    struct TciTraceEntry {
+        quint64 seq{0};
+        qint64 elapsedMs{0};
+        QString direction;
+        QString text;
+    };
+    std::deque<TciTraceEntry> m_tciTrace;
+    bool m_tciTraceEnabled{false};
+    quint64 m_tciTraceSeq{0};
+    QElapsedTimer m_tciTraceClock;
+    static constexpr size_t kTciTraceMax = 512;
 #endif
 
-    // TX safety rails (active only when AETHER_AUTOMATION_ALLOW_TX is set).
+    // TX safety rails. The timer runs while automation TX is allowed, but the
+    // state machine arms only for an accepted automation-originated TX action.
     QTimer* m_txWatchdog{nullptr};
     qint64  m_txKeyedSinceMs{0};   // when continuous key-down started (0 = idle)
     int     m_txMaxKeyMs{20000};   // max continuous key time before force-unkey
+    // True while the transmission in progress was started BY THIS BRIDGE. The
+    // watchdog above is a runaway-script backstop, not an operator time limit,
+    // so it enforces only when this is set — otherwise it force-unkeys a human
+    // holding MOX mid-sentence.
+    bool    m_txBridgeInitiated{false};
+    // Transmitter state sampled at the top of handleLine(), before any verb
+    // handler runs. markTxBridgeInitiated() needs it: it is called after its
+    // action has been issued, and the key verbs update TransmitModel
+    // optimistically, so by then "keyed" cannot tell "this action keyed it"
+    // apart from "it was already up".
+    bool    m_txKeyedAtRequestStart{false};
     int     m_txMaxPower{-1};      // power-ceiling clamp for invoke (-1 = off)
     bool    m_txAllowed{false};    // AETHER_AUTOMATION_ALLOW_TX at start()
     bool    m_readOnly{false};     // observe-only gate (#4188 area 6)
@@ -644,6 +781,11 @@ private:
         bool complete{false};
     };
     std::vector<std::shared_ptr<ConnectWait>> m_connectWaits;
+
+    QTimer* m_memoryTimer{nullptr};
+    QElapsedTimer m_memoryClock;
+    MemoryTelemetrySeries m_memorySeries;
+    qint64 m_memoryLastSampleMs{-1};
 };
 
 } // namespace AetherSDR

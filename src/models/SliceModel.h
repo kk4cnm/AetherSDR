@@ -177,6 +177,11 @@ public:
     void setAudioMute(bool mute);
     void setExternalReceiveAudioReplacementMute(bool active,
                                                 bool restoreMute = false);
+    // A FLEX band-stack recall persists the slice's current audio_mute value.
+    // Temporarily restore the pre-replacement Flex mute before the band command
+    // so the KiwiSDR suppression mute is never written into the outgoing slot.
+    // The external receive presentation remains active throughout.
+    void prepareExternalReceiveAudioReplacementBandRecall(bool restoreMute);
     void setExternalReceiveAutoSquelch(bool on);
     bool externalReceiveReplacementActive() const
     {
@@ -269,6 +274,21 @@ public:
 signals:
     void letterChanged(const QString& newLetter);
     void frequencyChanged(double mhz);
+    // Emitted after a local setter has issued a frequency command. Unlike
+    // frequencyChanged, radio-status application does not emit this signal.
+    void frequencyCommandIssued(double mhz);
+    // Filter change originating from the OPERATOR, not from radio status.
+    // filterChanged() fires for both, so it must not be used to drive a command
+    // back at the radio; that would echo the radio's own state as a request
+    // (Principle II). Mirrors frequencyCommandIssued.
+    void filterCommandIssued(int lowHz, int highHz);
+    // Operator-issued AGC change. Distinct from agcModeChanged/
+    // agcThresholdChanged, which ALSO fire when radio status is applied —
+    // driving a command off those would echo the radio's own state back at it
+    // as a request (Principle II). Emitted only from setAgcMode()/
+    // setAgcThreshold(), and always carries BOTH values because a backend
+    // configuring a DSP AGC needs the pair to act on either.
+    void agcCommandIssued(const QString& mode, int thresholdDb);
     void panIdChanged(const QString& panId);
     void modeChanged(const QString& mode);
     void filterChanged(int low, int high);
@@ -360,6 +380,8 @@ public:
     // mirror back to the wire form without duplicating the mode list.
     static bool filterPolarityUsbFamily(const QString& mode);
     static bool filterPolarityLsbFamily(const QString& mode);
+    // Modes whose passband must straddle the carrier (AM/SAM/DSB/DRM/FM...).
+    static bool filterCarrierStraddlingFamily(const QString& mode);
 
 private:
     // Sign-guarded, idempotent (lo,hi)→(-hi,-lo) mirror of the stored filter
@@ -402,6 +424,7 @@ private:
     bool    m_qsk{false};
     bool    m_audioMute{false};
     bool    m_externalReceiveAudioReplacement{false};
+    bool    m_externalReceiveFlexAudioSuppressed{false};
     bool    m_externalReceiveAudioMute{false};
     float   m_externalReceiveAudioGain{70.0f};
     int     m_externalReceiveAudioPan{50};

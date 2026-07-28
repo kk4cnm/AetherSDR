@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace {
 
@@ -207,15 +208,27 @@ std::array<float, DssRenderer::kCols> smoothDssRow(
 
 } // namespace
 
+void DssRenderer::resetInputSmoothing()
+{
+    m_rawHistCount = 0;
+    // Also break the temporal IIR blend for the next row of each path. Zeroing
+    // the median-of-3 counters alone does not forget the previous *smoothed*
+    // row that pushRow/appendHistoryRow blend the new row against — that row was
+    // decoded under the old scale, so without this the first post-reset row is
+    // contaminated by it.
+    m_skipLiveTemporalBlendOnce = true;
+    m_skipHistoryTemporalBlendOnce = true;
+    resetHistorySmoothing();
+}
+
 void DssRenderer::clear()
 {
     m_head  = 0;
     m_count = 0;
     m_dirty = true;
-    m_rawHistCount = 0;
     m_historyWriteRow = 0;
     m_historyRowCount = 0;
-    resetHistorySmoothing();
+    resetInputSmoothing();
 }
 
 quint64 DssRenderer::fixedStorageBytes() const
@@ -249,12 +262,64 @@ DssRenderer::rowAt(int age) const
     return m_rows[idx];
 }
 
+DssRenderer::RowStats DssRenderer::rowStats(int age, float epsilonDb) const
+{
+    RowStats stats;
+    if (age < 0 || age >= m_count) {
+        return stats;
+    }
+
+    const auto& row = rowAt(age);
+    stats.minDbm = std::numeric_limits<float>::infinity();
+    stats.maxDbm = -std::numeric_limits<float>::infinity();
+    for (const float value : row) {
+        if (!std::isfinite(value)) {
+            continue;
+        }
+        stats.minDbm = std::min(stats.minDbm, value);
+        stats.maxDbm = std::max(stats.maxDbm, value);
+        ++stats.finiteBins;
+    }
+    if (stats.finiteBins == 0) {
+        stats.minDbm = 0.0f;
+        stats.maxDbm = 0.0f;
+        return stats;
+    }
+
+    epsilonDb = std::max(0.0f, epsilonDb);
+    int currentRun = 0;
+    float previous = 0.0f;
+    bool havePrevious = false;
+    for (const float value : row) {
+        if (!std::isfinite(value)) {
+            currentRun = 0;
+            havePrevious = false;
+            continue;
+        }
+        if (std::abs(value - stats.minDbm) <= epsilonDb) {
+            ++stats.minValueBins;
+        }
+        if (havePrevious && std::abs(value - previous) <= epsilonDb) {
+            ++currentRun;
+        } else {
+            currentRun = 1;
+        }
+        stats.longestFlatRunBins =
+            std::max(stats.longestFlatRunBins, currentRun);
+        previous = value;
+        havePrevious = true;
+    }
+    return stats;
+}
+
 void DssRenderer::pushRow(const QVector<float>& binsDbm)
 {
     const std::array<float, kCols> raw = resampledRawRow(binsDbm, -200.0f);
-    const std::array<float, kCols>* previous = m_count > 0
+    const std::array<float, kCols>* previous =
+        (m_count > 0 && !m_skipLiveTemporalBlendOnce)
         ? &m_rows[m_head]
         : nullptr;
+    m_skipLiveTemporalBlendOnce = false;
     const std::array<float, kCols> nr =
         smoothDssRow(raw, m_rawPrev1, m_rawPrev2, m_rawHistCount, previous);
 
@@ -311,13 +376,14 @@ void DssRenderer::appendHistoryRow(const QVector<float>& binsDbm,
     const std::array<float, kCols> raw = resampledRawRow(binsDbm, fallbackDbm);
     std::array<float, kCols> previousRow;
     const std::array<float, kCols>* previous = nullptr;
-    if (m_historyRowCount > 0) {
+    if (m_historyRowCount > 0 && !m_skipHistoryTemporalBlendOnce) {
         const qfloat16* src = m_historyRows.constData() + m_historyWriteRow * kCols;
         for (int c = 0; c < kCols; ++c) {
             previousRow[c] = static_cast<float>(src[c]);
         }
         previous = &previousRow;
     }
+    m_skipHistoryTemporalBlendOnce = false;
     const std::array<float, kCols> row =
         smoothDssRow(raw, m_historyRawPrev1, m_historyRawPrev2,
                      m_historyRawHistCount, previous);
@@ -550,4 +616,19 @@ void DssRenderer::rebuild(const QSize& px, int scaleStripPx, float floorDbm,
             p.drawLine(pts[c], pts[c + 1]);
         }
     }
+}
+
+QVector<bool> dssDepthVisibleSegments(const QVector<qreal>& yFrontToBack)
+{
+    if (yFrontToBack.size() < 2) {
+        return {};
+    }
+    QVector<bool> visible(yFrontToBack.size() - 1, true);
+    qreal silhouetteY = std::numeric_limits<qreal>::max();
+    for (qsizetype i = 1; i < yFrontToBack.size(); ++i) {
+        visible[i - 1] = yFrontToBack.at(i - 1) <= silhouetteY + 0.5
+            || yFrontToBack.at(i) <= silhouetteY + 0.5;
+        silhouetteY = std::min(silhouetteY, yFrontToBack.at(i - 1));
+    }
+    return visible;
 }

@@ -24,6 +24,7 @@ namespace AetherSDR {
 class MemoryBrowsePanel;
 class KiwiSdrManager;
 class SliceModel;
+class SpectrumOverlayWheelGuard;
 
 // Floating overlay menu anchored to the top-left of the SpectrumWidget.
 // Open by default; collapses to a single arrow button when closed.
@@ -57,7 +58,8 @@ public:
                              bool autoBlackRadioSide = false,
                              int renderMode = 0,
                              int dssFloorDepth = 6,
-                             int dssGain = 70);
+                             int dssGain = 70,
+                             const QColor& lineColor = QColor(0x00, 0xe5, 0xff));
     // Update only the radio-owned pan processing controls from live status.
     // Signal blockers keep status echoes from generating commands back to the
     // radio.
@@ -138,6 +140,7 @@ signals:
     void fftWeightedAverageChanged(bool on);
     void fftFillAlphaChanged(float alpha);
     void fftFillColorChanged(const QColor& color);
+    void fftLineColorChanged(const QColor& color);
     void fftHeatMapChanged(bool on);
     void showGridChanged(bool on);
     void freqGridSpacingChanged(int khz);
@@ -204,6 +207,7 @@ private:
     QPointer<PanadapterModel> m_panadapter;
     QMetaObject::Connection m_panRxAntennaConnection;
     QMetaObject::Connection m_panLoopConnection;
+    SpectrumOverlayWheelGuard* m_wheelGuard{nullptr};
     void setKiwiWaterfallControlMode(bool kiwiMode);
     void toggle();
     void updateLayout();
@@ -215,6 +219,7 @@ private:
     void buildDaxPanel();
     void syncDaxPanel();
     void toggleDisplayPanel();
+    void layoutDisplayPanel();
     void buildDisplayPanel();
     void toggleMemoryPanel();
     void buildMemoryPanel();
@@ -296,6 +301,8 @@ private:
     QLabel*      m_fillLabel{nullptr};
     QPushButton* m_fillColorBtn{nullptr};
     QColor       m_fillColor{0x00, 0xe5, 0xff};  // default cyan
+    QPushButton* m_lineColorBtn{nullptr};
+    QColor       m_lineColor{0x00, 0xe5, 0xff};  // default cyan (#4239)
     QPushButton* m_heatMapBtn{nullptr};
     QPushButton* m_showGridBtn{nullptr};
     QSlider*     m_lineWidthSlider{nullptr};

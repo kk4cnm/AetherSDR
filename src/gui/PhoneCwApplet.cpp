@@ -86,10 +86,6 @@ static constexpr const char* kLabelStyle =
 static constexpr const char* kDimLabelStyle =
     "QLabel { color: #8090a0; font-size: 10px; }";
 
-static constexpr const char* kInsetValueStyle =
-    "QLabel { font-size: 10px; background: #0a0a18; border: 1px solid #1e2e3e; "
-    "border-radius: 3px; padding: 1px 2px; color: #c8d8e8; }";
-
 static constexpr const char* kInsetEditStyle =
     "QLineEdit { font-size: 10px; background: #0a0a18; border: 1px solid #1e2e3e; "
     "border-radius: 3px; padding: 1px 2px; color: #c8d8e8; }"
@@ -708,6 +704,25 @@ void PhoneCwApplet::setTransmitModel(TransmitModel* model)
             idx = m_micProfileCombo->findText(current);
             if (idx >= 0) m_micProfileCombo->setCurrentIndex(idx);
         }
+        m_updatingFromModel = false;
+    });
+
+    // Host-modulating backend: PC is the only possible source, so show it and
+    // take the choice away rather than offering jacks that do not exist.
+    connect(m_model, &TransmitModel::hostModulationChanged, this, [this](bool on) {
+        if (!m_micSourceCombo) return;
+        m_updatingFromModel = true;
+        const QSignalBlocker blocker(m_micSourceCombo);
+        if (on) {
+            m_micSourceCombo->clear();
+            m_micSourceCombo->addItem(QStringLiteral("PC"));
+            m_micSourceCombo->setCurrentIndex(0);
+        }
+        m_micSourceCombo->setEnabled(!on);
+        m_micSourceCombo->setToolTip(
+            on ? tr("This radio is modulated by AetherSDR, so the PC microphone "
+                    "is the only input. The other sources are FlexRadio jacks.")
+               : QString());
         m_updatingFromModel = false;
     });
 

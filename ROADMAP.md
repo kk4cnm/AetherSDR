@@ -7,7 +7,7 @@ as direction changes.
 
 For *what shipped*, see [`CHANGELOG.md`](CHANGELOG.md).
 
-## Current cycle: post-v26.7.4.1
+## Current cycle: post-v26.8.2
 
 ### In flight
 
@@ -17,14 +17,47 @@ For *what shipped*, see [`CHANGELOG.md`](CHANGELOG.md).
   woven through `RadioModel`. FlexBackend owns the Flex wire objects
   and threads, and the Panadapter / Slice / Meter / Transmit / Amp / Tuner
   status+command paths decode behind the seam (RFC steps 2.1–2.4). The seam
-  now carries **three** backends — `FlexBackend`, `HL2Backend`, and the
-  synthetic `SimBackend` — which is what took it from a design to a proven
-  interface. Remaining: the versioned protocol (RFC step 3+) that lets a
-  headless `aetherd` and thin UI clients split apart; UI code still consumes
-  models directly, and that remains correct until it lands.
+  now carries **four** backends — `FlexBackend`, `HL2Backend`, `IcomCIV`, and
+  the synthetic `SimBackend` — which is what took it from a design to a proven
+  interface. Bringing a third vendor up on it in v26.8.2 was also the seam's
+  best audit to date: it surfaced a meter path that ignored its own unit,
+  receive-DSP controls with no verb behind them, and a capability conflating
+  "the host modulates" with "TX audio leaves through the seam". Remaining: the
+  versioned protocol (RFC step 3+) that lets a headless `aetherd` and thin UI
+  clients split apart; UI code still consumes models directly, and that remains
+  correct until it lands.
+- **Icom networked radios — early** — `IcomCIV` speaks CI-V inside the RS-BA1
+  UDP transport, brought up in v26.8.2 against a live **IC-705** (RX, scope,
+  transmit, and FT8 both decoding and spotting on PSK Reporter) and an
+  **IC-7300** (RX, scope and stability; transmit unverified). Only the IC-705
+  and IC-7300MK2 are `verified` against their own CI-V guides; an unknown model
+  gets no scope and no transmit rather than optimistic defaults. Remaining:
+  transmit confirmation beyond the 705, the per-model SET-menu item numbers the
+  MOD Input check needs, audio gain/mute/pan, VOX and CW break-in, and the
+  once-a-second FT8 transmit dropout still under investigation.
+- **Hermes-Lite 2 — from experimental to supported** — the backend arrived
+  experimental in v26.7.4 and grew most of the way to parity in v26.8.1: four
+  independent receivers, the SSB voice chain, CW/RTTY decoding and the QSO
+  recorder, AX.25 packet with an on-air-proven mailbox, band switching with
+  hardware filters and preamp, host-side memory channels, per-MAC operating-state
+  restore with per-band drive/LNA memory, live connection health and a Radio
+  Health dialog. v26.8.2 added **manual notch filters** and **manual frequency
+  calibration**, DC-blocked the AM/SAM audio, and unfroze the first connect.
+  **The experimental → supported call itself is still open**; what remains
+  before making it is wider mode coverage, panadapter/waterfall parity with the
+  Flex path, and hardening the raw-IQ DSP chain (HL2 ships raw IQ, so the client
+  does all the tune/decimate/demodulate work a Flex does on-radio). Two known
+  costs are on the record rather than hidden: the **+64 ms of RX latency** the
+  8192-tap notch filter buys unconditionally, and the 0.6–1.1 s UI stall when a
+  pan-bandwidth change crosses a sample-rate boundary and rebuilds every
+  receiver.
 - **AppSettings nested-JSON refactor** — ~460 flat call sites today;
   the new pattern is one nested-JSON value per feature (Principle V).
-  Mechanical migration tooling is the prerequisite work.
+  The storage layer moved to SQLite and the scoped feature-document store,
+  BandStack and memory-bank fold-ins, and the Settings Browser all shipped in
+  v26.8.1 (RFC #4603, PRs 1–6). New radio-scoped configuration lands as
+  versioned feature documents in `radio_settings`; the remaining work is
+  migrating the legacy flat keys feature-by-feature.
 - **TX DSP chain visual rebuild** — stage-per-applet chain with the
   visual `CHAIN` widget as the primary entry point.
 - **Flathub submission** — the AppStream metainfo and manpage landed in
@@ -32,15 +65,10 @@ For *what shipped*, see [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Queued (next cycle)
 
-- **Hermes-Lite 2 — from experimental to supported** — an experimental backend
-  landed in v26.7.4 (receive, transmit, TCI/WSJT-X, operator-controllable span,
-  per-radio nicknames), but HL2 is not a supported radio family yet. Getting
-  there means wider mode coverage, panadapter/waterfall parity with the Flex
-  path, and hardening the raw-IQ DSP chain (HL2 ships raw IQ, so the client does
-  all the tune/decimate/demodulate work a Flex does on-radio).
 - **KiwiSDR follow-ups** — WebSDR / OpenWebRX support on top of the shipped
   public-receiver browser (per-receiver passwords, idle-release, and
-  waterfall polish already landed in v26.7.2).
+  waterfall polish landed in v26.7.2; warm audio through TX and the
+  resume-after-TX-delay option in v26.8.1).
 - **Extended region band plans** — DXCC entities outside IARU R1/R2/R3.
 - **macOS VirtualAudioBridge audit** ([#2940](https://github.com/aethersdr/AetherSDR/issues/2940))
   — focused security review of the macOS shared-memory audio bridge.
@@ -109,6 +137,88 @@ Substantial features requested on the
 Highlights from the last 30 days — full list in
 [`CHANGELOG.md`](CHANGELOG.md):
 
+- **Networked Icom radios** — `IcomCIV`, a fourth backend on the aetherd seam,
+  speaking CI-V inside the RS-BA1 UDP transport. Brought up on a live IC-705
+  (RX, 30 sweeps/s scope, RX audio, TCI RX, transmit, FT8 decoding and spotting)
+  and an IC-9700. Receive handedness certified against WWV (v26.8.2).
+- **Hermes-Lite 2 — manual notch filters** — right-click a signal on the
+  panadapter to add, move or resize a notch, driving a WDSP notch database that
+  was vendored but never declared. 33.4 dB measured off-air on WWV; costs a
+  constant +64 ms of RX latency, stated rather than implied (v26.8.2).
+- **Hermes-Lite 2 — manual frequency calibration** — a Calibration page, a
+  `freqcal` bridge verb, and one per-radio ppb correction that covers every band
+  and both oscillators, stored per MAC so two HL2s never share a number
+  (v26.8.2).
+- **Hermes-Lite 2 — the first connect no longer freezes the app** — 21–82 s of
+  frozen UI became a live one, and the FFTW wisdom that cost is spent on now
+  actually persists, so it is paid once per machine instead of once per launch
+  (v26.8.2).
+- **SPE Expert amplifiers** — 1.3K-FA / 1.5K-FA / 2K-FA over serial or ser2net
+  TCP (raw or telnet), with gauges, telemetry, the front-panel keystrokes, and
+  an RFC 2217 power-ON pulse that works over the network (v26.8.2).
+- **Three new spot and schedule overlays** — N1MM+/DXLog contest bandmap spots
+  with dupe/mult/CQ/bust status over the SmartSDR-compatible UDP feed, the EiBi
+  shortwave broadcast schedule with full code resolution, and the KiwiSDR DX
+  Community database as an opt-in click-to-tune layer (v26.8.2).
+- **US 60m follows the FCC Report & Order** effective 13 Feb 2026 — the
+  5351.5–5366.5 kHz segment added at 9.15 W ERP with its own colour, the retired
+  5358.5 kHz channel removed, and the band edges corrected so the top of the
+  5405 kHz channel resolves as 60m at all (v26.8.2).
+- **The local iambic keyer keys to spec** — absolute-grid element scheduling and
+  sample-accurate sidetone edges take a 30 WPM setting from 26.26 to 29.998 WPM
+  on real hardware, and Mode B stops dropping the trailing element on a clean
+  simultaneous release (v26.8.2).
+- **MNR reaches the attenuation it advertised** — 4.54 dB → 24.4 dB on
+  stationary noise, after fixing the minimum-statistics estimator, the
+  decision-directed recurrence and a strength blend that fed back into the
+  adaptive state (v26.8.2).
+- **K4-style mini-pan** — a detachable ±5/±10 kHz scope on the active VFO that
+  floats over other applications and keeps working in Minimal Mode (v26.8.2).
+- **Copy Assist survives an unusable GPU** — a Vulkan stack that enumerates
+  devices but cannot create one took the app down on the *second* attempt; a
+  per-session failure latch and a one-shot CPU retry replace the crash, and the
+  UI now says a fallback happened instead of naming a GPU running nothing
+  (v26.8.2).
+- **Hermes-Lite 2 — four independent receivers** — up to four DDCs behind the
+  single ADC, each with its own NCO, slice, WDSP channel, audio, S-meter and
+  panadapter, added and closed at runtime. Sample rate, LNA gain, band and
+  antenna are shared because the hardware shares them; four receivers are
+  available through 192 kHz and three at 384 kHz on one 100BASE-T link
+  (v26.8.1).
+- **Hermes-Lite 2 — the SSB voice chain, decoders and packet** — the EQ applet,
+  PROC, TX cut filters, eSSB and the ALC/compression meters are wired to the
+  host modulator; CW and RTTY decoding and the QSO recorder work; and AX.25
+  packet (APRS, KISS TNC, terminal, mailbox) transmits, proven on the air with
+  two complete BBS sessions on 21.100 MHz (v26.8.1).
+- **Hermes-Lite 2 — band switching, memory and operating-state restore** —
+  band buttons, hardware LPF/BPF filters and the hardware preamp reach the
+  radio; host-side memory channels work on any radio with no slots of its own;
+  and frequency, mode, passband and span are restored per MAC, with TX drive
+  and LNA gain remembered per band (v26.8.1).
+- **Client settings on SQLite** — transactional saves, startup integrity checks,
+  verified backups with quarantine and restore, credentials moved to the OS
+  keychain, a `--config` command line for repairing a store that blocks startup,
+  per-radio versioned feature documents, and a Settings Browser for reading and
+  editing the whole store (RFC #4603, v26.8.1).
+- **Capability-gated UI** — every Flex-only surface hides itself on a backend
+  that has no such thing, declared by concept rather than by radio family:
+  profiles, DAX, the ATU chain, SmartLink, GPS presence, PA supply voltage, and
+  the DVK button's SmartSDR+ entitlement (v26.8.1).
+- **Qt 6.8.3 LTS everywhere** — the source floor, the CI image, both AppImage
+  architectures, the Windows installer and both macOS legs are now the same
+  pinned Qt, so one version covers every check and every artifact. The Apple
+  Silicon DMG stopped taking whatever Homebrew was publishing, the ARM AppImage
+  stopped silently falling back to CPU spectrum drawing, and the Linux AppImage
+  runs natively on Wayland (v26.8.1).
+- **The Intel Mac DMG reaches older hardware** — it declares and honours a
+  macOS 12.0 floor, down from 13.0. The speech-to-text runtime is published at a
+  macOS 15.5 floor and one library's floor becomes the whole bundle's, so
+  speech-to-text is dropped from the Intel artifact to get there; Apple Silicon
+  keeps it (v26.8.1).
+- **TCI PTT keys the slice the client asked for** — the fault two operators
+  reported across v26.7.3 and v26.7.4 was four separate defects in one path;
+  receiver numbers are also now stable across a slice recreate, and the routing
+  decision is logged (v26.8.1).
 - **TCI rig control hotfix** — a `vfo:` SET confirmed the *pre-tune* frequency,
   so WSJT-X concluded the radio had never moved and failed every band change,
   and relative tuning from a control surface oscillated instead of walking.

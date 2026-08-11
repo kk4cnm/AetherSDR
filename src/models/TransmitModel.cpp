@@ -66,6 +66,7 @@ void TransmitModel::applyChanges(const TransmitDelta& d)
     bool micChanged = false;
     bool phoneChanged = false;
     bool filterCutoffChanged = false;
+    bool cwPitchChanged_ = false;
 
     // ── Core transmit ──
     // rf_power / tune_power emit inline (like max_power_level below): the
@@ -114,7 +115,7 @@ void TransmitModel::applyChanges(const TransmitDelta& d)
 
     // ── CW ──
     phoneChanged |= assign(d.cwSpeed, m_cwSpeed);
-    phoneChanged |= assign(d.cwPitch, m_cwPitch);
+    if (assign(d.cwPitch, m_cwPitch)) { phoneChanged = true; cwPitchChanged_ = true; }
     phoneChanged |= assign(d.cwBreakIn, m_cwBreakIn);
     phoneChanged |= assign(d.cwDelay, m_cwDelay);
     phoneChanged |= assign(d.cwSidetone, m_cwSidetone);
@@ -147,6 +148,7 @@ void TransmitModel::applyChanges(const TransmitDelta& d)
     if (micChanged) emit micStateChanged();
     if (phoneChanged) emit phoneStateChanged();
     if (filterCutoffChanged) emit txFilterCutoffChanged(m_txFilterLow, m_txFilterHigh);
+    if (cwPitchChanged_) emit cwPitchChanged(m_cwPitch);
 
     // ── ATU (own emit; model owns the enum parse) ──
     {
@@ -253,6 +255,14 @@ void TransmitModel::setHostModulation(bool on)
         emit micInputListChanged();
     }
     emit hostModulationChanged(on);
+}
+
+void TransmitModel::setHasTuner(bool present)
+{
+    if (m_hasTuner == present)
+        return;
+    m_hasTuner = present;
+    emit hasTunerChanged(present);
 }
 
 void TransmitModel::setRfPower(int power)
@@ -379,11 +389,13 @@ void TransmitModel::setTransmitting(bool tx)
 void TransmitModel::atuStart()
 {
     emit commandReady("atu start");
+    emit atuCommandIssued(true);
 }
 
 void TransmitModel::atuBypass()
 {
     emit commandReady("atu bypass");
+    emit atuCommandIssued(false);
 }
 
 void TransmitModel::setAtuMemories(bool on)
@@ -450,6 +462,12 @@ void TransmitModel::setMicLevel(int level)
         m_micLevel = level;
         emit micStateChanged();  // PhoneCwApplet's mic slider binds to this
     }
+    // Unconditional, like commandReady below and deliberately NOT inside the
+    // changed test: a host-modulating backend is the authority on its own gain
+    // and may have been reset (reconnect, radio swap) while m_micLevel stood
+    // still. Re-asserting a value the seam already holds is free; failing to
+    // re-assert one it has lost leaves the operator's slider lying.
+    emit micLevelCommandIssued(level);
     emit commandReady(QString("transmit set miclevel=%1").arg(level));
 }
 
@@ -465,6 +483,7 @@ void TransmitModel::setSpeechProcessorEnable(bool on)
     // incremental status — only in the initial full dump on connect.
     m_speechProcEnable = on;
     emit micStateChanged();
+    emit speechProcessorCommandIssued(m_speechProcEnable, m_speechProcLevel);
     emit commandReady(QString("transmit set speech_processor_enable=%1").arg(on ? 1 : 0));
 }
 
@@ -475,7 +494,30 @@ void TransmitModel::setSpeechProcessorLevel(int level)
     level = qBound(0, level, 2);
     m_speechProcLevel = level;
     emit micStateChanged();
+    emit speechProcessorCommandIssued(m_speechProcEnable, m_speechProcLevel);
     emit commandReady(QString("transmit set speech_processor_level=%1").arg(level));
+}
+
+bool TransmitModel::applySpeechProcessorState(bool on, int level)
+{
+    level = qBound(0, level, 2);
+    if (m_speechProcEnable == on && m_speechProcLevel == level) {
+        return false;
+    }
+    m_speechProcEnable = on;
+    m_speechProcLevel = level;
+    emit micStateChanged();
+    return true;
+}
+
+bool TransmitModel::applyMicSelectionState(const QString& input)
+{
+    if (input.isEmpty() || m_micSelection == input) {
+        return false;
+    }
+    m_micSelection = input;
+    emit micStateChanged();
+    return true;
 }
 
 void TransmitModel::setDax(bool on)
@@ -522,6 +564,7 @@ void TransmitModel::setVoxEnable(bool on)
     m_voxEnable = on;  // optimistic update — radio may not echo
     emit phoneStateChanged();
     emit commandReady(QString("transmit set vox_enable=%1").arg(on ? 1 : 0));
+    emit voxCommandIssued(on, m_voxLevel, m_voxDelay);
 }
 
 void TransmitModel::setVoxLevel(int level)
@@ -530,6 +573,7 @@ void TransmitModel::setVoxLevel(int level)
     m_voxLevel = level;
     emit phoneStateChanged();
     emit commandReady(QString("transmit set vox_level=%1").arg(level));
+    emit voxCommandIssued(m_voxEnable, m_voxLevel, m_voxDelay);
 }
 
 void TransmitModel::setVoxDelay(int delay)
@@ -538,6 +582,7 @@ void TransmitModel::setVoxDelay(int delay)
     m_voxDelay = delay;
     emit phoneStateChanged();
     emit commandReady(QString("transmit set vox_delay=%1").arg(delay));
+    emit voxCommandIssued(m_voxEnable, m_voxLevel, m_voxDelay);
 }
 
 void TransmitModel::setMicBoost(bool on)
@@ -586,24 +631,41 @@ void TransmitModel::setDexpLevel(int level)
     emit commandReady(QString("transmit set compander_level=%1").arg(level));
 }
 
+// The TX passband setters all take the same shape: bound, adopt OPTIMISTICALLY,
+// announce the intent, and emit the Flex verb.
+//
+// The optimistic adoption is what makes these work on a radio that modulates on
+// this host. A Flex echoes `transmit` status and applyStatus() writes the state
+// back, so the local fields could be left alone; a host-modulating backend never
+// echoes anything, so without this the operator drags the low-cut slider, the
+// verb goes nowhere, no status returns, and the control springs back — while the
+// modulator keeps whatever passband its mode default gave it. Same pattern, and
+// the same reason, as setSpeechProcessorEnable() above.
+//
+// txFilterCommandIssued is OPERATOR INTENT only — applyStatus() must never emit
+// it — so a backend can bind to it without echoing radio state back as a fresh
+// command (Principle II).
 void TransmitModel::setTxFilterLow(int hz)
 {
-    hz = qBound(0, hz, 10000);
-    emit commandReady(QString("transmit set filter_low=%1 filter_high=%2")
-                      .arg(hz).arg(m_txFilterHigh));
+    setTxFilter(qBound(0, hz, 10000), m_txFilterHigh);
 }
 
 void TransmitModel::setTxFilterHigh(int hz)
 {
-    hz = qBound(0, hz, 10000);
-    emit commandReady(QString("transmit set filter_low=%1 filter_high=%2")
-                      .arg(m_txFilterLow).arg(hz));
+    setTxFilter(m_txFilterLow, qBound(0, hz, 10000));
 }
 
 void TransmitModel::setTxFilter(int lowHz, int highHz)
 {
     lowHz = qBound(0, lowHz, 9950);
     highHz = qBound(lowHz + 50, highHz, 10000);
+    if (m_txFilterLow != lowHz || m_txFilterHigh != highHz) {
+        m_txFilterLow = lowHz;
+        m_txFilterHigh = highHz;
+        emit txFilterCutoffChanged(m_txFilterLow, m_txFilterHigh);
+        emit phoneStateChanged();
+    }
+    emit txFilterCommandIssued(lowHz, highHz);
     emit commandReady(QString("transmit set filter_low=%1 filter_high=%2")
                       .arg(lowHz).arg(highHz));
 }
@@ -626,6 +688,7 @@ void TransmitModel::setCwPitch(int hz)
     if (m_cwPitch != hz) {
         m_cwPitch = hz;  // update local cache so rapid steppers accumulate
         emit phoneStateChanged();
+        emit cwPitchChanged(hz);
     }
     emit commandReady(QString("cw pitch %1").arg(hz));
 }

@@ -182,6 +182,17 @@ public:
     // the operator to select an input that silently transmits nothing.
     void setHostModulation(bool on);
     [[nodiscard]] bool hostModulation() const { return m_hostModulation; }
+
+    // Whether the connected radio has an antenna tuner at all
+    // (RadioCapabilities::hasTuner), pushed down by RadioModel on connect for
+    // the same reason hostModulation is: the capability lives on the backend and
+    // the widgets that need it only see this model.
+    //
+    // Defaults TRUE so nothing changes for a Flex, and so a widget that reads it
+    // before any backend has reported stays in the pre-existing state rather
+    // than briefly greying out a control that does exist.
+    void setHasTuner(bool present);
+    [[nodiscard]] bool hasTuner() const { return m_hasTuner; }
     void setTunePower(int power);
     void setTuneMode(const QString& mode);
     void startTune(PttSource source = PttSource::Tune);
@@ -228,6 +239,24 @@ public:
     void setMicAcc(bool on);
     void setSpeechProcessorEnable(bool on);
     void setSpeechProcessorLevel(int level);
+    // Adopt speech-processor state that did NOT come from this model — the
+    // client-side compressor on a host-modulating backend, where PROC drives our
+    // own DSP and the operator can also reach that same compressor through the
+    // Aetherial strip.
+    //
+    // Updates the state and notifies the UI WITHOUT emitting commandReady, which
+    // is the whole point: the setters above are operator INTENT and must stay
+    // that way (Principle II), so an observer that mirrored engine state back
+    // through them would echo our own state as a fresh command and, with the
+    // strip on the other end, oscillate. Returns true when something changed.
+    bool applySpeechProcessorState(bool on, int level);
+    // Adopt a mic selection the OPERATOR did not choose — a radio whose input
+    // this client cannot select forces the source, and the model must agree
+    // with what the UI is showing. Like applySpeechProcessorState this updates
+    // state WITHOUT emitting commandReady, because pushing a forced value back
+    // out as operator intent is how a capability turns into a command nobody
+    // issued. Returns true when something changed.
+    bool applyMicSelectionState(const QString& input);
     void setDax(bool on);
     void setSbMonitor(bool on);
     void setMonGainSb(int gain);
@@ -274,6 +303,7 @@ signals:
     void moxCommandIssued(bool on);
     void tuneCommandIssued(bool on);
     void hostModulationChanged(bool on);
+    void hasTunerChanged(bool present);
     void tuneChanged(bool tuning);
     void moxChanged(bool mox);
     // Fires whenever m_transmitting changes — from setMox() (optimistic edge)
@@ -291,6 +321,37 @@ signals:
     // instead of phoneStateChanged for slot work that should NOT run on
     // every VOX/CW/dexp/mic-boost/etc. status update.
     void txFilterCutoffChanged(int lowHz, int highHz);
+    // The operator asked for a TX passband. OPERATOR INTENT ONLY — applyStatus()
+    // never emits this — so a backend that modulates on this host can bind to it
+    // and drive its own modulator without echoing radio state back as a command
+    // (Principle II). Distinct from txFilterCutoffChanged, which also fires when
+    // a Flex's own status moves the value.
+    void txFilterCommandIssued(int lowHz, int highHz);
+    // The operator moved the MIC slider. OPERATOR INTENT ONLY, for exactly the
+    // reason txFilterCommandIssued carries above: applyStatus() must never emit
+    // this, or a Flex's own `transmit set miclevel=` echo would be handed
+    // straight back to the seam as a fresh command.
+    void micLevelCommandIssued(int level);
+    // The operator moved PROC or its NOR/DX/DX+ level. OPERATOR INTENT ONLY,
+    // for the same reason as txFilterCommandIssued — and here the distinction is
+    // what protects the operator's own work: the client compressor these drive is
+    // shared with the Aetherial strip, and its NOR/DX/DX+ presets overwrite the
+    // strip's threshold/ratio/makeup. Keying the preset write off micStateChanged
+    // instead would let the strip's OWN enable toggle read as an off->on
+    // transition and overwrite the settings the operator had just dialled in
+    // there. applySpeechProcessorState() never emits this.
+    void speechProcessorCommandIssued(bool on, int level);
+    // VOX and the ATU, for the same reason the speech processor has one: the
+    // wire text above IS the command on a Flex and reaches nothing anywhere
+    // else, so a non-Flex backend needs the intent as a signal. Emitted from
+    // the set* / atu* methods only, never from applyStatus() — echoing a status
+    // back at the radio as a command is how a control starts fighting itself.
+    void voxCommandIssued(bool on, int level, int delayMs);
+    void atuCommandIssued(bool start);
+    // Fires only when cwPitch actually changes. Use this instead of
+    // phoneStateChanged for slot work that should NOT run on every
+    // VOX/CW/dexp/mic-boost/etc. status update (e.g. #4423 KiwiSDR BFO sync).
+    void cwPitchChanged(int hz);
     void apdStateChanged();
     void apdSamplerChanged(const QString& txAnt);
     void apdEqualizerResetReceived();
@@ -338,6 +399,7 @@ private:
     // Transmit state
     int    m_rfPower{100};
     bool   m_hostModulation{false};
+    bool   m_hasTuner{true};
     int    m_tunePower{10};
     bool   m_tune{false};
     bool   m_mox{false};

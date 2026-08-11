@@ -24,6 +24,8 @@ namespace AetherSDR {
 class CopyAssistSettingsDialog : public PersistentDialog {
     Q_OBJECT
 public:
+    static constexpr int kGpuDiscoveryPending = -2;
+
     explicit CopyAssistSettingsDialog(QWidget* parent = nullptr);
 
     // Model tier selector (id + human label).
@@ -32,11 +34,13 @@ public:
     void setTierLabel(const QString& id, const QString& label);
     QString currentTier() const;
 
-    // Compute-device selector — shown only when the controller finds a GPU.
+    // Compute-device selector — disabled during discovery and hidden on CPU-only hosts.
     void addGpuDevice(int index, const QString& name);
+    void clearGpuDevices();
     void setCurrentGpu(int index);
     int currentGpu() const;
     void setGpuSelectorVisible(bool on);
+    void setGpuSelectorEnabled(bool on);
 
     // Transcription-language selector (code + human label, e.g. "en"/"English").
     // The controller populates it from the whisper backend's supported list;
@@ -72,6 +76,12 @@ public:
     void setSpeakerThreshold(int percent);
     int speakerThreshold() const;
 
+    // Boundary-word recovery / segment overlap (RFC #4821): milliseconds of
+    // trailing audio carried across a forced segment cut so a word split at the
+    // boundary isn't lost. 0 = off (the default). Opt-in.
+    void setBoundaryOverlapMs(int ms);
+    int boundaryOverlapMs() const;
+
 signals:
     void tierChanged(const QString& tierId);
     void gpuChanged(int index);
@@ -83,6 +93,7 @@ signals:
     void labelSpeakersToggled(bool on);
     void browseSpeakerModelRequested();
     void speakerThresholdChanged(int percent);
+    void boundaryOverlapChanged(int ms);
 
 private:
     QComboBox* m_tier = nullptr;
@@ -101,6 +112,8 @@ private:
     QPushButton* m_spkBrowse = nullptr;
     QSlider* m_spkThreshold = nullptr;
     QLabel* m_spkThresholdValue = nullptr;
+    QSlider* m_overlap = nullptr;
+    QLabel* m_overlapValue = nullptr;
 };
 
 } // namespace AetherSDR

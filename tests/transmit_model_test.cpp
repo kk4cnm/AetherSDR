@@ -1,4 +1,5 @@
 #include "models/TransmitModel.h"
+#include "core/backends/TransmitDelta.h"
 #include "core/ClientQuindarTone.h"
 
 #include <QCoreApplication>
@@ -43,6 +44,46 @@ int main(int argc, char** argv)
                      [&blockedMessages](const QString& message) { blockedMessages.append(message); });
 
     bool ok = true;
+
+    // ---- forced mic selection is ADOPTED, never commanded --------------------
+    //
+    // On a radio whose input a client cannot choose (an Icom picks its own from
+    // its MOD Input menu), the Phone applet collapses the source list to PC.
+    // The model has to agree with what the screen shows — it did not, and
+    // reported MIC through a whole session, which made radiocert warn that
+    // transmit audio capture was not running on a radio where that is simply
+    // not how audio gets there.
+    //
+    // But the fix must NOT go through setMicSelection(): that is the operator
+    // intent path, and pushing a capability-forced value back out as intent is
+    // how a capability turns into a command nobody issued (Principle II). So
+    // this asserts the state changed AND that nothing went on the wire.
+    commands.clear();
+    ok &= expect(tx.micSelection() == QStringLiteral("MIC"),
+                 "the model starts on MIC, as a Flex would report");
+    ok &= expect(tx.applyMicSelectionState(QStringLiteral("PC")),
+                 "adopting a forced selection reports that it changed something");
+    ok &= expect(tx.micSelection() == QStringLiteral("PC"),
+                 "and the model now agrees with the screen");
+    ok &= expect(commands.isEmpty(),
+                 "WITHOUT emitting a command — a forced value is not operator intent");
+
+    ok &= expect(!tx.applyMicSelectionState(QStringLiteral("PC")),
+                 "re-adopting the same value is a no-op");
+    ok &= expect(!tx.applyMicSelectionState(QString()),
+                 "and an empty selection is refused rather than stored");
+    ok &= expect(tx.micSelection() == QStringLiteral("PC"),
+                 "so the last good value survives");
+    ok &= expect(commands.isEmpty(), "none of which touched the wire");
+
+    // The operator's own path still commands, so adopting did not break it.
+    tx.setMicSelection(QStringLiteral("MIC"));
+    ok &= expect(!commands.isEmpty(),
+                 "the OPERATOR choosing a source still emits a command");
+    // Leave the recorder clean: the assertions below compare `commands`
+    // EXACTLY, so anything left here fails a test that has nothing to do with
+    // mic selection.
+    commands.clear();
 
     tx.startTwoToneTune();
     ok &= expect(commands == QStringList({
@@ -198,6 +239,102 @@ int main(int argc, char** argv)
                      "transmit set filter_low=1200 filter_high=1800",
                  }),
                  "paired TX filter update is sent atomically");
+
+    // ── TX passband: optimistic adoption + the operator-intent signal ───────
+    //
+    // Both halves matter on a radio that modulates on this host. There is no
+    // status echo there, so a setter that only emitted the Flex verb would leave
+    // the model — and therefore the Phone applet's sliders — showing the old
+    // passband while the modulator kept its mode default. And the backend needs
+    // an intent signal it can bind to that applyStatus() never emits, or radio
+    // state would be echoed back as a fresh command.
+    {
+        QList<QPair<int, int>> intents;
+        QObject::connect(&tx, &TransmitModel::txFilterCommandIssued,
+                         [&intents](int lo, int hi) { intents.append({lo, hi}); });
+        commands.clear();
+        tx.setTxFilter(100, 4000);
+        ok &= expect(tx.txFilterLow() == 100 && tx.txFilterHigh() == 4000,
+                     "setTxFilter adopts the passband without waiting for a status echo");
+        ok &= expect(intents == QList<QPair<int, int>>({{100, 4000}}),
+                     "setTxFilter announces operator intent for the seam");
+
+        // The single-edge setters have to carry the other edge through, or
+        // dragging one slider resets the other to whatever it was constructed
+        // with.
+        intents.clear();
+        tx.setTxFilterLow(200);
+        ok &= expect(tx.txFilterLow() == 200 && tx.txFilterHigh() == 4000,
+                     "setTxFilterLow preserves the high cut");
+        tx.setTxFilterHigh(3500);
+        ok &= expect(tx.txFilterLow() == 200 && tx.txFilterHigh() == 3500,
+                     "setTxFilterHigh preserves the low cut");
+
+        // eSSB has to survive the bounds. 100..6000 is a real setting, not an
+        // edge case, and a clamp at 3 kHz would silently make the control a lie.
+        tx.setTxFilter(100, 6000);
+        ok &= expect(tx.txFilterLow() == 100 && tx.txFilterHigh() == 6000,
+                     "an eSSB passband is not clamped away");
+
+        // Radio status must NOT look like operator intent — otherwise a Flex's
+        // own echo would be sent straight back out as a command.
+        intents.clear();
+        TransmitDelta echo;
+        echo.txFilterLow = 300;
+        echo.txFilterHigh = 2700;
+        tx.applyChanges(echo);
+        ok &= expect(tx.txFilterLow() == 300 && tx.txFilterHigh() == 2700,
+                     "radio status still updates the passband");
+        ok &= expect(intents.isEmpty(),
+                     "applying radio status does not emit operator intent");
+    }
+
+    // ── Mic level: the same operator-intent contract ────────────────────────
+    //
+    // Hl2TxDsp::setMicGain had no production caller: the slider's `transmit set
+    // miclevel=` is dropped by a backend with no command plane, so mic gain did
+    // nothing at all on the HL2 and an operator sweeping it end to end saw no
+    // change on the air. micLevelCommandIssued is the seam's route in.
+    //
+    // The applyChanges half is the one that bites if it is wrong. A Flex echoes
+    // miclevel back in transmit status, and if that echo looked like intent it
+    // would be handed straight back to the seam as a fresh command.
+    {
+        QList<int> micIntents;
+        QObject::connect(&tx, &TransmitModel::micLevelCommandIssued,
+                         [&micIntents](int level) { micIntents.append(level); });
+
+        micIntents.clear();
+        tx.setMicLevel(80);
+        ok &= expect(tx.micLevel() == 80, "setMicLevel adopts the level");
+        ok &= expect(micIntents == QList<int>({80}),
+                     "setMicLevel announces operator intent for the seam");
+
+        // Re-asserting the SAME level must still reach the seam. A
+        // host-modulating backend can have been reset underneath the model — a
+        // reconnect, a radio swap — while m_micLevel never moved, and gating on
+        // "changed" would leave the modulator at its default with the slider
+        // insisting otherwise.
+        micIntents.clear();
+        tx.setMicLevel(80);
+        ok &= expect(micIntents == QList<int>({80}),
+                     "re-setting an unchanged mic level still re-asserts to the seam");
+
+        // Out of range is clamped before it is announced, so the seam never has
+        // to defend itself against a CAT client's arithmetic.
+        micIntents.clear();
+        tx.setMicLevel(150);
+        ok &= expect(tx.micLevel() == 100 && micIntents == QList<int>({100}),
+                     "an over-range mic level is clamped before it reaches the seam");
+
+        micIntents.clear();
+        TransmitDelta micEcho;
+        micEcho.micLevel = 42;
+        tx.applyChanges(micEcho);
+        ok &= expect(tx.micLevel() == 42, "radio status still updates the mic level");
+        ok &= expect(micIntents.isEmpty(),
+                     "applying radio status does not emit mic operator intent");
+    }
 
     ClientQuindarTone quindar;
     quindar.prepare(24000.0);

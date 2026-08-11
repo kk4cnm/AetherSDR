@@ -8,6 +8,7 @@
 
 #include "core/backends/IRadioBackend.h"
 #include "TestSettingsProfile.h"
+#include "TestDspBuildWait.h"
 
 #include "core/backends/hl2/Hl2Backend.h"
 
@@ -21,6 +22,7 @@
 #include <QHostAddress>
 #include <QNetworkDatagram>
 #include <QScopeGuard>
+#include <QStringList>
 #include <QSignalSpy>
 #include <QTimer>
 #include <QUdpSocket>
@@ -60,6 +62,27 @@ static void spin(int ms)
     loop.exec();
 }
 
+// Decode the TX drive level out of an EP2 packet, if this one happens to be
+// carrying the drive C&C bank (the round robin rotates through several).
+// Returns -1 when the packet carries some other bank.
+//
+// Same decode as hl2_tx_gate_test: C0 sits at SYNC(3) into each 512-byte frame,
+// the MOX bit is masked off the address, and the drive byte is C1 at +4.
+static int ep2DriveLevel(const QByteArray& dg)
+{
+    if (dg.size() < static_cast<int>(hl2::kUsbPacketSize))
+        return -1;
+    const auto* b = reinterpret_cast<const std::uint8_t*>(dg.constData());
+    if (b[0] != 0xEF || b[1] != 0xFE || b[2] != 0x01 || b[3] != 0x02)
+        return -1;   // not EP2
+    const std::size_t frameStarts[2] = {8, 8 + hl2::kFrameSize};
+    for (const std::size_t fs : frameStarts) {
+        if ((b[fs + 3] & ~hl2::kC0MoxBit) == hl2::kC0TxDrive)
+            return b[fs + 4];
+    }
+    return -1;
+}
+
 int main(int argc, char** argv)
 {
     // Redirect settings into a private temporary profile BEFORE QCoreApplication
@@ -80,6 +103,9 @@ int main(int argc, char** argv)
 
     QCoreApplication app(argc, argv);
     qRegisterMetaType<SliceDelta>();
+    // QSignalSpy stores a notchChanged argument by metatype, so the notch
+    // session-scope case below reads an empty QVariant without this.
+    qRegisterMetaType<NotchDelta>();
 
     // The backend RESTORES the operator's remembered span at connect, so the
     // default-span assertion below depends on persisted state. The isolated
@@ -142,7 +168,14 @@ int main(int argc, char** argv)
     check(caps.canTransmit, "canTransmit is true for an interactive run");
     check(caps.maxSlices == 1, "one slice");
     check(caps.sampleRatesHz.contains(48000) && caps.sampleRatesHz.contains(384000), "sample rates");
-    check(caps.extensionNamespaces.isEmpty(), "no extension namespaces advertised");
+    // "hl2" since manual frequency calibration landed (freqcal.get / .set /
+    // .set_live). This field is the handshake a client pre-checks before it
+    // issues invokeExtension(), so it has to name every namespace the backend
+    // actually answers — an empty list here while the verbs work would report
+    // the opposite of the truth. The unknown-verb path is still an error; see
+    // the invokeExtension case below.
+    check(caps.extensionNamespaces == QVector<QString>{QStringLiteral("hl2")},
+          "advertises the hl2 extension namespace");
 
     QSignalSpy connectedSpy(&backend, &IRadioBackend::connected);
     QSignalSpy disconnectedSpy(&backend, &IRadioBackend::disconnected);
@@ -156,8 +189,29 @@ int main(int argc, char** argv)
     qsizetype lastSpecBytes = 0;
     QObject::connect(&backend, &IRadioBackend::spectrumFrameReady, &backend,
                      [&](int, const QByteArray& ba) { ++specCount; lastSpecBytes = ba.size(); });
+    // The passband the FIRST slice report carries, and the order in which the pan
+    // is announced versus described. Both are connect-time-only facts, so they
+    // have to be captured from before connectRadio().
+    int firstFilterLow = -1, firstFilterHigh = -1;
+    QStringList panEventOrder;
     QObject::connect(&backend, &IRadioBackend::sliceChanged, &backend,
-                     [&](int, const SliceDelta&) { ++sliceCount; });
+                     [&](int, const SliceDelta& d) {
+                         if (sliceCount == 0) {
+                             if (d.filterLow)  firstFilterLow  = *d.filterLow;
+                             if (d.filterHigh) firstFilterHigh = *d.filterHigh;
+                         }
+                         ++sliceCount;
+                     });
+    QObject::connect(&backend, &IRadioBackend::panCenterBandwidthChanged, &backend,
+                     [&](const QString&, double, double) {
+                         if (!panEventOrder.contains(QStringLiteral("geometry")))
+                             panEventOrder << QStringLiteral("geometry");
+                     });
+    QObject::connect(&backend, &IRadioBackend::panBandwidthLimitsChanged, &backend,
+                     [&](const QString&, double, double) {
+                         if (!panEventOrder.contains(QStringLiteral("limits")))
+                             panEventOrder << QStringLiteral("limits");
+                     });
 
     // ---- connect ----
     RadioConnectRequest req;
@@ -169,8 +223,12 @@ int main(int argc, char** argv)
     // session leftovers, so anything emitted before connected() is discarded.
     check(!connectedSpy.count(), "connect leaves connected() pending until the first EP6");
 
-    // Stay inside kSilenceTimeoutMs (2 s): the fake radio stops after kCap
-    // frames, and the EP6 silence watchdog legitimately drops the link after it.
+    // The DSP has to finish opening before the wire starts; wait on that rather
+    // than on a clock. Once EP6 flows, stay inside kSilenceTimeoutMs (2 s): the
+    // fake radio stops after kCap frames and the silence watchdog legitimately
+    // drops the link after it.
+    AetherSDR::test::awaitDspBuild("hl2_backend_test",
+                                  [&] { return connectedSpy.count() >= 1; });
     spin(1200);   // capped ping-pong delivers EP6 + at least one spectrum frame
 
     check(connectedSpy.count() == 1, "connected() on the first EP6");
@@ -232,6 +290,28 @@ int main(int argc, char** argv)
               "reported limits are the real rate range, 48 kHz .. 384 kHz");
     }
 
+    // ---- the pan is ANNOUNCED before it is DESCRIBED ----
+    //
+    // RadioModel materialises the HL2's PanadapterModel from
+    // panCenterBandwidthChanged; its panBandwidthLimitsChanged handler is
+    // `if (!pan) return;` with no materialisation. onConnected() clears
+    // m_panadapters and m_activePanId synchronously inside emit connected(), so
+    // limits reported before the geometry are dropped for the whole session and
+    // nothing re-emits them — leaving the 5.4 MHz FlexLib fallback and the
+    // black-bar over-zoom. Ordering is the invariant, so assert the ordering.
+    check(panEventOrder == QStringList({QStringLiteral("geometry"),
+                                        QStringLiteral("limits")}),
+          "pan geometry is reported BEFORE the pan's zoom limits");
+
+    // ---- a fresh connect derives the passband from the MODE ----
+    //
+    // The member defaults are 150..3000, which is DIGU's passband and no other
+    // mode's. Publishing them verbatim on a default-USB connect told the UI
+    // DIGU's filter while the mode indicator read USB, and the radio was the
+    // side that was right. USB is 100..2900.
+    check(firstFilterLow == 100 && firstFilterHigh == 2900,
+          "first slice report carries USB's passband (100..2900), not the 150..3000 defaults");
+
     // ---- a span request snaps to a rate the DDC can actually run ----
     //
     // There is no continuous zoom on this radio: four rates, and a request lands
@@ -269,7 +349,7 @@ int main(int argc, char** argv)
     // itself is exercised separately below.
     for (const auto& c : cases) {
         spanSpy.clear();
-        backend.setPanBandwidth(QStringLiteral("hl2"), c.requestMhz * 1.0e6);
+        backend.setPanBandwidth(QStringLiteral("hl2-0"), c.requestMhz * 1.0e6);
         spin(220);
         // Every request re-publishes, including one that changes nothing —
         // otherwise a zoom the hardware cannot honour would leave the display
@@ -298,13 +378,13 @@ int main(int argc, char** argv)
     // not feel laggy), everything inside the cooldown is superseded, and the last
     // one wins. What must NOT happen is one rebuild per request.
     {
-        backend.setPanBandwidth(QStringLiteral("hl2"), 48000.0);
+        backend.setPanBandwidth(QStringLiteral("hl2-0"), 48000.0);
         spin(220);                            // settle, so the sweep starts clean
 
         QSignalSpy sweepSpy(&backend, &IRadioBackend::panCenterBandwidthChanged);
         // A drag: eight requests well inside one cooldown, ending on 384 kHz.
         for (const double mhz : {0.048, 0.060, 0.096, 0.120, 0.192, 0.240, 0.300, 0.384}) {
-            backend.setPanBandwidth(QStringLiteral("hl2"), mhz * 1.0e6);
+            backend.setPanBandwidth(QStringLiteral("hl2-0"), mhz * 1.0e6);
             spin(5);
         }
         const int duringSweep = sweepSpy.count();
@@ -330,12 +410,12 @@ int main(int argc, char** argv)
     // 14.100 MHz above; widening and narrowing the window around it has to leave
     // it exactly there.
     backend.setSliceFrequency(0, 14'100'000.0);
-    backend.setPanBandwidth(QStringLiteral("hl2"), 384000.0);
+    backend.setPanBandwidth(QStringLiteral("hl2-0"), 384000.0);
     spin(220);
-    backend.setPanBandwidth(QStringLiteral("hl2"), 48000.0);
+    backend.setPanBandwidth(QStringLiteral("hl2-0"), 48000.0);
     spin(220);
     QSignalSpy sliceSpy(&backend, &IRadioBackend::sliceChanged);
-    backend.setPanBandwidth(QStringLiteral("hl2"), 192000.0);
+    backend.setPanBandwidth(QStringLiteral("hl2-0"), 192000.0);
     spin(220);
     check(!sliceSpy.isEmpty(), "a span change re-publishes the slice");
     if (!sliceSpy.isEmpty()) {
@@ -458,7 +538,7 @@ int main(int argc, char** argv)
 
         // A request for the widest span must land on the ceiling, not above it.
         cappedSpan.clear();
-        capped.setPanBandwidth(QStringLiteral("hl2"), 384000.0);
+        capped.setPanBandwidth(QStringLiteral("hl2-0"), 384000.0);
         spin(60);
         check(!cappedSpan.isEmpty(), "capped backend republished its span");
         if (!cappedSpan.isEmpty()) {
@@ -475,6 +555,188 @@ int main(int argc, char** argv)
     // Already down via the watchdog; disconnectRadio() must not double-report.
     check(disconnectedSpy.count() == 1, "disconnect does not re-emit disconnected()");
     check(!backend.isConnected(), "isConnected() false after disconnect");
+
+    // ---- #4549: TUNE keys at TUNE power, and ANY unkey restores RF power ----
+    //
+    // The tune carrier's amplitude is a fixed full-scale constant, so the drive
+    // register is the only thing that sets tune power. Read it off the WIRE
+    // rather than from a flag: the register is what the radio actually obeys.
+    //
+    // This runs against its own UNCAPPED fake radio, not the shared one above.
+    // EP2 is paced only while the link is alive, and the shared radio stops
+    // answering after kCap frames so the silence-watchdog assertions can fire —
+    // which starves the very stream these checks read. Its own radio also keeps
+    // the drive traffic out of the earlier assertions.
+    //
+    // Sampling rule: the drive bank is a ONE-SHOT (MetisClient::setTxDriveLevel
+    // pushes onto m_oneShot; the steady round robin carries freq/gain/ADC only),
+    // so each call puts exactly one drive packet into a FIFO. Every check clears
+    // lastDrive and THEN acts and spins, so it reads a settled queue.
+    if (caps.canTransmit) {
+        QUdpSocket tuneRadio;
+        check(tuneRadio.bind(QHostAddress::LocalHost, 0), "#4549: tune fake radio binds");
+        std::uint32_t tuneSeq = 0;
+        int lastDrive = -1;
+        QObject::connect(&tuneRadio, &QUdpSocket::readyRead, &tuneRadio, [&] {
+            while (tuneRadio.hasPendingDatagrams()) {
+                const QNetworkDatagram dg = tuneRadio.receiveDatagram();
+                const int drive = ep2DriveLevel(dg.data());
+                if (drive >= 0)
+                    lastDrive = drive;
+                // Always answer: EP2 keeps flowing only while the link is up.
+                tuneRadio.writeDatagram(fakeEp6(tuneSeq++), dg.senderAddress(), dg.senderPort());
+            }
+        });
+
+        Hl2Backend tuner;
+        RadioConnectRequest tuneReq;
+        tuneReq.host = QStringLiteral("127.0.0.1");
+        tuneReq.port = tuneRadio.localPort();
+        tuner.connectRadio(tuneReq);
+        spin(300);
+        check(tuner.isConnected(), "#4549: tune backend connects");
+
+        const auto driveFor = [](int percent) { return percent * hl2::kTxDriveMax / 100; };
+        // Settle on a known RF power, distinguishable from tune power.
+        lastDrive = -1;
+        tuner.setTxPower(100);
+        spin(200);
+        check(lastDrive == driveFor(100),
+              "#4549: RF power 100 reaches the drive register");
+
+        // TUNE at 10% must DROP the drive, not inherit the RF slider. Before the
+        // fix the register still held 255 and the tune went out at FULL power.
+        lastDrive = -1;
+        tuner.setTune(true, 10);
+        spin(200);
+        check(lastDrive == driveFor(10),
+              "#4549: TUNE drives at TUNE power, not the RF Power slider");
+
+        // The unkey that does NOT go through setTune(): the automation TX
+        // watchdog and the key verb (RadioModel.cpp:2696) and the MOX/PTT
+        // coordinator (RadioModel.cpp:674) all call setKeying(false) directly.
+        // That clears m_tuning, so restoring in setTune()'s release branch left
+        // these paths at TUNE power with setTxPower() no longer holding off —
+        // the radio stayed at 10% until the slider next moved, and the next
+        // voice transmission went out at tune power.
+        lastDrive = -1;
+        tuner.setKeying(false);
+        spin(200);
+        check(lastDrive == driveFor(100),
+              "#4549: an unkey that BYPASSES setTune() still restores RF power");
+
+        // The ordinary path — releasing the TUNE toggle — restores too.
+        tuner.setTune(true, 10);
+        spin(200);
+        lastDrive = -1;
+        tuner.setTune(false, 10);
+        spin(200);
+        check(lastDrive == driveFor(100),
+              "#4549: releasing TUNE restores RF power");
+
+        // A power change made mid-tune is the operator's intent for after the
+        // carrier drops: remembered, but not applied while the carrier is up.
+        tuner.setTune(true, 10);
+        spin(200);
+        lastDrive = -1;
+        tuner.setTxPower(40);
+        spin(200);
+        check(lastDrive == -1,
+              "#4549: a mid-tune power change does not disturb the tune carrier");
+        lastDrive = -1;
+        tuner.setTune(false, 10);
+        spin(200);
+        check(lastDrive == driveFor(40),
+              "#4549: the unkey restores the power set DURING the tune");
+
+        tuner.disconnectRadio();
+        spin(50);
+    }
+
+    // ---- notch records are SESSION state, and ids are never recycled (#4780) --
+    //
+    // The half of the notch lifecycle that lives ABOVE Hl2RxDsp, and the one
+    // hl2_notch_seed_test cannot reach: that test pins seeding as idempotent
+    // against a single DSP chain, and never disconnects, so deleting
+    // m_notches.clear() from connectRadio() leaves it green.
+    //
+    // What that line prevents: RadioModel::onDisconnected() empties TnfModel,
+    // but a same-family reconnect rebuilds no backend, so records kept here
+    // would be replayed into the fresh WDSP chains by seedNotches() with
+    // nothing on screen naming them — nulls in the audio at frequencies the UI
+    // does not mention, and no id to remove them by. Asserted through the seam
+    // rather than by reaching into m_notches: a record that survived is a
+    // record still addressable, so setNotch/removeNotch on last session's id
+    // would report back.
+    {
+        QUdpSocket radio4;
+        check(radio4.bind(QHostAddress::LocalHost, 0), "fourth fake radio binds");
+        std::uint32_t seq4 = 0;
+        QObject::connect(&radio4, &QUdpSocket::readyRead, &radio4, [&] {
+            while (radio4.hasPendingDatagrams()) {
+                const QNetworkDatagram dg = radio4.receiveDatagram();
+                if (seq4 < kCap)
+                    radio4.writeDatagram(fakeEp6(seq4++), dg.senderAddress(),
+                                         dg.senderPort());
+            }
+        });
+
+        Hl2Backend notcher;
+        QSignalSpy notchedSpy(&notcher, &IRadioBackend::notchChanged);
+        QSignalSpy unnotchedSpy(&notcher, &IRadioBackend::notchRemoved);
+        QSignalSpy notchConnected(&notcher, &IRadioBackend::connected);
+        RadioConnectRequest nr;
+        nr.host = QStringLiteral("127.0.0.1");
+        nr.port = radio4.localPort();
+        notcher.connectRadio(nr);
+        AetherSDR::test::awaitDspBuild("hl2_backend_test",
+                                      [&] { return notchConnected.count() >= 1; });
+        spin(300);
+        check(notchConnected.count() >= 1, "notch-session backend came up");
+
+        // Placed against a live chain, so the id the backend mints is the one a
+        // real session would carry.
+        notcher.createNotch(7'041'000.0, 200.0);
+        check(notchedSpy.count() == 1, "createNotch reports the id the backend minted");
+        const int firstId = notchedSpy.isEmpty() ? -1 : notchedSpy.first().at(0).toInt();
+
+        notcher.disconnectRadio();
+        spin(150);
+        seq4 = 0;               // let the same fake answer a second session
+        notcher.connectRadio(nr);
+        // Awaited rather than merely spun past. The second session opens its own
+        // WDSP chains on the I/O thread; leaving that build in flight would put
+        // the planner under whatever assertion runs next, which then fails for a
+        // reason it does not name.
+        AetherSDR::test::awaitDspBuild("hl2_backend_test",
+                                      [&] { return notchConnected.count() >= 2; });
+        spin(200);
+        check(notchConnected.count() >= 2, "the notch-session backend reconnected");
+
+        notchedSpy.clear();
+        unnotchedSpy.clear();
+        NotchDelta move;
+        move.centerHz = 7'042'000.0;
+        notcher.setNotch(firstId, move);
+        check(notchedSpy.isEmpty(),
+              "a notch from the previous session is still editable after reconnect");
+        notcher.removeNotch(firstId);
+        check(unnotchedSpy.isEmpty(),
+              "a notch from the previous session is still removable after reconnect");
+
+        // And the counter deliberately does NOT reset with the records: a
+        // recycled id would let a stale reference address a different notch.
+        notchedSpy.clear();
+        notcher.createNotch(7'050'000.0, 200.0);
+        check(notchedSpy.count() == 1, "the new session can still place a notch");
+        if (!notchedSpy.isEmpty()) {
+            check(notchedSpy.first().at(0).toInt() > firstId,
+                  "the new session handed out an id the old one already used");
+        }
+
+        notcher.disconnectRadio();
+        spin(100);
+    }
 
     // ---- F4 (#4448): a connect to a radio that never answers must surface a
     // connectionError (from MetisClient::connectFailed), not wedge silently. ----

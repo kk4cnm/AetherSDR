@@ -3,6 +3,8 @@
 #include "UlanziDialMapperDialog.h"
 #include "core/AppSettings.h"
 #include "core/ShortcutManager.h"
+#include "core/ThemeManager.h"
+#include "core/UlanziDialMappings.h"
 #ifdef HAVE_MIDI
 #include "core/MidiControlManager.h"
 #endif
@@ -69,7 +71,7 @@ public:
         setAttribute(Qt::WA_StyledBackground, false);
         setAutoFillBackground(false);
         setStyleSheet(QStringLiteral("background: transparent;"));
-        setFixedSize(620, 555);  // matches the 640×640 fixed dialog
+        setFixedSize(620, 590);
     }
 
 protected:
@@ -159,7 +161,8 @@ UlanziDialMapperDialog::UlanziDialMapperDialog(UlanziDialBackend* manager,
     , m_shortcuts(shortcuts)
     , m_midi(midi)
 {
-    setFixedSize(640, 640);
+    setFixedSize(640, 675);
+
 
     auto* outer = new QVBoxLayout(bodyWidget());
     outer->setContentsMargins(0, 0, 0, 8);
@@ -205,6 +208,10 @@ UlanziDialMapperDialog::UlanziDialMapperDialog(UlanziDialBackend* manager,
             const int idx = m_pills[i].combo->findData(m_pills[i].defaultAction);
             if (idx >= 0) m_pills[i].combo->setCurrentIndex(idx);
         }
+        if (m_rotaryCombo) {
+            const int rIdx = m_rotaryCombo->findData(QStringLiteral("WheelFrequency"));
+            if (rIdx >= 0) m_rotaryCombo->setCurrentIndex(rIdx);
+        }
     });
     bottomRow->addWidget(m_resetBtn);
 
@@ -244,9 +251,10 @@ QPoint UlanziDialMapperDialog::normalizedAnchor(double nx, double ny)
 
 QRect UlanziDialMapperDialog::dialBodyRect() const
 {
-    // Fixed geometry inside the fixed-size canvas (620 × 555).  Body
-    // honours the trimmed image aspect (512:562 ≈ 0.911) at 320×352,
-    // centred both horizontally and vertically in the canvas.
+    // Fixed geometry inside the upper region (620 × 555) of the canvas
+    // (620 × 590). Body honours the trimmed image aspect (512:562 ≈ 0.911)
+    // at 320×352, centered in the upper region to leave vertical space for
+    // the bottom rotary and single-tap combo controls at y >= 525.
     const int bw = 320;
     const int bh = 352;
     const int bx = (620 - bw) / 2;       // 150
@@ -264,6 +272,59 @@ QPoint UlanziDialMapperDialog::anchorScreenPos(const QPoint& norm) const
 void UlanziDialMapperDialog::buildPills()
 {
     m_pills.clear();
+
+    if (!m_rotaryCombo) {
+        m_rotaryLabel = new QLabel(tr("Tuning:"), this);
+        ThemeManager::instance().applyStyleSheet(m_rotaryLabel,
+            QStringLiteral("QLabel { color: {{color.text.primary}}; font-size: 11px; font-weight: bold; }"));
+        m_rotaryLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        m_rotaryLabel->raise();
+
+        m_rotaryCombo = new QComboBox(this);
+        ThemeManager::instance().applyStyleSheet(m_rotaryCombo, pillComboStyle());
+        m_rotaryCombo->setFixedWidth(180);
+        m_rotaryCombo->raise();
+
+        struct RotaryOption {
+            const char* label;
+            const char* actionId;
+        };
+        static constexpr RotaryOption kRotaryOptions[] = {
+            {"[Frequency] Tune Slice", "WheelFrequency"},
+            {"[Filter] Filter Bandwidth", "FilterWidth"},
+            {"[Audio] Slice Audio Volume", "WheelSliceAudio"},
+            {"[Audio] Master Volume", "WheelVolume"},
+            {"[Audio] Headphone Volume", "WheelHeadphoneVolume"},
+            {"[Display] Panadapter Zoom", "PanadapterZoom"},
+            {"[Display] Band Zoom", "BandZoom"},
+            {"[Display] Segment Zoom", "SegmentZoom"},
+            {"[RIT/XIT] RIT (Receive Incremental Tuning)", "WheelRit"},
+            {"[RIT/XIT] XIT (Transmit Incremental Tuning)", "WheelXit"},
+            {"[AGC] AGC-T (Threshold)", "WheelAgcT"},
+            {"[AGC] RF Gain", "WheelRfGain"},
+            {"[DSP] APF (Audio Peaking Filter)", "WheelApf"},
+            {"[CW] CW Speed", "WheelCwSpeed"},
+            {"[TX] RF Power", "WheelPower"},
+        };
+        for (const auto& opt : kRotaryOptions) {
+            m_rotaryCombo->addItem(QString::fromLatin1(opt.label), QString::fromLatin1(opt.actionId));
+        }
+
+        connect(m_rotaryCombo, &QComboBox::currentIndexChanged, this, [this](int idx) {
+            if (m_isLoading || !m_rotaryCombo || idx < 0) {
+                return;
+            }
+            const QString actionId = m_rotaryCombo->itemData(idx).toString();
+            UlanziDialMappings::setRotaryAction(actionId);
+        });
+
+        m_singleTapLabel = new QLabel(tr("Single tap:"), this);
+        ThemeManager::instance().applyStyleSheet(m_singleTapLabel,
+            QStringLiteral("QLabel { color: {{color.text.primary}}; font-size: 11px; font-weight: bold; }"));
+        m_singleTapLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        m_singleTapLabel->raise();
+    }
+
     for (int i = 0; i < kPillCount; ++i) {
         Pill p;
         p.id            = QString::fromLatin1(kPillSpecs[i].id);
@@ -283,7 +344,7 @@ void UlanziDialMapperDialog::buildPills()
         p.combo = new QComboBox(dialogParented ? static_cast<QWidget*>(this)
                                                : static_cast<QWidget*>(m_canvas));
         p.combo->setStyleSheet(pillComboStyle());
-        p.combo->setFixedWidth(120);  // uniform; longer labels get ellipsized
+        p.combo->setFixedWidth(pillId == QLatin1String("dial_press") ? 180 : 120);
         if (dialogParented) p.combo->raise();
 
         // (unassigned) — always first.
@@ -300,14 +361,20 @@ void UlanziDialMapperDialog::buildPills()
             }
         }
 
-        // MIDI Toggle/Trigger params — only the discrete-event types
-        // make sense on a button.  Continuous params would need a
+        // MIDI Toggle/Trigger/Gate params — only the discrete-event and gate
+        // types make sense on a button.  Continuous params would need a
         // rotary, which is intentionally not bound here.
 #ifdef HAVE_MIDI
         if (m_midi) {
             for (const auto& mp : m_midi->params()) {
                 if (mp.type != MidiParamType::Toggle &&
-                    mp.type != MidiParamType::Trigger) continue;
+                    mp.type != MidiParamType::Trigger &&
+                    mp.type != MidiParamType::Gate) continue;
+                // The CW keying actions are registered in BOTH registries under
+                // the same id.  Offering them twice would give the operator two
+                // dropdown entries that do the same thing by different code
+                // paths, so the shortcut entry (already listed) is the one.
+                if (m_shortcuts && m_shortcuts->action(mp.id)) continue;
                 p.combo->addItem(QStringLiteral("[MIDI %1] %2").arg(mp.category, mp.displayName),
                                  QStringLiteral("midi:%1").arg(mp.id));
             }
@@ -325,6 +392,16 @@ void UlanziDialMapperDialog::layoutPills()
 {
     if (m_pills.isEmpty()) return;
     const QRect body = dialBodyRect();
+
+    if (m_rotaryLabel && m_rotaryCombo && m_singleTapLabel) {
+        m_rotaryLabel->resize(75, 24);
+        m_rotaryLabel->move(185, 525);
+        m_rotaryCombo->resize(180, 24);
+        m_rotaryCombo->move(265, 525);
+
+        m_singleTapLabel->resize(75, 24);
+        m_singleTapLabel->move(185, 557);
+    }
 
     // No connector lines: pills sit "almost touching" the body edge at
     // positions derived directly from pill_id, not anchor coords.  Top
@@ -370,13 +447,13 @@ void UlanziDialMapperDialog::layoutPills()
             center = QPoint(body.right() + sz.width() / 2 + touchGap,
                             body.top()   + body.height() * 68 / 100 - 15);
         } else if (p.id == QLatin1String("dial_press")) {
-            // Same treatment as top_middle.  Hardcoded x = 640/2 − 120/2 = 260.
-            p.combo->resize(120, p.combo->sizeHint().height());
-            p.combo->move(260, 525);
+            p.combo->resize(180, p.combo->sizeHint().height());
+            p.combo->move(265, 557);
             p.combo->raise();
-            p.pillCenter = QPoint(320, 525 + p.combo->height() / 2);
+            p.pillCenter = QPoint(355, 557 + p.combo->height() / 2);
             return;
         }
+
         p.pillCenter = center;
         p.combo->resize(sz);
         p.combo->move(center.x() - sz.width() / 2,
@@ -454,9 +531,34 @@ void UlanziDialCanvas::paintEvent(QPaintEvent*)
     // the dial body so the spatial mapping is conveyed by adjacency.
 }
 
-QString UlanziDialMapperDialog::actionSettingsKey(const QString& pillId)
+QStringList UlanziDialMapperDialog::allPillIds()
 {
-    return QStringLiteral("UlanziDial/action/%1").arg(pillId);
+    QStringList ids;
+    ids.reserve(kPillCount);
+    for (int i = 0; i < kPillCount; ++i)
+        ids.append(QString::fromLatin1(kPillSpecs[i].id));
+    return ids;
+}
+
+void UlanziDialMapperDialog::migrateLegacyMappings()
+{
+    UlanziDialMappings::migrateLegacyKeys(allPillIds());
+}
+
+QString UlanziDialMapperDialog::actionForPill(const QString& pillId)
+{
+    // The document is authoritative; an absent entry means "built-in default".
+    // Legacy flat keys are not consulted here — migrateLegacyMappings() has
+    // already claimed and deleted them at startup.
+    const QString bound = UlanziDialMappings::actionForPill(pillId);
+    if (!bound.isEmpty())
+        return bound;
+    return defaultActionForPill(pillId);
+}
+
+void UlanziDialMapperDialog::setActionForPill(const QString& pillId, const QString& actionId)
+{
+    UlanziDialMappings::setActionForPill(pillId, actionId);
 }
 
 QString UlanziDialMapperDialog::defaultActionForPill(const QString& pillId)
@@ -480,24 +582,29 @@ QString UlanziDialMapperDialog::pillForSignature(const QString& signature)
 
 void UlanziDialMapperDialog::loadActions()
 {
-    auto& s = AppSettings::instance();
+    m_isLoading = true;
     for (int i = 0; i < m_pills.size(); ++i) {
         if (!m_pills[i].combo) continue;
-        const QString actionId =
-            s.value(actionSettingsKey(m_pills[i].id),
-                    m_pills[i].defaultAction).toString();
+        const QString actionId = actionForPill(m_pills[i].id);
         const int idx = m_pills[i].combo->findData(actionId);
         if (idx >= 0) m_pills[i].combo->setCurrentIndex(idx);
     }
+    if (m_rotaryCombo) {
+        const QString rotaryAction = UlanziDialMappings::rotaryAction();
+        const int rIdx = m_rotaryCombo->findData(rotaryAction);
+        if (rIdx >= 0) m_rotaryCombo->setCurrentIndex(rIdx);
+    }
+    m_isLoading = false;
 }
 
 void UlanziDialMapperDialog::saveAction(int pillIndex)
 {
+    if (m_isLoading) return;
     if (pillIndex < 0 || pillIndex >= m_pills.size()) return;
     const Pill& p = m_pills[pillIndex];
     if (!p.combo) return;
     const QString actionId = p.combo->currentData().toString();
-    AppSettings::instance().setValue(actionSettingsKey(p.id), actionId);
+    setActionForPill(p.id, actionId);
 }
 
 void UlanziDialMapperDialog::refreshPillLabel(int /*pillIndex*/)

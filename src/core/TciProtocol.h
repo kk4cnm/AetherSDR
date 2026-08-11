@@ -9,6 +9,7 @@ namespace AetherSDR {
 class RadioModel;
 class SliceModel;
 class TciRoutingState;
+class TciTrxMap;
 
 // TCI protocol handler — text command parser and response generator.
 // No I/O — receives a command string, returns the response.
@@ -35,7 +36,8 @@ public:
         QString source;
     };
 
-    explicit TciProtocol(RadioModel* model, TciRoutingState* routingState = nullptr);
+    explicit TciProtocol(RadioModel* model, TciRoutingState* routingState = nullptr,
+                         const TciTrxMap* trxMap = nullptr);
 
     // Process one TCI command (without trailing semicolon).
     // Returns response string (with trailing semicolon) or empty if no response.
@@ -172,7 +174,11 @@ private:
 public:
     // Mode conversion (public for TciServer broadcast use)
     static QString smartsdrToTci(const QString& mode);
-    static QString tciToSmartSDR(const QString& mode);
+    // `ok` reports whether `mode` was a recognised TCI modulation name. The
+    // return value falls back to "USB" when it isn't, so a caller that must
+    // reject an unrecognised name rather than silently substitute USB has to
+    // check `ok` — which is why it is not defaulted (#4523).
+    static QString tciToSmartSDR(const QString& mode, bool* ok);
 
     // Slice display letter for `active_slice` (#4160), public for the same
     // reason. `index_letter` is radio-supplied, and a stray ',' or ';' in it
@@ -198,6 +204,15 @@ public:
     // command paths so GET and SET never target different receivers.
     static SliceModel* resolveSliceForTrx(RadioModel* model, int trx);
 
+    // Same resolution WITHOUT the first-slice fallback: an unresolvable trx
+    // returns nullptr instead of silently addressing slices[0]. Use on any
+    // path that keys the radio (#4547) — the compatibility fallback is a
+    // reasonable guess for a read, but under PTT it transmits on a slice the
+    // client never asked for, on that slice's band and antenna. The positional
+    // and raw-id steps are unchanged, so a correctly-addressed legacy client
+    // still resolves; only the guess is withdrawn.
+    static SliceModel* resolveSliceForTrxStrict(RadioModel* model, int trx);
+
     static long long mhzToHz(double mhz);
 
     // IQ center (DDS) for a slice = its populated panadapter center in Hz.
@@ -209,6 +224,9 @@ private:
 
     RadioModel* m_model;
     TciRoutingState* m_routingState;
+    // #4567: stable receiver numbering; nullptr falls back to the positional
+    // statics (tests construct TciProtocol without a map).
+    const TciTrxMap* m_trxMap{nullptr};
     QString m_pendingNotification;
     std::optional<VfoRequest> m_vfoRequest;
     std::optional<SplitRequest> m_splitRequest;

@@ -3,10 +3,12 @@
 #include "KiwiSdrClient.h"
 #include "KiwiSdrCredentialStore.h"
 
+#include <QByteArray>
 #include <QHash>
 #include <QObject>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include <functional>
@@ -22,6 +24,15 @@ struct KiwiSdrAntennaProfile {
     QString name;
     QString endpoint;
     bool autoConnect{false};
+    // Keep this receiver's audio audible while the radio transmits (the
+    // stream itself always keeps flowing during TX; this only opens the
+    // transmit gate at the audio mix). Default off: muted during TX.
+    bool keepAudioDuringTx{false};
+    // Hold the post-TX unmute for the receiver's stream latency so the
+    // resume lands on audio received after unkey (suppresses hearing your
+    // own delayed TX tail on an in-range receiver). No effect when
+    // keepAudioDuringTx is set.
+    bool resumeAudioAfterTxDelay{false};
     bool waterfallAutoScale{true};
     int waterfallMinDbm{-110};
     int waterfallMaxDbm{-10};
@@ -33,6 +44,19 @@ struct KiwiSdrWaterfallDisplayRange {
     float maxDbm{0.0f};
     bool autoRange{false};
     bool valid{false};
+};
+
+struct KiwiSdrCsvImportResult {
+    int addedCount{0};
+    int mergedCount{0};
+    QStringList errors;
+    bool ok() const { return errors.isEmpty(); }
+};
+
+struct KiwiSdrCsvExportResult {
+    int exportedCount{0};
+    QString error;
+    bool ok() const { return error.isEmpty(); }
 };
 
 enum class KiwiSdrPasswordPersistenceState {
@@ -56,6 +80,16 @@ public:
     QVector<KiwiSdrAntennaProfile> profiles() const { return m_profiles; }
     KiwiSdrAntennaProfile profile(const QString& id) const;
     bool hasProfile(const QString& id) const;
+
+    // CSV import/export of the saved receiver list (#4586), scoped to the
+    // profile fields only — passwords stay in IKiwiSdrCredentialStore and
+    // are never written to a plaintext file. Import merges: a row whose
+    // endpoint matches an existing profile updates that profile in place
+    // (keeping its id and password) rather than creating a duplicate.
+    QByteArray exportProfilesCsv() const;
+    KiwiSdrCsvImportResult importProfilesCsv(const QByteArray& bytes);
+    KiwiSdrCsvExportResult exportToFile(const QString& path) const;
+    KiwiSdrCsvImportResult importFromFile(const QString& path);
     QString displayName(const QString& id) const;
     QString virtualAntennaToken(const QString& id) const;
     QString profileIdForVirtualAntennaToken(const QString& token) const;
@@ -97,17 +131,17 @@ public slots:
                               int filterLowHz, int filterHighHz,
                               const QString& panId, double centerMhz,
                               double bandwidthMhz, int lineDurationMs,
-                              const QString& bandName);
+                              const QString& bandName, int cwPitchHz);
     void assignSliceToProfile(int sliceId, const QString& profileId,
                               double frequencyMhz, const QString& mode,
                               int filterLowHz, int filterHighHz,
                               const QString& panId,
-                              const QString& bandName);
+                              const QString& bandName, int cwPitchHz);
     void clearSliceAssignment(int sliceId);
     void updateSliceTracking(int sliceId, double frequencyMhz,
                              const QString& mode, int filterLowHz,
                              int filterHighHz, const QString& panId,
-                             const QString& bandName);
+                             const QString& bandName, int cwPitchHz);
     void updateWaterfallView(int sliceId, const QString& panId,
                              double centerMhz, double bandwidthMhz,
                              int lineDurationMs);

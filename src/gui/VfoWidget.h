@@ -578,6 +578,33 @@ public:
     void setDiversityAllowed(bool allowed);
     void setSmartSdrPlus(bool has);
     void setHasExtendedDsp(bool has);
+    // Whether the RADIO owns its noise reduction / blanking / auto-notch
+    // (RadioCapabilities::hasRadioSideDsp). False hides NR, NB, ANF, NRL,
+    // ANFL and ANFT — controls that on a host-demodulating backend would
+    // toggle firmware that is not there. The client-side modules in the
+    // AetherDSP applet are untouched.
+    void setHasRadioSideDsp(bool has);
+    // Whether the radio has the WDSP LMS/FFT filter family
+    // (RadioCapabilities::hasLmsNoiseFilters). False hides NRL, ANFL and ANFT
+    // on a radio that runs its own DSP but not FlexRadio's particular set of
+    // it — an Icom has noise reduction, a blanker and both notches, and
+    // nothing these three buttons could reach.
+    void setHasLmsNoiseFilters(bool has);
+    // Whether the radio has one operator-placed in-passband notch
+    // (RadioCapabilities::hasManualNotch). Shows the MN button and re-targets
+    // the shared level slider to the notch POSITION while it is selected.
+    void setHasManualNotch(bool has);
+    // The filter widths the RADIO actually has
+    // (RadioCapabilities::rxFilterWidthsHz), widest first. Non-empty means
+    // the hardware has a fixed ladder and the mode-preset grid must not be
+    // offered instead: an IC-705 has three IF filters per mode, so the
+    // eight SSB presets left five buttons that snapped onto a neighbour
+    // and did nothing visible. Empty restores the operator's own presets.
+    //
+    // This is the same contract RxApplet::setRadioFilterWidths carries —
+    // the VFO grid was simply never given it, so the two filter surfaces
+    // in the app disagreed about what the radio could do.
+    void setRadioFilterWidths(const QList<int>& widthsHz);
 
     // Reflect whether any client-side AetherDSP NR module (NR2 / NR4 / MNR /
     // BNR / DFNR / RN2) is active by accenting the ADSP launcher, so the cue is
@@ -621,6 +648,7 @@ private:
     QPushButton* m_nrfBtn{nullptr};
     QPushButton* m_anflBtn{nullptr};
     QPushButton* m_anftBtn{nullptr};
+    QPushButton* m_mnBtn{nullptr};
     QPushButton* m_apfBtn{nullptr};
     QPushButton* m_aetherDspBtn{nullptr};    // launches AetherDSP Settings dialog
     bool         m_aetherDspActive{false};   // any client NR module on (#3800)
@@ -630,7 +658,11 @@ private:
     // target switches based on which leveled DSP the user most recently
     // turned on.  RNN / ANFT / APF are toggle-only on this slider — they
     // either have no level (RNN, ANFT) or own a dedicated container (APF).
-    enum DspLevelTarget { LvlNone = 0, LvlNR, LvlNB, LvlAnf, LvlNrl, LvlNrs, LvlNrf, LvlAnfl };
+    enum DspLevelTarget { LvlNone = 0, LvlNR, LvlNB, LvlAnf, LvlNrl, LvlNrs, LvlNrf, LvlAnfl,
+                          // POSITION, not amount. The shared slider means
+                          // something different for this target than for every
+                          // other one — see SliceModel::setMnLevel.
+                          LvlMn };
     QWidget* m_dspLevelRow{nullptr};
     QLabel*  m_dspLevelLabel{nullptr};
     QSlider* m_dspLevelSlider{nullptr};
@@ -656,6 +688,11 @@ private:
     // (NRS/RNN/NRF) — one place so setSlice/syncFromSlice/setHasExtendedDsp
     // can't drift on the mode gate. Caller must hold a valid m_slice. (#2177)
     void updateExtendedDspVisibility();
+    // The ONE owner of the radio-side DSP buttons' visibility: ANDs each
+    // button's cached mode eligibility with m_hasRadioSideDsp. Both mode
+    // recompute sites and setHasRadioSideDsp() route through here, so no
+    // caller drives these setVisible() directly and none can race another.
+    void applyRadioSideDspVisibility();
     // RTTY Mark/Shift (shown only in RTTY mode)
     QWidget* m_rttyContainer{nullptr};
     // DIG offset (shown only in DIGL/DIGU mode)
@@ -663,8 +700,9 @@ private:
     ScrollableLabel* m_digOffsetLabel{nullptr};   // read-only display, scroll-wheel steps
     QLineEdit*       m_digOffsetEdit{nullptr};     // inline direct-entry (double-click)
     QStackedWidget*  m_digOffsetStack{nullptr};    // switches between label and edit
-    // FM OPT controls (shown only in FM/NFM mode)
+    // FM-family OPT controls. DSTR uses the duplex controls but not CTCSS.
     QWidget*       m_fmContainer{nullptr};
+    QWidget*       m_fmToneContainer{nullptr};
     QComboBox*     m_fmToneModeCmb{nullptr};
     QComboBox*     m_fmToneValueCmb{nullptr};
     QDoubleSpinBox* m_fmOffsetSpin{nullptr};
@@ -682,6 +720,8 @@ private:
     QGridLayout* m_filterGrid{nullptr};
     QVector<QPushButton*> m_filterBtns;
     QVector<int> m_filterWidths;
+    // Radio-declared ladder; empty when the radio does not declare one.
+    QVector<int> m_radioFilterWidths;
     // Parallel to m_filterWidths.  When a slot has user-defined custom
     // edges (right-click → "Set Custom Edges..."), the lo/hi are stored
     // here and applied directly instead of going through applyFilterPreset's
@@ -698,6 +738,39 @@ private:
     QPushButton* m_zeroBeatBtn{nullptr};
     bool         m_hasSmartSdrPlus{false};
     bool         m_hasExtendedDsp{false};
+    // Whether the RADIO runs its own NR/NB/ANF (RadioCapabilities::
+    // hasRadioSideDsp). Defaults TRUE so a widget built before any backend has
+    // reported stays in its pre-existing state rather than briefly hiding
+    // controls that do exist.
+    bool         m_hasRadioSideDsp{true};
+    // Defaults TRUE for the same reason as m_hasRadioSideDsp above: a widget
+    // built before any backend has reported must not briefly hide controls
+    // that do exist. Flex is the only radio that has these today, and it was
+    // the only radio these buttons ever worked on.
+    bool         m_hasLmsNoiseFilters{true};
+    // Defaults FALSE, and that asymmetry is deliberate: MN is a NEW button.
+    // Showing it before a backend has claimed the capability would put a
+    // control on screen for every radio in the pre-report window, including
+    // the Flexes that have TNFs instead and will never claim it.
+    bool         m_hasManualNotch{false};
+    // Mode eligibility for each radio-side DSP button, cached by the two places
+    // that recompute it (the slice modeChanged handler and syncFromSlice) so
+    // applyRadioSideDspVisibility() can AND it with the capability WITHOUT
+    // re-deriving mode.
+    //
+    // Re-deriving would force a choice between those two sites' rules, and they
+    // differ: the modeChanged handler hides ANF/ANFL/ANFT for FreeDV modes
+    // (its isVoice carries a !isFdv term), syncFromSlice does not. That is a
+    // pre-existing difference — the same class of drift #2177 found on DFM — and
+    // resolving it is not this change's job. Caching keeps each site's answer
+    // exactly as it was.
+    bool         m_nrModeOk{true};
+    bool         m_nbModeOk{true};
+    bool         m_anfModeOk{true};
+    bool         m_nrlModeOk{true};
+    bool         m_anflModeOk{true};
+    bool         m_anftModeOk{true};
+    bool         m_mnModeOk{true};
     // RIT/XIT tab
     QPushButton* m_ritBtn{nullptr};
     QPushButton* m_xitBtn{nullptr};

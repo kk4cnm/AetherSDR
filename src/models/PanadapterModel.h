@@ -80,7 +80,10 @@ public:
     // reached nothing — and the engine has to shape the stream itself. This is
     // where the target it shapes to lives. Emits the same *Reported/*Changed
     // pairs as the radio path so consumers cannot tell the two apart.
-    void setDisplayRates(int fps, int wfLineDurationMs);
+    // `wfRate` is the 1..100 waterfall RATE, low slow / high fast — not the
+    // milliseconds Flex's `line_duration` wire name claims (core/WaterfallRate.h,
+    // #4606).
+    void setDisplayRates(int fps, int wfRate);
     // Flex-specific WNB extension applied from the backend's namespaced
     // extensionStatus("flex","panWnb",…). Applies only the keys present;
     // emits wnbChanged/wnbStateChanged when anything changes. (aetherd RFC 2.3
@@ -94,7 +97,22 @@ public:
     int rfGainLow() const { return m_rfGainLow; }
     int rfGainHigh() const { return m_rfGainHigh; }
     int rfGainStep() const { return m_rfGainStep; }
-    void setRfGainInfo(int low, int high, int step);
+    // What the readout appends to the number. " dB" for a real gain register,
+    // "%" for a radio whose RF gain is an opaque scale — see
+    // IRadioBackend::panRfGainInfoChanged.
+    QString rfGainUnitSuffix() const { return m_rfGainUnitSuffix; }
+    void setRfGainInfo(int low, int high, int step,
+                       const QString& unitSuffix = QStringLiteral(" dB"));
+    // Discrete receive front-end stages. An EMPTY label list means the radio
+    // has no such stage and its control does not appear.
+    QStringList preampLabels() const { return m_preampLabels; }
+    int preampStep() const { return m_preampStep; }
+    void setPreampLabels(const QStringList& labels);
+    void setPreampStep(int step);
+    QStringList attenuatorLabels() const { return m_attenuatorLabels; }
+    int attenuatorStep() const { return m_attenuatorStep; }
+    void setAttenuatorLabels(const QStringList& labels);
+    void setAttenuatorStep(int step);
     // Normalized setters driven by the backend (aetherd RFC 2.3 — rfgain +
     // antenna promoted to universal typed signals). Each emits its existing
     // change-signal only on an actual change; the wire decode lives in
@@ -106,6 +124,11 @@ public:
     int wnbLevel() const { return m_wnbLevel; }
     bool wnbUpdating() const { return m_wnbUpdating; }
     bool wideActive() const { return m_wideActive; }
+    // Set the WIDE state from a backend that computes it itself rather than
+    // parsing it out of a Flex `display pan` status. Change-gated, like the
+    // status path — the signal drives a repaint, and a backend that recomputes
+    // this on every band decision would otherwise emit it continuously.
+    void setWide(bool wide);
     bool loopA() const { return m_loopA; }
     bool loopB() const { return m_loopB; }
     int fps() const { return m_fps; }
@@ -115,12 +138,17 @@ public:
     // painting a definitive unchecked box before the real value is known, the
     // same way average()/fps() use a -1 unknown sentinel (#4261).
     bool weightedAverageKnown() const { return m_weightedAverageKnown; }
+    // The 1..100 waterfall RATE, low slow / high fast. The accessor keeps
+    // Flex's `line_duration` wire name because that is the field it decodes,
+    // but the VALUE IS NOT MILLISECONDS — convert through core/WaterfallRate.h
+    // before pacing anything on it. Reading it literally is what ran the
+    // control backwards on the HL2 (#4606).
     int waterfallLineDuration() const { return m_waterfallLineDuration; }
-    // Normalized waterfall-line-duration setter driven by the backend (universal
-    // display timing). Feeds PerfTelemetry and always emits
+    // Normalized waterfall-rate setter driven by the backend (universal display
+    // timing). Feeds PerfTelemetry and always emits
     // waterfallLineDurationReported; the change-gated signal fires only on a real
     // change. (aetherd RFC 2.3.)
-    void setWaterfallLineDuration(int ms);
+    void setWaterfallLineDuration(int rate);
     int fftYPixels() const { return m_fftYPixels; }
     bool setFftYPixels(int yPixels) {
         if (m_fftYPixels == yPixels) {
@@ -168,7 +196,12 @@ signals:
     void rxAntennaChanged(const QString& ant);
     void antListChanged(const QStringList& ants);
     void rfGainChanged(int gain);
-    void rfGainInfoChanged(int low, int high, int step);
+    void rfGainInfoChanged(int low, int high, int step,
+                           const QString& unitSuffix = QStringLiteral(" dB"));
+    void preampLabelsChanged(const QStringList& labels);
+    void preampStepChanged(int step);
+    void attenuatorLabelsChanged(const QStringList& labels);
+    void attenuatorStepChanged(int step);
     void wnbChanged(bool active, int level);
     void wnbStateChanged(bool active, int level, bool updating);
     void wideChanged(bool active);
@@ -211,6 +244,11 @@ private:
     int         m_rfGainLow{-8};
     int         m_rfGainHigh{32};
     int         m_rfGainStep{8};
+    QString     m_rfGainUnitSuffix{QStringLiteral(" dB")};
+    QStringList m_preampLabels;
+    int         m_preampStep{0};
+    QStringList m_attenuatorLabels;
+    int         m_attenuatorStep{0};
     bool        m_wnbActive{false};
     bool        m_wnbUpdating{false};
     bool        m_wideActive{false};

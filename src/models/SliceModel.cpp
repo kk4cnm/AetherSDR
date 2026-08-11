@@ -363,6 +363,7 @@ void SliceModel::setNb(bool on)
 {
     m_nb = on;
     sendCommand(QString("slice set %1 nb=%2").arg(m_id).arg(on ? 1 : 0));
+    emit noiseBlankerCommandIssued(on, m_nbLevel);
     emit nbChanged(on);
 }
 
@@ -370,6 +371,7 @@ void SliceModel::setNr(bool on)
 {
     m_nr = on;
     sendCommand(QString("slice set %1 nr=%2").arg(m_id).arg(on ? 1 : 0));
+    emit noiseReductionCommandIssued(on, m_nrLevel);
     emit nrChanged(on);
 }
 
@@ -377,7 +379,21 @@ void SliceModel::setAnf(bool on)
 {
     m_anf = on;
     sendCommand(QString("slice set %1 anf=%2").arg(m_id).arg(on ? 1 : 0));
+    emit autoNotchCommandIssued(on);
     emit anfChanged(on);
+}
+
+// NO sendCommand(). There is no Flex wire text for this — a Flex notches with
+// TNFs, which are a different instrument (see RadioCapabilities::hasManualNotch)
+// — so the intent goes to the seam and nowhere else. Inventing a `slice set
+// <id> mn=` verb would send a command no radio answers and make the control
+// look wired on a family that does not have it.
+void SliceModel::setMn(bool on)
+{
+    if (m_mn == on) return;
+    m_mn = on;
+    emit manualNotchCommandIssued(on, m_mnLevel);
+    emit mnChanged(on);
 }
 
 // v4 DSP toggles — command keys differ from status keys (FlexLib Slice.cs)
@@ -445,6 +461,7 @@ void SliceModel::setNbLevel(int v)
     if (m_nbLevel == v) return;
     m_nbLevel = v;
     sendCommand(QString("slice set %1 nb_level=%2").arg(m_id).arg(v));
+    emit noiseBlankerCommandIssued(m_nb, v);
     emit nbLevelChanged(v);
 }
 
@@ -454,6 +471,7 @@ void SliceModel::setNrLevel(int v)
     if (m_nrLevel == v) return;
     m_nrLevel = v;
     sendCommand(QString("slice set %1 nr_level=%2").arg(m_id).arg(v));
+    emit noiseReductionCommandIssued(m_nr, v);
     emit nrLevelChanged(v);
 }
 
@@ -464,6 +482,19 @@ void SliceModel::setAnfLevel(int v)
     m_anfLevel = v;
     sendCommand(QString("slice set %1 anf_level=%2").arg(m_id).arg(v));
     emit anfLevelChanged(v);
+}
+
+// Position, not depth — 0 is one edge of the passband and 100 the other.
+// Re-emits the enable alongside it so a drag while the notch is off still
+// records where it will land, and the seam never has to remember a position it
+// was not given.
+void SliceModel::setMnLevel(int v)
+{
+    v = std::clamp(v, 0, 100);
+    if (m_mnLevel == v) return;
+    m_mnLevel = v;
+    emit manualNotchCommandIssued(m_mn, v);
+    emit mnLevelChanged(v);
 }
 
 void SliceModel::setNrlLevel(int v)
@@ -598,7 +629,18 @@ void SliceModel::setSquelch(bool on, int level)
     if (levelChanged)
         sendCommand(QString("slice set %1 squelch_level=%2").arg(m_id).arg(level));
 
+    emit squelchCommandIssued(on, level);
     emit squelchChanged(on, level);
+}
+
+void SliceModel::setManualSquelch(bool on, int level)
+{
+    setSquelch(on, level);
+    // Kiwi/external-receive slices already track their own level via
+    // m_externalReceiveSquelchLevel (setSquelch's early-return branch
+    // above) — nothing else to record here.
+    if (!m_externalReceiveAudioReplacement)
+        setManualSquelchLevel(level);
 }
 
 void SliceModel::setExternalReceiveAutoSquelch(bool on)
@@ -616,6 +658,7 @@ void SliceModel::setRit(bool on, int hz)
     m_ritFreq = hz;
     sendCommand(QString("slice set %1 rit_on=%2 rit_freq=%3")
                     .arg(m_id).arg(on ? 1 : 0).arg(hz));
+    emit ritCommandIssued(on, hz);
     emit ritChanged(on, hz);
 }
 
@@ -625,6 +668,7 @@ void SliceModel::setXit(bool on, int hz)
     m_xitFreq = hz;
     sendCommand(QString("slice set %1 xit_on=%2 xit_freq=%3")
                     .arg(m_id).arg(on ? 1 : 0).arg(hz));
+    emit xitCommandIssued(on, hz);
     emit xitChanged(on, hz);
 }
 
@@ -675,6 +719,12 @@ void SliceModel::setDiguOffset(int hz)
 void SliceModel::setTxSlice(bool on)
 {
     sendCommand(QString("slice set %1 tx=%2").arg(m_id).arg(on ? 1 : 0));
+    // Only the REQUEST to take transmit is forwarded. There is no "stop being
+    // the TX slice" on a radio with one transmitter — transmit always lives
+    // somewhere — so a backend is told which slice should own it, never that
+    // one should stop. Clearing is what the operator does by choosing another.
+    if (on)
+        emit txSliceCommandIssued();
 }
 
 void SliceModel::setActive(bool on)
@@ -690,6 +740,10 @@ void SliceModel::setActive(bool on)
             emit activeChanged(true);
         }
         sendCommand(QString("slice set %1 active=1").arg(m_id));
+        // For a backend that never sees the wire text above. It also has to
+        // CLEAR the previously active slice, which on a Flex arrives as a status
+        // echo and here has no other way of happening.
+        emit activeSliceCommandIssued();
     }
 }
 
@@ -773,6 +827,9 @@ void SliceModel::setAudioGain(float gain)
     m_audioGain = gain;
     emit commandReady(QString("slice set %1 audio_level=%2")
         .arg(m_id).arg(static_cast<int>(gain)));
+    // Operator-issued, for a backend that mixes slice audio on THIS host and
+    // never sees the Flex wire text above. See audioGainCommandIssued.
+    emit audioGainCommandIssued(static_cast<int>(gain));
     emit audioGainChanged(m_audioGain);
 }
 
@@ -799,6 +856,7 @@ void SliceModel::setAudioMute(bool mute)
     if (m_audioMute == mute) return;
     m_audioMute = mute;
     sendCommand(QString("slice set %1 audio_mute=%2").arg(m_id).arg(mute ? 1 : 0));
+    emit audioMuteCommandIssued(m_audioMute);
     if (audioMute() != previousVisibleMute) {
         emit audioMuteChanged(audioMute());
     }
@@ -961,6 +1019,7 @@ void SliceModel::setAudioPan(int pan)
     if (m_audioPan == pan) return;
     m_audioPan = pan;
     sendCommand(QString("slice set %1 audio_pan=%2").arg(m_id).arg(pan));
+    emit audioPanCommandIssued(pan);
     emit audioPanChanged(pan);
 }
 
@@ -1291,6 +1350,10 @@ void SliceModel::applyChanges(const SliceDelta& d)
         m_anft = *d.anft;
         emit anftChanged(m_anft);
     }
+    if (d.mn.has_value()) {
+        m_mn = *d.mn;
+        emit mnChanged(m_mn);
+    }
     if (d.apf.has_value()) {
         bool v = *d.apf;
         if (m_apf != v) { m_apf = v; emit apfChanged(v); }
@@ -1337,6 +1400,10 @@ void SliceModel::applyChanges(const SliceDelta& d)
         int v = *d.anflLevel;
         if (m_anflLevel != v) { m_anflLevel = v; emit anflLevelChanged(v); }
     }
+    if (d.mnLevel.has_value()) {
+        int v = *d.mnLevel;
+        if (m_mnLevel != v) { m_mnLevel = v; emit mnLevelChanged(v); }
+    }
     if (d.agcMode.has_value()) {
         m_agcMode = *d.agcMode;
         emit agcModeChanged(m_agcMode);
@@ -1352,8 +1419,19 @@ void SliceModel::applyChanges(const SliceDelta& d)
     if (d.squelchOn.has_value() || d.squelchLevel.has_value()) {
         if (d.squelchOn.has_value())
             m_squelchOn = *d.squelchOn;
-        if (d.squelchLevel.has_value())
+        if (d.squelchLevel.has_value()) {
             m_squelchLevel = *d.squelchLevel;
+            // Adopt the echoed level as the operator's manual choice only
+            // when the surface owning this slice's SQL mode says it is one
+            // (see setSquelchEchoIsManual) — an Auto-computed level, or the
+            // level carried by an Off-mode push, would otherwise silently
+            // overwrite the threshold the operator actually chose (#4592).
+            // External-receive (Kiwi) slices keep their level in
+            // m_externalReceiveSquelchLevel and never read the Flex manual
+            // memory, so exclude them here exactly as setManualSquelch does.
+            if (m_squelchEchoIsManual && !m_externalReceiveAudioReplacement)
+                setManualSquelchLevel(*d.squelchLevel);
+        }
         emit squelchChanged(m_squelchOn, m_squelchLevel);
     }
     if (d.ritOn.has_value() || d.ritFreq.has_value()) {
@@ -1438,6 +1516,9 @@ void SliceModel::applyChanges(const SliceDelta& d)
         emit fmDeviationChanged(m_fmDeviation);
     }
 
+    // (applyRecalledStepHz is defined next to the status decode on purpose: the
+    // two are the only writers of m_stepHz, and a future edit to one should see
+    // the other.)
     if (d.step.has_value() || d.stepList.has_value()) {
         bool changed = false;
         if (d.step.has_value()) {
@@ -1463,6 +1544,23 @@ void SliceModel::applyChanges(const SliceDelta& d)
         emit frequencyChanged(m_frequency);
     if (modeChanged_)   emit modeChanged(m_mode);
     if (filterChanged_) emit filterChanged(m_filterLow, m_filterHigh);
+}
+
+void SliceModel::applyRecalledStepHz(int hz)
+{
+    // Host-bank recall only — see the header for why this is the one sanctioned
+    // client-side write of a radio-authoritative field.
+    //
+    // No command is emitted: there is no wire to send it over on a backend
+    // without a command plane, which is exactly why the recalled step was being
+    // lost. stepChanged() is what the tuning-step control and the tuning wheel
+    // listen to, so the value takes effect in the UI just as a radio-sourced one
+    // would, and a later status update from a radio that does own the field
+    // still wins by overwriting it.
+    if (hz <= 0 || hz == m_stepHz)
+        return;
+    m_stepHz = hz;
+    emit stepChanged(m_stepHz, m_stepList);
 }
 
 QStringList SliceModel::drainPendingCommands()

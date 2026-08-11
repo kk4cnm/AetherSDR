@@ -59,10 +59,16 @@ public:
                              int renderMode = 0,
                              int dssFloorDepth = 6,
                              int dssGain = 70,
-                             const QColor& lineColor = QColor(0x00, 0xe5, 0xff));
+                             const QColor& lineColor = QColor(0x00, 0xe5, 0xff),
+                             int dssRowSpan = 100);
     // Update only the radio-owned pan processing controls from live status.
     // Signal blockers keep status echoes from generating commands back to the
     // radio.
+    // Grey the 3D Span row out when the GPU mesh path is unavailable. The CPU
+    // image fallback ignores rowSpanFactor entirely, so the control would move,
+    // label, and persist while nothing on screen changed.
+    void setDssRowSpanSupported(bool supported);
+
     void syncPanProcessingSettings(int avg, int fps, bool weightedAvg);
     void syncWfLineDuration(int rate);
     void syncKiwiWaterfallSettings(int minDbm, int maxDbm, bool autoScale,
@@ -81,9 +87,37 @@ public:
     // Connect/disconnect the ANT panel to a slice model.
     void setSlice(SliceModel* slice);
     void setWnbState(bool on, int level);
+    // Show/hide the whole WNB row (button + level slider + readout) based on
+    // whether the radio runs its own DSP (RadioCapabilities::hasRadioSideDsp).
+    void setRadioSideDspAvailable(bool available);
+    // Whether this radio has DAX audio/IQ channels at all
+    // (RadioCapabilities::hasDaxStreams). Hides the per-pan DAX button and its
+    // panel: the channel selectors reach a radio-side routing feature that a
+    // backend without DAX simply does not have, so on an HL2 they were live
+    // controls wired to nothing.
+    void setDaxStreamsAvailable(bool available);
+    // Whether the connected radio can hold manual notches at all
+    // (RadioCapabilities::maxNotchFilters). False HIDES the +TNF button rather
+    // than disabling it: the control shipped live on every backend while the
+    // commands behind it only meant anything to a Flex, so on any other radio
+    // it was a button that did nothing.
+    void setNotchesSupported(bool supported);
+    // Whether the RADIO computes a per-tile waterfall black level
+    // (RadioCapabilities::hasRadioSideWaterfallAutoBlack). False removes HW from
+    // the Black Level button's cycle and moves off it if it was selected —
+    // the SW estimate is untouched and stays available on every family.
+    void setRadioSideAutoBlackAvailable(bool available);
     void syncWnbState(bool on, int level, bool updating);
     void setRfGain(int gain);
-    void setRfGainRange(int low, int high, int step);
+    void setRfGainRange(int low, int high, int step,
+                       const QString& unitSuffix = QStringLiteral(" dB"));
+    // Discrete receive front-end stages. An EMPTY label list hides the
+    // control — a radio with no preamp or no attenuator shows neither an
+    // empty button nor a disabled one.
+    void setPreampLabels(const QStringList& labels);
+    void setPreampStep(int step);
+    void setAttenuatorLabels(const QStringList& labels);
+    void setAttenuatorStep(int step);
     void setLoopState(bool loopA, bool loopB);
     void syncNoiseFloorPosition(int pos);
     void syncDssFloorDepth(int dB);
@@ -97,6 +131,13 @@ public:
     // a default-constructed value when disconnected — the conditional
     // VHF row will disappear.  Triggers a band-panel rebuild. (#695)
     void setRadioCapabilities(ModelCapabilities caps);
+
+    // The tuning range the connected backend reports (MHz). Band buttons whose
+    // target frequency falls outside it are disabled and say why, so a
+    // direct-sampling HF receiver stops offering 6 m as though it were a band
+    // it could reach. Pass (0, 0) for "not reported" — every button is enabled,
+    // which is the pre-existing behaviour and what a Flex gets.
+    void setTuningRangeMhz(double minMhz, double maxMhz);
 
     // Bands the radio itself declared (optional "bands=" discovery/status
     // key, names from BandDefs).  Non-empty: the band grid is built from
@@ -163,6 +204,7 @@ signals:
     void spectrumRenderModeChanged(int mode);
     void dssFloorDepthChanged(int dB);
     void dssGainChanged(int pct);
+    void dssRowSpanChanged(int pct);
     void noiseFloorPositionChanged(int pos);
     void noiseFloorEnableChanged(bool on);
     // Emitted when user selects a band from the sub-panel.  stackKeyHint is
@@ -180,6 +222,9 @@ signals:
     void wnbLevelChanged(int level);
     // Emitted when RF gain slider changes (panadapter-level).
     void rfGainChanged(int gain);
+    // Step index into the label list this menu was given, never a dB value.
+    void preampStepChanged(int step);
+    void attenuatorStepChanged(int step);
     // customLowMhz/customHighMhz bound the sweep when the operator has ticked
     // "Limit range" (else both 0 = sweep the full band). The values are clamped
     // to the in-region band edges receiver-side, so they can only ever narrow
@@ -252,6 +297,21 @@ private:
     bool m_xvtrPanelVisible{false};
     QVector<QPushButton*> m_xvtrBandBtns;
 
+    // Every band button in the main band panel paired with the frequency it
+    // tunes to, so the tuning-range gate can be re-applied after any rebuild
+    // without the two builders each having to know about it.
+    //
+    // QPointer, not a raw pointer: the band panel is destroyed with
+    // deleteLater() on every rebuild, so entries can outlive their buttons by a
+    // full event-loop turn if a range update lands in that window.
+    QVector<QPair<QPointer<QPushButton>, double>> m_bandBtnFreqs;
+    double m_tuningMinMhz{0.0};
+    double m_tuningMaxMhz{0.0};
+    // True until a connected backend says otherwise, so a disconnected session
+    // keeps the button rather than having it appear on connect.
+    bool m_notchesSupported{true};
+    void applyTuningRangeToBandButtons();
+
     // Cached state for band-panel rebuilds — setXvtrBands() and
     // setRadioCapabilities() each store their argument and trigger
     // a rebuild so either input changing produces a correct panel
@@ -269,6 +329,25 @@ private:
     QPushButton* m_loopBBtn{nullptr};
     QSlider*     m_rfGainSlider{nullptr};
     QLabel*      m_rfGainLabel{nullptr};
+    // What the RF-gain readout appends. " dB" on a radio with a real gain
+    // register, "%" on one whose gain is an opaque scale.
+    QString      m_rfGainUnitSuffix{QStringLiteral(" dB")};
+    void refreshFrontEndButtons();
+    // ONE ROW EACH, and each hides on its own. They were a single "Front end:"
+    // row with both buttons side by side, which does not fit: the ANT panel is
+    // a fixed 180 px with a 48 px label column, so "Front end:" was clipped and
+    // "PRE: P.AMP2" in the 56 px that left was unreadable. Two rows in the same
+    // label+control shape as RX ANT and RF Gain above them cost one row of
+    // height and make both legible.
+    QWidget*     m_preampRow{nullptr};
+    QWidget*     m_attenuatorRow{nullptr};
+    QPushButton* m_preampBtn{nullptr};
+    QPushButton* m_attenuatorBtn{nullptr};
+    QStringList  m_preampLabels;
+    QStringList  m_attenuatorLabels;
+    int          m_preampStep{0};
+    int          m_attenuatorStep{0};
+    QWidget*     m_wnbRow{nullptr};   // container for the whole WNB row
     QPushButton* m_wnbBtn{nullptr};
     QSlider*     m_wnbSlider{nullptr};
     QLabel*      m_wnbLabel{nullptr};
@@ -317,8 +396,17 @@ private:
     QPushButton* m_autoBlackBtn{nullptr};
     // Auto-black is a 3-way cycle on one button: 0 = Off, 1 = Auto-C (client
     // noise-floor estimate), 2 = Auto-R (radio per-tile level).
+    // The operator's stored INTENT (0 Off / 1 SW / 2 HW). Keeps HW across a
+    // session on a radio that cannot serve it — see effectiveAutoBlackMode.
     int m_autoBlackMode{1};
+    // Permissive default, matching every other capability gate: with no
+    // radio attached there is nothing to be honest about.
+    bool m_radioSideAutoBlackAvailable{true};
     void applyAutoBlackMode(int mode, bool emitSignals);
+    // m_autoBlackMode masked by the capability. The stored field is the
+    // operator's intent and may hold HW on a radio that has none; this is what
+    // the button shows and what the app acts on. (#4606)
+    int  effectiveAutoBlackMode() const;
     void clearKiwiWaterfallAutoButtonState();
     // Two values backing the single Black slider; the slider shows whichever
     // matches the current AUTO state.  Toggling AUTO swaps the displayed
@@ -331,6 +419,10 @@ private:
     QLabel*      m_dssFloorLabel{nullptr};
     QSlider*     m_dssGainSlider{nullptr};  // 3DSS colour floor (0-100)
     QLabel*      m_dssGainLabel{nullptr};
+    QSlider*     m_dssRowSpanSlider{nullptr};  // 3DSS wedge close-in (0-100)
+    QLabel*      m_dssRowSpanLabel{nullptr};
+    QLabel*      m_dssRowSpanTitle{nullptr};
+    bool         m_dssRowSpanSupported{true};
     QComboBox*   m_gpuCombo{nullptr};   // render-GPU selector (multi-GPU only)
     QSlider*     m_rateSlider{nullptr};
     QLabel*      m_rateLabel{nullptr};

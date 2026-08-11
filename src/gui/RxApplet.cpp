@@ -1,4 +1,6 @@
 #include "RxApplet.h"
+
+#include "gui/FilterStepMath.h"
 #include "FilterPassbandWidget.h"
 #include "FrequencyEntryParser.h"
 #include "GuardedSlider.h"
@@ -323,14 +325,9 @@ RxApplet::RxApplet(QWidget* parent) : QWidget(parent)
         "QSlider::sub-page:horizontal { background: {{color.slider.foreground}}; }"
         "QSlider::sub-page:vertical   { background: {{color.slider.foreground}}; }");
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
-    // Recall the last user-chosen Manual squelch threshold from prior
-    // sessions.  Auto mode clobbers the slice's squelchLevel with
-    // algorithm-suggested values, so the radio can't be relied on to
-    // preserve the operator's manual preference across mode cycles or
-    // launches — we persist it client-side.
-    m_sqlManualLevel = std::clamp(
-        AppSettings::instance().value("LastManualSquelchLevel", "20").toInt(),
-        0, 100);
+    // m_sqlManualLevel is only the fallback for when no slice is attached;
+    // it takes its class-default (20) here. Squelch is radio-authoritative
+    // (AGENTS.md "do NOT persist") — no AppSettings seed (#4592).
     m_accessibleFrequencyTimer.setSingleShot(true);
     connect(&m_accessibleFrequencyTimer, &QTimer::timeout, this, [this]() {
         if (!QAccessible::isActive() || !m_freqLabel) {
@@ -1345,11 +1342,11 @@ void RxApplet::cycleSqlMode()
 //
 // VfoWidget hosts a second SQL button+slider that must show the same
 // mode and value as the one in RxApplet.  These helpers let it pipe its
-// own user events through RxApplet's existing state machine so all the
-// persistence (AppSettings LastManualSquelchLevel / AutoSqlMarginDb),
-// algorithm enable/disable, and the manual-level cache live in exactly
-// one place.  RxApplet emits sqlModeChanged / autoSqlMarginDbChanged
-// back so VfoWidget can refresh its UI.
+// own user events through RxApplet's existing state machine so the
+// persistence (AppSettings AutoSqlMarginDb), algorithm enable/disable,
+// and the per-slice manual-level cache (SliceModel::manualSquelchLevel,
+// #4592) live in exactly one place.  RxApplet emits sqlModeChanged /
+// autoSqlMarginDbChanged back so VfoWidget can refresh its UI.
 
 void RxApplet::cycleSqlModeExternal()
 {
@@ -1373,7 +1370,12 @@ int RxApplet::sqlManualLevel() const
         return clampManualSqlLevelForCurrentSurface(
             m_slice->receiveSquelchLevel());
     }
-    return clampManualSqlLevelForCurrentSurface(m_sqlManualLevel);
+    // Per-slice (#3326): m_sqlManualLevel is only the fallback for the rare
+    // moment no slice is attached — once attached, each slice keeps its own
+    // remembered manual threshold so switching the active slice doesn't
+    // pull in whichever slice last touched the control.
+    return clampManualSqlLevelForCurrentSurface(
+        m_slice ? m_slice->manualSquelchLevel() : m_sqlManualLevel);
 }
 
 int RxApplet::sqlManualMaximum() const
@@ -1395,10 +1397,15 @@ void RxApplet::setManualSqlLevelForCurrentSurface(int level)
         return;
     }
 
+    // Per-slice (#3326): the attached slice keeps its own threshold.
+    // m_sqlManualLevel is refreshed unconditionally too (#4592), not just
+    // when no slice is attached, so the no-slice fallback tracks the
+    // operator's last choice instead of freezing at whatever it held the
+    // first time a slice attached.
+    if (m_slice) {
+        m_slice->setManualSquelchLevel(clamped);
+    }
     m_sqlManualLevel = clamped;
-    auto& s = AppSettings::instance();
-    s.setValue("LastManualSquelchLevel", QString::number(clamped));
-    s.save();
 }
 
 void RxApplet::setSqlSliderValueExternal(int v)
@@ -1458,14 +1465,29 @@ void RxApplet::setSqlMode(SqlMode m, bool propagateToRadio)
     if (wasAuto != nowAuto)
         emit sqlAutoChanged(nowAuto);
 
+    // Re-gate the slice's status-echo handler on EVERY mode change, not only
+    // the Auto edges: an echoed level counts as the operator's manual choice
+    // only while we are in Manual.  Gating on `wasAuto != nowAuto` alone
+    // would miss Off↔Manual entirely (wasAuto == nowAuto there), and would
+    // leave the gate open across Auto→Off — the leg every return from Auto
+    // to Manual goes through, since cycleSqlMode() runs Off→Manual→Auto→Off
+    // (#4592).
+    if (m_slice) m_slice->setSquelchEchoIsManual(m == SqlMode::Manual);
+
     // Manual / Auto both want the radio squelch ON. Use the same model-backed
     // value that applySqlModeVisuals() displays so the first Kiwi command
     // cannot diverge from the slider/overlay before the operator drags it.
+    //
+    // Only Auto sends the dB margin: it is a 5–20 dB offset from the noise
+    // floor, not a 0–100 threshold.  Since #4592 dropped the client-side
+    // copy, the radio's own squelch_level is the only surviving record of
+    // the operator's manual threshold across a reconnect — writing the
+    // margin there on the way to Off would destroy it (Principle II).
     if (propagateToRadio && m_slice) {
         const bool sqOn = (m != SqlMode::Off);
-        const int level = (m == SqlMode::Manual)
-            ? sqlManualLevel()
-            : autoSqlMarginDb();
+        const int level = (m == SqlMode::Auto)
+            ? autoSqlMarginDb()
+            : sqlManualLevel();
         m_slice->setSquelch(sqOn, level);
     }
 }
@@ -1860,6 +1882,7 @@ void RxApplet::setKiwiSdrManager(KiwiSdrManager* manager)
                 applySqlModeVisuals();
                 emit sqlModeChanged(static_cast<int>(m_sqlMode));
                 emit sqlAutoChanged(m_sqlMode == SqlMode::Auto);
+                m_slice->setSquelchEchoIsManual(m_sqlMode == SqlMode::Manual);
             }
         });
     }
@@ -2306,6 +2329,11 @@ void RxApplet::connectSlice(SliceModel* s)
     }
     emit sqlModeChanged(static_cast<int>(m_sqlMode));
     emit sqlAutoChanged(m_sqlMode == SqlMode::Auto);
+    // Explicit re-sync on every (re)attach: setSqlMode() above is a no-op
+    // when the mode it computed already matches m_sqlMode, so a freshly
+    // connected slice can arrive with the gate at its class default rather
+    // than this applet's actual mode (#4592).
+    s->setSquelchEchoIsManual(m_sqlMode == SqlMode::Manual);
     emit squelchStateChanged(s->receiveSquelchOn(), s->receiveSquelchLevel());
     // AF gain → radio's per-slice audio_level
     {
@@ -2434,6 +2462,13 @@ void RxApplet::disconnectSlice(SliceModel* s)
 {
     s->disconnect(this);
     m_savedSquelchOn = false;
+    // No surface owns this slice's SQL mode once it's detached (review on
+    // #4592), so fall back to the class default: treat echoes as manual.
+    // Leaving the gate closed would permanently deafen a later-reclaimed or
+    // reattached slice to genuine manual changes — the same silent-overwrite
+    // class in the opposite direction, and precisely the non-active-slice
+    // leak #4592 part 1 set out to close.
+    s->setSquelchEchoIsManual(true);
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
@@ -2523,21 +2558,16 @@ void RxApplet::applyFilterPreset(int widthHz)
     m_slice->setFilterWidth(lo, hi);
 }
 
-void RxApplet::stepFilterWidth(int direction)
+void RxApplet::stepFilterWidth(int steps)
 {
-    if (!m_slice || m_filterWidths.isEmpty() || direction == 0) return;
-
+    // ONE list, searched, clamped and applied — see FilterStepMath.h for why
+    // that is stated rather than assumed.
+    const QVector<int>& stepWidths = effectiveFilterWidths();
+    if (!m_slice) return;
     const int currentWidth = m_slice->filterHigh() - m_slice->filterLow();
-    int idx = 0;
-    int bestDist = std::numeric_limits<int>::max();
-    for (int i = 0; i < m_filterWidths.size(); ++i) {
-        const int dist = std::abs(currentWidth - m_filterWidths[i]);
-        if (dist < bestDist) { bestDist = dist; idx = i; }
-    }
-    const int next = std::clamp(idx + (direction > 0 ? 1 : -1),
-                                0, static_cast<int>(m_filterWidths.size()) - 1);
-    if (next == idx && bestDist == 0) return;
-    applyFilterPreset(m_filterWidths[next]);
+    const int next = steppedFilterWidthIndex(stepWidths, currentWidth, steps);
+    if (next < 0) return;
+    applyFilterPreset(stepWidths[next]);
 }
 
 void RxApplet::updateFilterButtons()
@@ -2590,12 +2620,16 @@ void RxApplet::updateFilterButtons()
     int bestIdx = -1;
     int bestDist = INT_MAX;
     if (width >= 0) {
-        for (int i = 0; i < m_filterWidths.size(); ++i) {
-            int dist = std::abs(width - m_filterWidths[i]);
+        // Through the EFFECTIVE list, like the buttons themselves — reading the
+        // operator's list here while the buttons were built from the radio's
+        // would highlight a button by an index into a different array.
+        const QVector<int>& widths = effectiveFilterWidths();
+        for (int i = 0; i < widths.size(); ++i) {
+            int dist = std::abs(width - widths[i]);
             if (dist < bestDist) { bestDist = dist; bestIdx = i; }
         }
         // Only highlight if reasonably close (within 10% of the preset width)
-        if (bestIdx >= 0 && bestDist > m_filterWidths[bestIdx] / 10)
+        if (bestIdx >= 0 && bestDist > widths[bestIdx] / 10)
             bestIdx = -1;
     }
 
@@ -2704,6 +2738,15 @@ void RxApplet::updateModeSettings(const QString& mode)
     if (m_slice) updateFilterButtons();
 }
 
+void RxApplet::setRadioFilterWidths(const QList<int>& widthsHz)
+{
+    QVector<int> wanted(widthsHz.begin(), widthsHz.end());
+    if (wanted == m_radioFilterWidths)
+        return;   // rides capabilitiesChanged, which repeats on every edge
+    m_radioFilterWidths = wanted;
+    rebuildFilterButtons();
+}
+
 void RxApplet::rebuildFilterButtons()
 {
     // Remove old buttons
@@ -2711,74 +2754,97 @@ void RxApplet::rebuildFilterButtons()
     m_filterBtns.clear();
 
     // Create new buttons matching current mode's filter widths
-    for (int i = 0; i < m_filterWidths.size(); ++i) {
-        const int w = m_filterWidths[i];
+    const QVector<int>& widths = effectiveFilterWidths();
+    // Custom edges belong to the OPERATOR'S presets. A radio-declared set is
+    // fixed hardware — there is no edge to customise — so the parallel arrays
+    // are only consulted when that list is the one in force, which is also what
+    // keeps them from being indexed out of range by a shorter radio list.
+    const bool customisable = m_radioFilterWidths.isEmpty();
+    for (int i = 0; i < widths.size(); ++i) {
+        const int w = widths[i];
         auto* btn = mkToggle(formatStepLabel(w));
         btn->setStyleSheet(kButtonBase() + kBlueActive());
-        connect(btn, &QPushButton::clicked, this, [this, i](bool) {
+        connect(btn, &QPushButton::clicked, this, [this, i, customisable](bool) {
             if (!m_slice) return;
-            if (m_filterCustomLo[i] != INT_MIN) {
+            const QVector<int>& live = effectiveFilterWidths();
+            if (i >= live.size()) return;
+            if (customisable && m_filterCustomLo[i] != INT_MIN) {
                 m_slice->setFilterWidth(m_filterCustomLo[i], m_filterCustomHi[i]);
             } else {
-                applyFilterPreset(m_filterWidths[i]);
+                applyFilterPreset(live[i]);
             }
         });
 
-        // Right-click to customize this preset
-        btn->setContextMenuPolicy(Qt::CustomContextMenu);
-        connect(btn, &QPushButton::customContextMenuRequested, this, [this, i, btn](const QPoint& pos) {
-            QMenu menu;
-            menu.addAction("Set Custom Edges...", [this, i] {
-                if (!m_slice) return;
-                QDialog dlg(this);
-                dlg.setWindowTitle("Set Custom Filter Edges");
-                auto* form = new QFormLayout(&dlg);
-                auto* loSpin = new QSpinBox(&dlg);
-                auto* hiSpin = new QSpinBox(&dlg);
-                loSpin->setRange(-20000, 20000);
-                hiSpin->setRange(-20000, 20000);
-                loSpin->setSingleStep(50);
-                hiSpin->setSingleStep(50);
-                loSpin->setSuffix(" Hz");
-                hiSpin->setSuffix(" Hz");
-                int curLo = m_filterCustomLo[i] != INT_MIN
-                                ? m_filterCustomLo[i] : m_slice->filterLow();
-                int curHi = m_filterCustomHi[i] != INT_MIN
-                                ? m_filterCustomHi[i] : m_slice->filterHigh();
-                loSpin->setValue(curLo);
-                hiSpin->setValue(curHi);
-                form->addRow("Low edge:", loSpin);
-                form->addRow("High edge:", hiSpin);
-                auto* btns = new QDialogButtonBox(
-                    QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
-                QObject::connect(btns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
-                QObject::connect(btns, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
-                form->addRow(btns);
-                if (dlg.exec() != QDialog::Accepted) return;
-                int lo = loSpin->value();
-                int hi = hiSpin->value();
-                if (hi <= lo) return;
-                m_filterCustomLo[i] = lo;
-                m_filterCustomHi[i] = hi;
-                m_filterWidths[i] = hi - lo;
-                saveFilterPresets();
-                rebuildFilterButtons();
-                m_slice->setFilterWidth(lo, hi);
+        // Right-click to customize this preset — ONLY when the presets are the
+        // OPERATOR'S. The click handler above got this guard; this menu did not,
+        // and it indexes all three operator arrays with `i` from the radio list:
+        // m_filterCustomLo/Hi are read and then WRITTEN, and m_filterWidths is
+        // written and persisted. m_filterWidths is built from the saved
+        // FilterPresets_<mode> string, which legitimately parses to 1-6 entries,
+        // so with two saved presets and a radio declaring three widths the third
+        // button is an out-of-range read and an out-of-range write on accept.
+        // Even in range it edits the wrong preset silently.
+        //
+        // Not installed rather than guarded inside, which is also what the
+        // customisable comment already argues: a radio-declared set is fixed
+        // hardware and has no edge to customise.
+        if (customisable) {
+            btn->setContextMenuPolicy(Qt::CustomContextMenu);
+            connect(btn, &QPushButton::customContextMenuRequested, this, [this, i, btn](const QPoint& pos) {
+                QMenu menu;
+                menu.addAction("Set Custom Edges...", [this, i] {
+                    if (!m_slice) return;
+                    QDialog dlg(this);
+                    dlg.setWindowTitle("Set Custom Filter Edges");
+                    auto* form = new QFormLayout(&dlg);
+                    auto* loSpin = new QSpinBox(&dlg);
+                    auto* hiSpin = new QSpinBox(&dlg);
+                    loSpin->setRange(-20000, 20000);
+                    hiSpin->setRange(-20000, 20000);
+                    loSpin->setSingleStep(50);
+                    hiSpin->setSingleStep(50);
+                    loSpin->setSuffix(" Hz");
+                    hiSpin->setSuffix(" Hz");
+                    int curLo = m_filterCustomLo[i] != INT_MIN
+                                    ? m_filterCustomLo[i] : m_slice->filterLow();
+                    int curHi = m_filterCustomHi[i] != INT_MIN
+                                    ? m_filterCustomHi[i] : m_slice->filterHigh();
+                    loSpin->setValue(curLo);
+                    hiSpin->setValue(curHi);
+                    form->addRow("Low edge:", loSpin);
+                    form->addRow("High edge:", hiSpin);
+                    auto* btns = new QDialogButtonBox(
+                        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+                    QObject::connect(btns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+                    QObject::connect(btns, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+                    form->addRow(btns);
+                    if (dlg.exec() != QDialog::Accepted) return;
+                    int lo = loSpin->value();
+                    int hi = hiSpin->value();
+                    if (hi <= lo) return;
+                    m_filterCustomLo[i] = lo;
+                    m_filterCustomHi[i] = hi;
+                    m_filterWidths[i] = hi - lo;
+                    saveFilterPresets();
+                    rebuildFilterButtons();
+                    m_slice->setFilterWidth(lo, hi);
+                });
+                menu.addAction("Reset to Default", [this, i] {
+                    if (!m_slice) return;
+                    const auto& factory = modeSettingsFor(m_slice->mode()).filterWidths;
+                    if (i >= factory.size()) return;
+                    m_filterWidths[i] = factory[i];
+                    m_filterCustomLo[i] = INT_MIN;
+                    m_filterCustomHi[i] = INT_MIN;
+                    saveFilterPresets();
+                    rebuildFilterButtons();
+                    applyFilterPreset(m_filterWidths[i]);
+                });
+                menu.exec(btn->mapToGlobal(pos));
             });
-            menu.addAction("Reset to Default", [this, i] {
-                if (!m_slice) return;
-                const auto& factory = modeSettingsFor(m_slice->mode()).filterWidths;
-                if (i >= factory.size()) return;
-                m_filterWidths[i] = factory[i];
-                m_filterCustomLo[i] = INT_MIN;
-                m_filterCustomHi[i] = INT_MIN;
-                saveFilterPresets();
-                rebuildFilterButtons();
-                applyFilterPreset(m_filterWidths[i]);
-            });
-            menu.exec(btn->mapToGlobal(pos));
-        });
+        }   // if (customisable)
 
+        // OUTSIDE the guard: the button itself is always created and shown.
         m_filterBtns.append(btn);
         m_filterGrid->addWidget(btn, i / 3, i % 3);
     }

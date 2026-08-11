@@ -84,6 +84,10 @@ public:
     bool    nrfOn()       const { return m_nrf; }
     bool    anflOn()      const { return m_anfl; }
     bool    anftOn()      const { return m_anft; }
+    // The radio's own single in-passband notch (RadioCapabilities::
+    // hasManualNotch). mnLevel() is a POSITION, 0..100 across the passband,
+    // not a frequency and not a depth.
+    bool    mnOn()        const { return m_mn; }
     bool    apfOn()       const { return m_apf; }
     int     apfLevel()    const { return m_apfLevel; }
     int     nbLevel()     const { return m_nbLevel; }
@@ -93,6 +97,7 @@ public:
     int     nrsLevel()    const { return m_nrsLevel; }
     int     nrfLevel()    const { return m_nrfLevel; }
     int     anflLevel()   const { return m_anflLevel; }
+    int     mnLevel()     const { return m_mnLevel; }
     QString agcMode()      const { return m_agcMode; }
     QString flexAgcMode()  const { return m_agcMode; }
     QString receiveAgcMode() const { return m_externalReceiveAudioReplacement
@@ -126,11 +131,44 @@ public:
     int     receiveSquelchLevel() const { return m_externalReceiveAudioReplacement
                                               ? m_externalReceiveSquelchLevel
                                               : m_squelchLevel; }
+    // Last manual-mode threshold the operator chose for THIS slice,
+    // independent of squelchLevel() (which Auto mode also overwrites with
+    // its own computed threshold each update). RxApplet restores Manual
+    // mode's slider from this when it reattaches to a slice, so switching
+    // the active slice doesn't pull in another slice's threshold (#3326).
+    int     manualSquelchLevel() const { return m_manualSquelchLevel; }
+    void    setManualSquelchLevel(int level) { m_manualSquelchLevel = qBound(0, level, 100); }
+    // Whether a radio-echoed squelch_level for this slice should be taken as
+    // the operator's manual choice.  Driven by whichever surface owns the
+    // slice's SQL mode (RxApplet), and true only while that mode is Manual:
+    //   Manual — the echo is a genuine manual level (the operator's own
+    //            edit, another Multi-Flex client, or session restore) and
+    //            must update the manual memory.
+    //   Auto   — the level is algorithm-computed and re-pushed every tick.
+    //   Off    — the mode push sends sqlManualLevel(), but nothing keeps a
+    //            disabled squelch's level pinned, so an echo here is not a
+    //            threshold the operator chose either.
+    // Adopting the last two would silently overwrite the threshold the
+    // operator actually chose (#4592) — the same silent-overwrite class
+    // #3326 fixed, reached via the status-echo path rather than a direct
+    // client write.  Defaults true so a slice with no surface attached (a
+    // non-active VFO flag, a slice reclaimed from a previous session) still
+    // tracks genuine manual changes — the leak #4592 part 1 set out to close.
+    void    setSquelchEchoIsManual(bool isManual) { m_squelchEchoIsManual = isManual; }
     bool    ritOn()       const { return m_ritOn; }
     int     ritFreq()     const { return m_ritFreq; }
     bool    xitOn()       const { return m_xitOn; }
     int     xitFreq()     const { return m_xitFreq; }
     int     stepHz()      const { return m_stepHz; }
+    // HOST-BANK MEMORY RECALL ONLY — do not call this on a radio that owns its
+    // slots. Step size is radio-authoritative (AGENTS.md, Principle II): on a
+    // Flex it arrives as `slice` status and the client must never assert it, or
+    // the two fight on reconnect. On a backend with no command plane there is no
+    // radio opinion to defer to, the host bank owns the channel, and a recalled
+    // step would otherwise never take because the wire command that normally
+    // round-trips it is dropped. Named for its one caller so the exception stays
+    // visible; see RadioModel::recallLocalMemory().
+    void    applyRecalledStepHz(int hz);
     QVector<int> stepList() const { return m_stepList; }
     int     daxChannel()  const { return m_daxChannel; }
     int     rttyMark()        const { return m_rttyMark; }
@@ -221,6 +259,7 @@ public:
     void setNrf(bool on);
     void setAnfl(bool on);
     void setAnft(bool on);
+    void setMn(bool on);
     void setApf(bool on);
     void setApfLevel(int v);
     void setNbLevel(int v);
@@ -230,10 +269,19 @@ public:
     void setNrsLevel(int v);
     void setNrfLevel(int v);
     void setAnflLevel(int v);
+    void setMnLevel(int v);
     void setAgcMode(const QString& mode);
     void setAgcThreshold(int value);
     void setAgcOffLevel(int value);
     void setSquelch(bool on, int level);
+    // For genuine operator-driven manual squelch input only (a VFO flag's
+    // own SQL controls, a controller-mapped squelch knob) — setSquelch()
+    // plus recording the level as the operator's manual choice, in one
+    // call so no caller can push a manual level and forget the second half
+    // (#4592). Algorithm-driven writes (Auto mode) must keep calling plain
+    // setSquelch() — routing them here would silently overwrite the
+    // operator's last manual choice with the auto-computed value.
+    void setManualSquelch(bool on, int level);
     void setRit(bool on, int hz);
     void setXit(bool on, int hz);
     void setDaxChannel(int ch);
@@ -289,6 +337,51 @@ signals:
     // setAgcThreshold(), and always carries BOTH values because a backend
     // configuring a DSP AGC needs the pair to act on either.
     void agcCommandIssued(const QString& mode, int thresholdDb);
+
+    // RECEIVE DSP THE RADIO RUNS. Same contract as the signals above: emitted
+    // only by the operator-facing setters, never by status application, so a
+    // radio's own echo can never come back as a fresh command (Principle II).
+    //
+    // These exist because every one of these controls used to emit FlexRadio
+    // wire text and nothing else. On a Flex that string IS the command; on any
+    // other backend it was discarded, and there was no seam verb for a backend
+    // to implement instead — so declaring hasRadioSideDsp bought nothing and
+    // the control moved while the radio never heard about it.
+    //
+    // Enable and level travel TOGETHER because a radio that has a level
+    // register generally needs both to make either meaningful, and because the
+    // two arriving separately is how a toggle lands before the level it implies.
+    void noiseReductionCommandIssued(bool on, int level);
+    void noiseBlankerCommandIssued(bool on, int level);
+    void autoNotchCommandIssued(bool on);
+    // Enable and position together — see IRadioBackend::setSliceManualNotch
+    // for why turning the notch on without placing it is not enough.
+    void manualNotchCommandIssued(bool on, int position);
+    void squelchCommandIssued(bool on, int level);
+    // Receive and transmit incremental tuning.
+    void ritCommandIssued(bool on, int hz);
+    void xitCommandIssued(bool on, int hz);
+    // Operator-issued per-slice AUDIO changes, same discipline as the three
+    // above: audioMuteChanged/audioGainChanged/audioPanChanged also fire when
+    // radio status is applied, so driving a command off those would echo the
+    // radio's own state back as a request (Principle II).
+    //
+    // These exist because a Flex mixes its slices ON THE RADIO and these
+    // controls are wire commands to it, while a host-mixing backend (HL2)
+    // demodulates every receiver here and has to apply them in its own mixer.
+    // Without them the operator's mute moved the model and the fader, and the
+    // audio kept playing.
+    void audioMuteCommandIssued(bool mute);
+    void audioGainCommandIssued(int gainPercent);
+    void audioPanCommandIssued(int panPercent);      // 0=left, 50=centre, 100=right
+    // Operator asked for THIS slice to own transmit. A radio with one
+    // transmitter and several receivers has to move it rather than set a flag.
+    void txSliceCommandIssued();
+    // Operator selected THIS slice as the one the shared controls act on.
+    // Separate from activeChanged, which also fires when radio status is
+    // applied — driving a command off that would echo the radio's own state
+    // back as a request (Principle II).
+    void activeSliceCommandIssued();
     void panIdChanged(const QString& panId);
     void modeChanged(const QString& mode);
     void filterChanged(int low, int high);
@@ -321,6 +414,7 @@ signals:
     void nrfChanged(bool on);
     void anflChanged(bool on);
     void anftChanged(bool on);
+    void mnChanged(bool on);
     void apfChanged(bool on);
     void apfLevelChanged(int v);
     void nbLevelChanged(int v);
@@ -330,6 +424,7 @@ signals:
     void nrsLevelChanged(int v);
     void nrfLevelChanged(int v);
     void anflLevelChanged(int v);
+    void mnLevelChanged(int v);
     void agcModeChanged(const QString& mode);
     void agcThresholdChanged(int value);
     void agcOffLevelChanged(int value);
@@ -452,6 +547,7 @@ private:
     bool    m_nrf{false};
     bool    m_anfl{false};
     bool    m_anft{false};
+    bool    m_mn{false};
     bool    m_apf{false};
     int     m_apfLevel{50};
     int     m_nbLevel{50};
@@ -461,11 +557,16 @@ private:
     int     m_nrsLevel{50};
     int     m_nrfLevel{50};
     int     m_anflLevel{50};
+    // Mid-passband, so a notch enabled before the slider is touched lands
+    // somewhere the operator can see and drag, not at an edge.
+    int     m_mnLevel{50};
     QString m_agcMode{"med"};
     int     m_agcThreshold{65};
     int     m_agcOffLevel{10};
     bool    m_squelchOn{false};
     int     m_squelchLevel{20};
+    int     m_manualSquelchLevel{20};
+    bool    m_squelchEchoIsManual{true};
     int     m_stepHz{100};
     QVector<int> m_stepList;
     bool    m_ritOn{false};

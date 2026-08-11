@@ -403,6 +403,17 @@ private:
 
 namespace AetherSDR {
 
+static bool isFmRfMode(const QString& mode)
+{
+    return mode == "FM" || mode == "NFM" || mode == "DFM"
+        || mode == "DSTR";
+}
+
+static bool hasFmToneControls(const QString& mode)
+{
+    return mode == "FM" || mode == "NFM" || mode == "DFM";
+}
+
 // ── Styles ────────────────────────────────────────────────────────────────────
 
 // Background is painted manually in paintEvent for true alpha transparency.
@@ -1785,8 +1796,8 @@ void VfoWidget::buildTabContent()
             } else if (m_slice && m_slice->externalReceiveReplacementActive()) {
                 cycleStandaloneSqlMode();
             } else if (!m_updatingFromModel && m_slice) {
-                m_slice->setSquelch(m_sqlBtn->isChecked(),
-                                    clampManualSqlLevel(m_sqlSlider->value()));
+                m_slice->setManualSquelch(m_sqlBtn->isChecked(),
+                                          clampManualSqlLevel(m_sqlSlider->value()));
             }
         });
         connect(m_sqlSlider, &QSlider::valueChanged, this, [this](int v) {
@@ -1804,8 +1815,8 @@ void VfoWidget::buildTabContent()
                        && standaloneSqlMode() == LocalSqlMode::Auto) {
                 setAutoSqlMarginDb(v);
             } else if (m_slice) {
-                m_slice->setSquelch(m_sqlBtn->isChecked(),
-                                    clampManualSqlLevel(v));
+                m_slice->setManualSquelch(m_sqlBtn->isChecked(),
+                                          clampManualSqlLevel(v));
             }
         });
         connect(m_agcCmb, &QComboBox::currentTextChanged, this, [this](const QString& text) {
@@ -1909,6 +1920,15 @@ void VfoWidget::buildTabContent()
             b->setCheckable(true);
             b->setFixedHeight(26);
             b->setStyleSheet(kDspToggle);
+            // A STABLE id, not just an accessible name. These already carry
+            // accessible names, which is what a screen reader needs — but the
+            // automation bridge addresses controls by objectName first, and a
+            // name written as prose ("Auto notch filter") is not a contract:
+            // rewording it for clarity would silently break every script that
+            // drove it. A control that cannot be addressed cannot be certified
+            // (CERTIFICATION.md 1.29), and these are exactly the toggles that
+            // sent `slice dsp` around the problem instead of closing it.
+            b->setObjectName(QStringLiteral("dsp%1Btn").arg(text));
             return b;
         };
 
@@ -1932,6 +1952,9 @@ void VfoWidget::buildTabContent()
         m_anflBtn->setAccessibleName("LMS notch filter");
         m_anftBtn = makeDsp("ANFT");
         m_anftBtn->setAccessibleName("FFT notch filter");
+        m_mnBtn   = makeDsp("MN");
+        m_mnBtn->setAccessibleName("Manual notch filter");
+        m_mnBtn->hide();   // shown only on a radio that claims hasManualNotch
         m_apfBtn->hide();  // only visible in CW mode
 
         // Client-side AetherDSP launcher — same kDspToggle styling and
@@ -1972,6 +1995,7 @@ void VfoWidget::buildTabContent()
         m_dspGrid->addWidget(m_nrfBtn,  1, 3);
         m_dspGrid->addWidget(m_anflBtn, 2, 0);
         m_dspGrid->addWidget(m_anftBtn, 2, 1);
+        m_dspGrid->addWidget(m_mnBtn,   2, 2);
         dspVb->addLayout(m_dspGrid);
 
         // Shared DSP-level row — one slider that re-targets based on which
@@ -2011,6 +2035,7 @@ void VfoWidget::buildTabContent()
                     case LvlNrs:  m_slice->setNrsLevel(v);  break;
                     case LvlNrf:  m_slice->setNrfLevel(v);  break;
                     case LvlAnfl: m_slice->setAnflLevel(v); break;
+                    case LvlMn:   m_slice->setMnLevel(v);   break;
                     case LvlNone: break;
                 }
             });
@@ -2033,6 +2058,8 @@ void VfoWidget::buildTabContent()
         m_nrfBtn->setToolTip("Spectral subtraction filter \u2014 computes speech/noise probability per frequency bin to remove steady noise.");
         m_anflBtn->setToolTip("Leaky LMS notch filter \u2014 removes steady tones such as power-line hum or carriers.");
         m_anftBtn->setToolTip("FFT-based notch filter \u2014 removes up to five persistent tones from transformers or power supplies.");
+        m_mnBtn->setToolTip("Manual notch \u2014 the radio's own single notch. The level slider moves it "
+                            "across the passband; it is a POSITION, not a depth.");
 
         // DSP button accessible names (#870)
         // Accessible names set inline after each widget creation below (#870)
@@ -2054,7 +2081,7 @@ void VfoWidget::buildTabContent()
             m_apfSlider->setRange(0, 100);
             m_apfSlider->setValue(50);
             applyPrimarySliderStyle(m_apfSlider);
-            m_apfSlider->setToolTip("Adjusts APF bandwidth. Higher values narrow the peak for better CW selectivity.");
+            m_apfSlider->setToolTip("Adjusts APF bandwidth. Higher values narrow the peak for better CW selectivity. Enabled when APF is on in the DSP grid.");
             apfVb->addWidget(m_apfSlider, 1);
             m_apfValueLbl = new QLabel("50");
             m_apfValueLbl->setStyleSheet(kLabelStyle);
@@ -2067,6 +2094,11 @@ void VfoWidget::buildTabContent()
                 if (!m_updatingFromModel && m_slice) m_slice->setApfLevel(v);
             });
 
+            // Level is only reachable while the filter is engaged — same rule
+            // as every other DSP parameter. Kept VISIBLE (disabled) in CW so
+            // the control stays discoverable; hiding it was how operators
+            // ended up dragging a live slider into a disengaged filter (#4658).
+            m_apfContainer->setEnabled(false);
             m_apfContainer->hide();
             dspVb->addWidget(m_apfContainer);
         }
@@ -2276,7 +2308,8 @@ void VfoWidget::buildTabContent()
             dspVb->addWidget(m_digContainer);
         }
 
-        // FM OPT controls (hidden unless FM/NFM mode)
+        // FM-family OPT controls. DSTR uses the DFM RF chain and therefore
+        // shares the duplex-offset controls, but it does not use CTCSS.
         {
             static const QString kDirBtn =
                 "QPushButton { background: #1a2a3a; border: 1px solid #304050; border-radius: 2px;"
@@ -2290,14 +2323,19 @@ void VfoWidget::buildTabContent()
                 "QPushButton:hover { border: 1px solid #0090e0; }";
 
             m_fmContainer = new QWidget;
+            m_fmContainer->setObjectName("vfoFmDuplexContainer");
             auto* fvb = new QVBoxLayout(m_fmContainer);
             fvb->setContentsMargins(0, 0, 0, 0);
             fvb->setSpacing(2);
 
             // Tone mode + tone value on one row
-            auto* toneRow = new QHBoxLayout;
+            m_fmToneContainer = new QWidget;
+            m_fmToneContainer->setObjectName("vfoFmToneContainer");
+            auto* toneRow = new QHBoxLayout(m_fmToneContainer);
+            toneRow->setContentsMargins(0, 0, 0, 0);
             toneRow->setSpacing(2);
             m_fmToneModeCmb = new GuardedComboBox;
+            m_fmToneModeCmb->setAccessibleName("FM tone mode");
             m_fmToneModeCmb->addItem("Off", QString("off"));
             m_fmToneModeCmb->addItem("CTCSS TX", QString("ctcss_tx"));
             AetherSDR::applyComboStyle(m_fmToneModeCmb);
@@ -2305,6 +2343,7 @@ void VfoWidget::buildTabContent()
 
             // Tone value — simplified list of common CTCSS tones
             m_fmToneValueCmb = new GuardedComboBox;
+            m_fmToneValueCmb->setAccessibleName("FM tone frequency");
             const double tones[] = {67.0,71.9,74.4,77.0,79.7,82.5,85.4,88.5,91.5,94.8,
                 97.4,100.0,103.5,107.2,110.9,114.8,118.8,123.0,127.3,131.8,
                 136.5,141.3,146.2,151.4,156.7,162.2,167.9,173.8,179.9,186.2,
@@ -2315,7 +2354,7 @@ void VfoWidget::buildTabContent()
             AetherSDR::applyComboStyle(m_fmToneValueCmb);
             m_fmToneValueCmb->setEnabled(false);
             toneRow->addWidget(m_fmToneValueCmb, 1);
-            fvb->addLayout(toneRow);
+            fvb->addWidget(m_fmToneContainer);
 
             connect(m_fmToneModeCmb, QOverload<int>::of(&QComboBox::currentIndexChanged),
                     this, [this](int idx) {
@@ -2337,6 +2376,7 @@ void VfoWidget::buildTabContent()
             offLbl->setStyleSheet(kLabelStyle);
             offRow->addWidget(offLbl);
             m_fmOffsetSpin = new QDoubleSpinBox;
+            m_fmOffsetSpin->setAccessibleName("Repeater offset");
             m_fmOffsetSpin->setRange(0.0, 100.0);
             m_fmOffsetSpin->setDecimals(3);
             m_fmOffsetSpin->setSingleStep(0.1);
@@ -2375,12 +2415,14 @@ void VfoWidget::buildTabContent()
             };
 
             m_fmOffsetDown = new QPushButton(QString::fromUtf8("\xe2\x88\x92"));
+            m_fmOffsetDown->setAccessibleName("Repeater offset down");
             m_fmOffsetDown->setCheckable(true);
             m_fmOffsetDown->setStyleSheet(kDirBtn);
             connect(m_fmOffsetDown, &QPushButton::clicked, this, [applyDir] { applyDir("down"); });
             dirRow->addWidget(m_fmOffsetDown);
 
             m_fmSimplexBtn = new QPushButton("Simplex");
+            m_fmSimplexBtn->setAccessibleName("Repeater simplex");
             m_fmSimplexBtn->setCheckable(true);
             m_fmSimplexBtn->setChecked(true);
             m_fmSimplexBtn->setStyleSheet(kDirBtn);
@@ -2388,12 +2430,14 @@ void VfoWidget::buildTabContent()
             dirRow->addWidget(m_fmSimplexBtn);
 
             m_fmOffsetUp = new QPushButton("+");
+            m_fmOffsetUp->setAccessibleName("Repeater offset up");
             m_fmOffsetUp->setCheckable(true);
             m_fmOffsetUp->setStyleSheet(kDirBtn);
             connect(m_fmOffsetUp, &QPushButton::clicked, this, [applyDir] { applyDir("up"); });
             dirRow->addWidget(m_fmOffsetUp);
 
             m_fmRevBtn = new QPushButton("REV");
+            m_fmRevBtn->setAccessibleName("Reverse repeater offset");
             m_fmRevBtn->setCheckable(true);
             m_fmRevBtn->setStyleSheet(kRevBtn);
             connect(m_fmRevBtn, &QPushButton::toggled, this, [this](bool on) {
@@ -2431,6 +2475,7 @@ void VfoWidget::buildTabContent()
         wireLeveledDsp(m_nrsBtn,  &SliceModel::setNrs,  LvlNrs);
         wireLeveledDsp(m_nrfBtn,  &SliceModel::setNrf,  LvlNrf);
         wireLeveledDsp(m_anflBtn, &SliceModel::setAnfl, LvlAnfl);
+        wireLeveledDsp(m_mnBtn,   &SliceModel::setMn,   LvlMn);
         // Toggle-only DSPs — do not interact with the shared slider.
         connect(m_rnnBtn,  &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel && m_slice) m_slice->setRnn(on); });
         connect(m_anftBtn, &QPushButton::toggled, this, [this](bool on) { if (!m_updatingFromModel && m_slice) m_slice->setAnft(on); });
@@ -2826,6 +2871,7 @@ void VfoWidget::updateDspTabAccent()
             || activeWhenAvailable(m_nrfBtn, m_slice->nrfOn())
             || activeWhenAvailable(m_anflBtn, m_slice->anflOn())
             || activeWhenAvailable(m_anftBtn, m_slice->anftOn())
+            || activeWhenAvailable(m_mnBtn, m_slice->mnOn())
             || activeWhenAvailable(m_apfBtn, m_slice->apfOn()));
     const bool dspActive = radioDspActive || m_aetherDspActive;
     QPushButton* dspTabButton = m_tabBtns[1];
@@ -3144,7 +3190,8 @@ void VfoWidget::setSmartSdrPlus(bool has)
 }
 
 // Single source of truth for the extended firmware DSP filters' visibility
-// (NRS/RNN/NRF, 8000-series). Hidden on FM-family modes (FM/NFM/DFM); RNN is
+// (NRS/RNN/NRF, 8000-series). Hidden on FM-family RF modes
+// (FM/NFM/DFM/DSTR); RNN is
 // additionally hidden on CW/CWL. Called from setSlice(), syncFromSlice(), and
 // setHasExtendedDsp() so those three paths can no longer drift (they had
 // disagreed on DFM). Caller must hold a valid m_slice and drive its own
@@ -3152,11 +3199,84 @@ void VfoWidget::setSmartSdrPlus(bool has)
 void VfoWidget::updateExtendedDspVisibility()
 {
     const QString mode = m_slice->mode();
-    const bool isFm = (mode == "FM" || mode == "NFM" || mode == "DFM");
+    const bool isFm = isFmRfMode(mode);
     const bool isCw = (mode == "CW" || mode == "CWL");
     m_nrsBtn->setVisible(!isFm && m_hasExtendedDsp);
     m_rnnBtn->setVisible(!isCw && !isFm && m_hasExtendedDsp);
     m_nrfBtn->setVisible(!isFm && m_hasExtendedDsp);
+}
+
+// The one owner of the radio-side DSP buttons' visibility. Each button is its
+// cached mode eligibility ANDed with the capability, so the two mode recompute
+// sites and setHasRadioSideDsp() cannot disagree about who won.
+//
+// Note the asymmetry with updateExtendedDspVisibility() above: that one derives
+// mode itself, which is safe because its three callers agreed on the rule once
+// #2177 unified them. These six do NOT have an agreed rule — see the comment on
+// m_*ModeOk in the header — so mode stays where it is computed and only the
+// capability is applied here.
+void VfoWidget::applyRadioSideDspVisibility()
+{
+    m_nrBtn->setVisible(m_nrModeOk && m_hasRadioSideDsp);
+    m_nbBtn->setVisible(m_nbModeOk && m_hasRadioSideDsp);
+    m_anfBtn->setVisible(m_anfModeOk && m_hasRadioSideDsp);
+    // The LMS/FFT three carry a SECOND capability on top of the first. A radio
+    // can run its own DSP without running FlexRadio's — see
+    // RadioCapabilities::hasLmsNoiseFilters.
+    m_nrlBtn->setVisible(m_nrlModeOk && m_hasRadioSideDsp && m_hasLmsNoiseFilters);
+    m_anflBtn->setVisible(m_anflModeOk && m_hasRadioSideDsp && m_hasLmsNoiseFilters);
+    m_anftBtn->setVisible(m_anftModeOk && m_hasRadioSideDsp && m_hasLmsNoiseFilters);
+    m_mnBtn->setVisible(m_mnModeOk && m_hasRadioSideDsp && m_hasManualNotch);
+}
+
+void VfoWidget::setHasLmsNoiseFilters(bool has)
+{
+    if (m_hasLmsNoiseFilters == has)
+        return;
+    m_hasLmsNoiseFilters = has;
+    // Same late-arrival hazard as setHasRadioSideDsp below.
+    if (!m_slice)
+        return;
+    applyRadioSideDspVisibility();
+    relayoutDspGrid();
+}
+
+void VfoWidget::setRadioFilterWidths(const QList<int>& widthsHz)
+{
+    const QVector<int> wanted(widthsHz.begin(), widthsHz.end());
+    if (wanted == m_radioFilterWidths)
+        return;   // rides capabilitiesChanged, which repeats on every edge
+    m_radioFilterWidths = wanted;
+    if (!m_slice)
+        return;   // updateModeTab() reads the field when the slice arrives
+    updateModeTab();
+}
+
+void VfoWidget::setHasManualNotch(bool has)
+{
+    if (m_hasManualNotch == has)
+        return;
+    m_hasManualNotch = has;
+    if (!m_slice)
+        return;
+    applyRadioSideDspVisibility();
+    relayoutDspGrid();
+}
+
+void VfoWidget::setHasRadioSideDsp(bool has)
+{
+    if (m_hasRadioSideDsp == has)
+        return;
+    m_hasRadioSideDsp = has;
+    // Same late-arrival hazard setHasExtendedDsp() documents below: the backend's
+    // capability can land AFTER the slice's initial DSP layout, and without a
+    // refresh here the flag would flip while the buttons kept their old state
+    // until the next mode change. Before a slice exists the two mode recompute
+    // sites read the flag on their own.
+    if (!m_slice)
+        return;
+    applyRadioSideDspVisibility();
+    relayoutDspGrid();
 }
 
 void VfoWidget::setHasExtendedDsp(bool has)
@@ -4227,6 +4347,7 @@ void VfoWidget::setSlice(SliceModel* slice)
     wireLevelEcho(&SliceModel::nrsLevelChanged,  LvlNrs);
     wireLevelEcho(&SliceModel::nrfLevelChanged,  LvlNrf);
     wireLevelEcho(&SliceModel::anflLevelChanged, LvlAnfl);
+    wireLevelEcho(&SliceModel::mnLevelChanged,   LvlMn);
     // Mode list (dynamic from radio)
     connect(m_slice, &SliceModel::modeListChanged, this, [this](const QStringList& modes) {
         if (modes.isEmpty()) return;          // keep static fallback list (#891)
@@ -4270,7 +4391,8 @@ void VfoWidget::setSlice(SliceModel* slice)
         bool isRtty = (mode == "RTTY");
         bool isCw   = (mode == "CW" || mode == "CWL");
         bool isDig  = (mode == "DIGL" || mode == "DIGU" || mode == "NT");
-        bool isFm   = (mode == "FM" || mode == "NFM" || mode == "DFM");
+        bool isFm   = isFmRfMode(mode);
+        bool hasToneControls = hasFmToneControls(mode);
         bool isFdv  = mode.startsWith("FDV");  // FDVU, FDVM, etc.
         // Swap DSP tab label to OPT for FM modes
         m_tabBtns[1]->setText(isFm ? "OPT" : "DSP");
@@ -4278,6 +4400,7 @@ void VfoWidget::setSlice(SliceModel* slice)
         m_apfContainer->setVisible(isCw);
         m_digContainer->setVisible(isDig && !isFdv && mode != "NT");
         m_fmContainer->setVisible(isFm);
+        m_fmToneContainer->setVisible(hasToneControls);
         if (isDig) {
             int off = (mode == "DIGL") ? m_slice->diglOffset() : m_slice->diguOffset();
             m_digOffsetLabel->setText(QString::number(off));
@@ -4311,14 +4434,25 @@ void VfoWidget::setSlice(SliceModel* slice)
         }
         syncSqlVisuals();
         m_apfBtn->setVisible(isCw);
-        m_anfBtn->setVisible(isVoice);
-        m_anflBtn->setVisible(isVoice);
-        m_anftBtn->setVisible(isVoice);
+        // Mode eligibility only — applyRadioSideDspVisibility() ANDs the radio's
+        // hasRadioSideDsp capability in. The rule here is unchanged, INCLUDING
+        // isVoice's !isFdv term, which syncFromSlice() does not carry.
+        m_anfModeOk  = isVoice;
+        m_anflModeOk = isVoice;
+        m_anftModeOk = isVoice;
+        // NOT gated on voice, unlike the auto notches above. A manual notch is
+        // placed by the operator at a tone they can see, and the tone that most
+        // needs notching in CW or a digital mode is an interfering carrier
+        // inside a narrow filter — exactly where an automatic notch is least
+        // useful and this one is most. FM is the only exclusion, and only
+        // because the radio itself runs no receive DSP there.
+        m_mnModeOk = !isFm;
         // Hide all DSP buttons in FM mode
-        m_nrBtn->setVisible(!isFm);
-        m_nbBtn->setVisible(!isFm);
+        m_nrModeOk = !isFm;
+        m_nbModeOk = !isFm;
         // NRL is available on 6000-series too (#2177)
-        m_nrlBtn->setVisible(!isFm);
+        m_nrlModeOk = !isFm;
+        applyRadioSideDspVisibility();
         // 8000-series-only firmware DSP filters — shared rule (#2177)
         updateExtendedDspVisibility();
         updateDspTabAccent();
@@ -4459,7 +4593,13 @@ void VfoWidget::setSlice(SliceModel* slice)
     connectLeveledDsp(&SliceModel::nrfChanged,  m_nrfBtn,  LvlNrf);
     connectLeveledDsp(&SliceModel::anflChanged, m_anflBtn, LvlAnfl);
     connectDsp(&SliceModel::anftChanged, m_anftBtn);   // toggle-only, no level
+    connectLeveledDsp(&SliceModel::mnChanged,   m_mnBtn,   LvlMn);
     connectDsp(&SliceModel::apfChanged, m_apfBtn);     // own level row
+    // The level row follows the filter's engagement, radio-echo included —
+    // a slider that talks to a disengaged filter reads as "APF is broken" (#4658).
+    connect(m_slice, &SliceModel::apfChanged, this, [this](bool on) {
+        m_apfContainer->setEnabled(on);
+    });
     connect(m_slice, &SliceModel::apfLevelChanged, this, [this](int v) {
         m_updatingFromModel = true;
         m_apfSlider->setValue(v);
@@ -4846,6 +4986,7 @@ void VfoWidget::syncFromSlice()
     syncDsp(m_nrfBtn, m_slice->nrfOn());
     syncDsp(m_anflBtn, m_slice->anflOn());
     syncDsp(m_anftBtn, m_slice->anftOn());
+    syncDsp(m_mnBtn,  m_slice->mnOn());
     syncDsp(m_apfBtn, m_slice->apfOn());
 
     // Shared DSP-level slider — pick the highest-priority enabled DSP.
@@ -4867,22 +5008,28 @@ void VfoWidget::syncFromSlice()
     m_rttyContainer->setVisible(isRtty);
     bool isCw = (m_slice->mode() == "CW" || m_slice->mode() == "CWL");
     bool isDig = (m_slice->mode() == "DIGL" || m_slice->mode() == "DIGU" || m_slice->mode() == "NT");
-    bool isFm = (m_slice->mode() == "FM" || m_slice->mode() == "NFM"
-                 || m_slice->mode() == "DFM");
+    bool isFm = isFmRfMode(m_slice->mode());
+    bool hasToneControls = hasFmToneControls(m_slice->mode());
     m_tabBtns[1]->setText(isFm ? "OPT" : "DSP");
     m_apfBtn->setVisible(isCw);
-    m_anfBtn->setVisible(!isRtty && !isCw && !isDig && !isFm);
-    m_anflBtn->setVisible(!isRtty && !isCw && !isDig && !isFm);
-    m_anftBtn->setVisible(!isRtty && !isCw && !isDig && !isFm);
-    m_nrBtn->setVisible(!isFm);
-    m_nbBtn->setVisible(!isFm);
+    // Mode eligibility only — see the note at the modeChanged handler. This
+    // site's ANF rule has no !isFdv term and keeps not having one.
+    m_anfModeOk  = !isRtty && !isCw && !isDig && !isFm;
+    m_anflModeOk = !isRtty && !isCw && !isDig && !isFm;
+    m_anftModeOk = !isRtty && !isCw && !isDig && !isFm;
+    // Deliberately wider than the three above — see the modeChanged handler.
+    m_mnModeOk = !isFm;
+    m_nrModeOk = !isFm;
+    m_nbModeOk = !isFm;
     // NRL is available on 6000-series too (#2177)
-    m_nrlBtn->setVisible(!isFm);
+    m_nrlModeOk = !isFm;
+    applyRadioSideDspVisibility();
     // 8000-series-only firmware DSP filters — shared rule (#2177)
     updateExtendedDspVisibility();
     m_apfContainer->setVisible(isCw);
     m_digContainer->setVisible(isDig && m_slice->mode() != "NT");
     m_fmContainer->setVisible(isFm);
+    m_fmToneContainer->setVisible(hasToneControls);
     // CW: radio locks squelch on at fixed level; Digital: not meaningful
     m_sqlBtn->setEnabled(!isDig && !isCw);
     m_sqlSlider->setEnabled(!isDig && !isCw);
@@ -4912,6 +5059,7 @@ void VfoWidget::syncFromSlice()
         QSignalBlocker sb(m_apfSlider);
         m_apfSlider->setValue(m_slice->apfLevel());
         m_apfValueLbl->setText(QString::number(m_slice->apfLevel()));
+        m_apfContainer->setEnabled(m_slice->apfOn());   // slice-switch sync (#4658)
     }
 
     // DAX
@@ -4988,7 +5136,8 @@ void VfoWidget::relayoutDspGrid()
 {
     // Remove all widgets from the grid (without deleting them)
     QPushButton* all[] = {m_nrBtn, m_nbBtn, m_anfBtn, m_apfBtn, m_nrlBtn,
-                          m_nrsBtn, m_rnnBtn, m_nrfBtn, m_anflBtn, m_anftBtn};
+                          m_nrsBtn, m_rnnBtn, m_nrfBtn, m_anflBtn, m_anftBtn,
+                          m_mnBtn};
     for (auto* btn : all)
         m_dspGrid->removeWidget(btn);
     if (m_aetherDspBtn)
@@ -5059,6 +5208,10 @@ void VfoWidget::setDspLevelTarget(DspLevelTarget t)
         case LvlNrs:  level = m_slice->nrsLevel();  name = "NRS";  break;
         case LvlNrf:  level = m_slice->nrfLevel();  name = "NRF";  break;
         case LvlAnfl: level = m_slice->anflLevel(); name = "ANFL"; break;
+        // "POS", not "MN" — the slider under this label moves the notch
+        // across the passband rather than deepening it, and every other
+        // target it shares uses it as an amount.
+        case LvlMn:   level = m_slice->mnLevel();   name = "POS";  break;
         case LvlNone: return;
     }
     m_dspLevelLabel->setText(name);
@@ -5094,11 +5247,12 @@ void VfoWidget::refreshDspLevelTarget()
             case LvlNrs:  return m_slice->nrsOn();
             case LvlNrf:  return m_slice->nrfOn();
             case LvlAnfl: return m_slice->anflOn();
+            case LvlMn:   return m_slice->mnOn();
             case LvlNone: return false;
         }
         return false;
     };
-    for (auto t : { LvlNR, LvlNB, LvlAnf, LvlNrl, LvlNrs, LvlNrf, LvlAnfl }) {
+    for (auto t : { LvlNR, LvlNB, LvlAnf, LvlNrl, LvlNrs, LvlNrf, LvlAnfl, LvlMn }) {
         if (isOn(t)) m_dspLevelStack.append(t);
     }
     if (m_dspLevelStack.isEmpty())
@@ -5181,6 +5335,18 @@ void VfoWidget::updateModeTab()
     }
     if (m_filterWidths.isEmpty()) {
         m_filterWidths = filterPresetsFor(cur).filterWidths;
+        m_filterCustomLo.fill(INT_MIN, m_filterWidths.size());
+        m_filterCustomHi.fill(INT_MIN, m_filterWidths.size());
+    }
+    // A RADIO-DECLARED LADDER WINS OVER BOTH, and it is checked last so it
+    // overrides the saved presets as well as the mode defaults. Those presets
+    // belong to a radio whose passband is continuous; on hardware with three
+    // fixed IF filters they are eight buttons for three filters, five of which
+    // snap onto a neighbour and appear to do nothing. Custom edges go with
+    // them — there is no edge to customise on a fixed filter — which is also
+    // what keeps the parallel arrays from being indexed past their end.
+    if (!m_radioFilterWidths.isEmpty()) {
+        m_filterWidths = m_radioFilterWidths;
         m_filterCustomLo.fill(INT_MIN, m_filterWidths.size());
         m_filterCustomHi.fill(INT_MIN, m_filterWidths.size());
     }
@@ -5288,7 +5454,16 @@ void VfoWidget::rebuildFilterButtons()
             }
         });
 
-        // Right-click to customize this preset
+        // Right-click to customize this preset — but ONLY when the presets are
+        // the operator's. A radio-declared width is fixed hardware; offering
+        // "Set Custom Edges..." there promises a passband the radio cannot be
+        // given, and "Reset to Default" would index the mode CSV, which is a
+        // different length.
+        if (!m_radioFilterWidths.isEmpty()) {
+            m_filterGrid->addWidget(btn, i / 4, i % 4);
+            m_filterBtns.append(btn);
+            continue;
+        }
         btn->setContextMenuPolicy(Qt::CustomContextMenu);
         connect(btn, &QPushButton::customContextMenuRequested, this, [this, i, btn](const QPoint& pos) {
             QMenu menu;
@@ -5601,6 +5776,10 @@ void VfoWidget::applyFilterPreset(int widthHz)
 void VfoWidget::saveFilterPresets()
 {
     if (!m_slice) return;
+    // NEVER persist a radio-declared ladder as the operator's presets. Doing so
+    // would write the Icom's three widths into FilterPresets_<mode> and hand
+    // them to the next Flex session, which has eight.
+    if (!m_radioFilterWidths.isEmpty()) return;
     QStringList parts;
     for (int i = 0; i < m_filterWidths.size(); ++i) {
         if (m_filterCustomLo[i] != INT_MIN) {

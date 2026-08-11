@@ -62,6 +62,23 @@ more options. It floats over the app and can stay open while you operate.
   splits), lower = looser (fewer, merged speakers). RF caveats: narrowband/noise
   and propagation drift can split or merge a voice, so expect to tune it.
   Requires an ONNX-Runtime-enabled build.
+- **Boundary overlap** (slider, 0–2000 ms; **0 = Off, the default**) — recovers a
+  word chopped in half by the **Buffer** cap. A long "over" that never pauses is
+  force-closed at the buffer limit, and that cut can land mid-word; because each
+  segment is decoded on its own, the straddling word comes out mangled or
+  missing. With overlap set, the last N ms of a *cap-forced* segment are carried
+  into the front of the next one so the word is decoded whole, and the repeated
+  boundary words are then stripped from the transcript. Applied live, no model
+  reload, and it works on every backend (whisper, sherpa-onnx, remote).
+  - Costs a little extra decoding — the carried audio is transcribed twice — so
+    the practical setting is a few hundred ms, not the maximum. The carry is
+    internally capped at half the Buffer, so no combination of the two sliders
+    can run away.
+  - Only fires on a **buffer-cap** close. A normal close on a silence gap has no
+    split word to recover, and is left alone.
+  - The de-duplication is word-based, so it does nothing for languages whisper
+    transcribes without spaces (Chinese, Japanese, Thai) — on those, leave it
+    Off or expect the overlapping words to appear twice.
 
 ### Tuning (the control row)
 
@@ -114,6 +131,23 @@ The selected model runs on the **GPU when one is available**, else CPU
 
 Without the toolchain the build is CPU-only, unchanged. A GPU-enabled binary
 still runs on GPU-less hosts.
+
+### Not shipped on the Intel macOS DMG
+
+The **Intel macOS release build has no ASR at all** (`ENABLE_ASR=OFF`, #4719).
+Building it from source on an Intel Mac still works; this is about the shipped
+artifact.
+
+The reason is reach, not the feature. The ASR stack pulls in an ONNX Runtime
+built at `minos 15.5`, and dyld enforces that floor on every Mach-O it loads —
+so a DMG carrying it requires macOS 15.5 no matter what it advertises, which
+excludes most of the older Intel hardware that artifact exists for (#4713,
+#4532). Dropping ASR is what lets the Intel DMG hold a 12.0 floor. Intel Macs
+also have no GPU worth running ASR on, so what was left there after the ONNX
+and sherpa backends came out was CPU-only whisper.
+
+Apple Silicon is unaffected: Metal 3.1 with bf16, plus the ONNX and sherpa
+backends, all required at configure time.
 
 ## sherpa-onnx models (non-whisper engines)
 
@@ -183,6 +217,7 @@ AudioEngine (aethercore, 24 kHz post-NR RX)
 | `ENABLE_ASR_METAL` | ON (Apple) | Metal GPU backend (macOS). |
 | `REQUIRE_ASR_ONNX` | OFF | **Release guard** — fail configure if ONNX Runtime is missing (else VAD/speaker/classifier silently compile out). |
 | `REQUIRE_ASR_GPU` | OFF | **Release guard** — fail configure if no GPU backend (Vulkan/Metal) is enabled. |
+| `USE_SYSTEM_LIBWHISPER` | OFF | Link a distro libwhisper (**≥ 1.8.0**) via pkg-config instead of the vendored snapshot. |
 
 The ONNX features (Silero VAD, speaker labeling) and the signal classifier need
 **ONNX Runtime**. Stage a prebuilt with `scripts/setup/setup-onnxruntime.sh`
@@ -194,6 +229,14 @@ installed (Linux x86_64 Vulkan, macOS Metal).
 
 Vendored whisper.cpp is pinned; see
 [`third_party/whisper.cpp/AETHER_VENDORING.md`](../third_party/whisper.cpp/AETHER_VENDORING.md).
+
+`USE_SYSTEM_LIBWHISPER=ON` is the packager escape hatch from that pin — it drops
+the vendored subdirectory and takes `whisper` (plus `ggml`, which
+`WhisperAsrBackend` calls directly) from pkg-config. The 1.8.0 floor is the first
+release carrying `GGML_BACKEND_DEVICE_TYPE_IGPU`. Since the ggml backends built
+into a distro package are the packager's choice and can't be read back at
+configure time, this path never reports a GPU backend and is rejected outright
+under `REQUIRE_ASR_GPU`: release images build the vendored engine.
 
 ### Tests
 

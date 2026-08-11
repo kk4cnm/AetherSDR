@@ -65,12 +65,49 @@ bool PanadapterModel::ownedByClient(quint32 handle) const
     return m_ownerHandle == 0 || m_ownerHandle == handle;
 }
 
-void PanadapterModel::setRfGainInfo(int low, int high, int step)
+void PanadapterModel::setRfGainInfo(int low, int high, int step,
+                                    const QString& unitSuffix)
 {
     m_rfGainLow = low;
     m_rfGainHigh = high;
     m_rfGainStep = step;
-    emit rfGainInfoChanged(low, high, step);
+    m_rfGainUnitSuffix = unitSuffix;
+    emit rfGainInfoChanged(low, high, step, unitSuffix);
+}
+
+// Change-gated, all four. The Icom backend republishes its front-end
+// description on every reconnect and the labels are identical each time; an
+// ungated emit would rebuild the buttons for no reason.
+void PanadapterModel::setPreampLabels(const QStringList& labels)
+{
+    if (labels == m_preampLabels)
+        return;
+    m_preampLabels = labels;
+    emit preampLabelsChanged(m_preampLabels);
+}
+
+void PanadapterModel::setPreampStep(int step)
+{
+    if (step == m_preampStep)
+        return;
+    m_preampStep = step;
+    emit preampStepChanged(m_preampStep);
+}
+
+void PanadapterModel::setAttenuatorLabels(const QStringList& labels)
+{
+    if (labels == m_attenuatorLabels)
+        return;
+    m_attenuatorLabels = labels;
+    emit attenuatorLabelsChanged(m_attenuatorLabels);
+}
+
+void PanadapterModel::setAttenuatorStep(int step)
+{
+    if (step == m_attenuatorStep)
+        return;
+    m_attenuatorStep = step;
+    emit attenuatorStepChanged(m_attenuatorStep);
 }
 
 bool PanadapterModel::setCenterBandwidth(double centerMhz, double bandwidthMhz)
@@ -189,6 +226,14 @@ void PanadapterModel::setRxAntenna(const QString& ant)
     }
 }
 
+void PanadapterModel::setWide(bool wide)
+{
+    if (wide == m_wideActive)
+        return;
+    m_wideActive = wide;
+    emit wideChanged(m_wideActive);
+}
+
 void PanadapterModel::setAntList(const QStringList& ants)
 {
     if (ants != m_antList) {
@@ -197,21 +242,26 @@ void PanadapterModel::setAntList(const QStringList& ants)
     }
 }
 
-void PanadapterModel::setWaterfallLineDuration(int ms)
+void PanadapterModel::setWaterfallLineDuration(int rate)
 {
+    // `rate` is the 1..100 waterfall RATE, low slow / high fast — the method and
+    // field keep Flex's `line_duration` wire name because that is what arrives
+    // on the wire, but the VALUE is not milliseconds. See core/WaterfallRate.h.
+    // (#4606)
+    //
     // PerfTelemetry is fed every report (even when unchanged), and
     // waterfallLineDurationReported likewise always fires; the change-gated
     // signal is waterfallLineDurationChanged. Semantics preserved verbatim from
     // the old applyWaterfallStatus.
-    PerfTelemetry::instance().setWaterfallLineDurationMs(ms);
-    if (ms != m_waterfallLineDuration) {
-        m_waterfallLineDuration = ms;
+    PerfTelemetry::instance().setWaterfallRate(rate);
+    if (rate != m_waterfallLineDuration) {
+        m_waterfallLineDuration = rate;
         emit waterfallLineDurationChanged(m_waterfallLineDuration);
     }
-    emit waterfallLineDurationReported(ms);
+    emit waterfallLineDurationReported(rate);
 }
 
-void PanadapterModel::setDisplayRates(int fps, int wfLineDurationMs)
+void PanadapterModel::setDisplayRates(int fps, int wfRate)
 {
     // fps reuses the same reported/changed pair the Flex status path emits, so
     // the widget's existing wiring picks it up with no special case.
@@ -222,8 +272,8 @@ void PanadapterModel::setDisplayRates(int fps, int wfLineDurationMs)
         }
         emit fpsReported(fps);
     }
-    if (wfLineDurationMs > 0) {
-        setWaterfallLineDuration(wfLineDurationMs);
+    if (wfRate > 0) {
+        setWaterfallLineDuration(wfRate);
     }
 }
 
@@ -242,11 +292,7 @@ void PanadapterModel::applyStateExtension(const QVariantMap& fields)
         bool ok = false;
         const uint v = fields.value(QStringLiteral("wide")).toString().toUInt(&ok);
         if (ok && v <= 1) {
-            const bool wide = (v != 0);
-            if (wide != m_wideActive) {
-                m_wideActive = wide;
-                emit wideChanged(m_wideActive);
-            }
+            setWide(v != 0);
         } else {
             qCDebug(lcProtocol) << "PanadapterModel: invalid wide value"
                                 << fields.value(QStringLiteral("wide"));

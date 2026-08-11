@@ -4,6 +4,7 @@
 #include "KiwiSdrProtocol.h"
 #include "LogManager.h"
 #include "Resampler.h"
+#include "WaterfallRate.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -59,6 +60,17 @@ constexpr const char* kWaterfallCompressionEnv = "AETHER_KIWI_WF_COMP";
 QString trKiwiSdrClient(const char* sourceText)
 {
     return QCoreApplication::translate("KiwiSdrClient", sourceText);
+}
+
+// Shared by kiwiMode() (checks the already-tracked mode) and
+// setTrackedSlice()'s dedup guard (checks the incoming mode before it's
+// assigned to m_trackedMode) so both agree on what counts as CW.
+bool isCwModeString(const QString& mode)
+{
+    const QString normalized = mode.trimmed().toUpper();
+    return normalized == QStringLiteral("CW")
+        || normalized == QStringLiteral("CWU")
+        || normalized == QStringLiteral("CWL");
 }
 
 KiwiSdrProtocol::WaterfallDisplayRange clampedWaterfallDisplayRange(
@@ -872,13 +884,7 @@ void KiwiSdrClient::openWebSockets()
             }
         }
     });
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     connect(m_soundSocket, &QWebSocket::errorOccurred, this,
-#else
-    connect(m_soundSocket,
-            QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::error),
-            this,
-#endif
             [this](QAbstractSocket::SocketError) {
                 const QString error =
                     m_soundSocket ? m_soundSocket->errorString() : QString();
@@ -939,13 +945,7 @@ void KiwiSdrClient::openWebSockets()
             }
         }
     });
-#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
     connect(m_waterfallSocket, &QWebSocket::errorOccurred, this,
-#else
-    connect(m_waterfallSocket,
-            QOverload<QAbstractSocket::SocketError>::of(&QWebSocket::error),
-            this,
-#endif
             [this](QAbstractSocket::SocketError) {
                 const QString error = m_waterfallSocket
                     ? m_waterfallSocket->errorString()
@@ -975,16 +975,25 @@ void KiwiSdrClient::disconnectFromEndpoint()
 void KiwiSdrClient::setTrackedSlice(int sliceId, double frequencyMhz,
                                     const QString& mode, int filterLowHz,
                                     int filterHighHz, const QString& panId,
-                                    const QString& bandName)
+                                    const QString& bandName, int cwPitchHz)
 {
     const QString normalizedBandName = bandName.trimmed();
+    // cwPitchHz only affects the wire command in CW mode (formatSoundTuneCommand
+    // ignores it otherwise) — comparing it unconditionally here made every CW
+    // pitch step re-send an identical SET to every non-CW Kiwi-tracked slice too.
+    // Against a public KiwiSDR, dragging the pitch control turned into a
+    // sustained burst of redundant commands risking a kick/rate-limit policy
+    // (#4423 review). Skip the comparison outright when the incoming mode
+    // isn't CW, so a pitch-only "change" on a USB/LSB/AM slice dedups away.
+    const bool cwPitchMatters = isCwModeString(mode);
     if (m_trackedSliceId == sliceId
         && qFuzzyCompare(m_trackedFrequencyMhz, frequencyMhz)
         && m_trackedMode == mode
         && m_trackedFilterLowHz == filterLowHz
         && m_trackedFilterHighHz == filterHighHz
         && m_trackedPanId == panId
-        && m_trackedBandName == normalizedBandName) {
+        && m_trackedBandName == normalizedBandName
+        && (!cwPitchMatters || m_trackedCwPitchHz == cwPitchHz)) {
         return;
     }
 
@@ -998,6 +1007,7 @@ void KiwiSdrClient::setTrackedSlice(int sliceId, double frequencyMhz,
     m_trackedFilterLowHz = filterLowHz;
     m_trackedFilterHighHz = filterHighHz;
     m_trackedPanId = panId;
+    m_trackedCwPitchHz = cwPitchHz;
     if (bandChanged) {
         resetWaterfallAutoScaleHistory();
     }
@@ -1027,14 +1037,23 @@ void KiwiSdrClient::setWaterfallView(const QString& panId, double centerMhz,
     sendWaterfallViewToServer();
 }
 
-void KiwiSdrClient::setWaterfallLineDurationMs(int lineDurationMs)
+void KiwiSdrClient::setDisplayWaterfallRate(int rate)
 {
-    const int clamped = std::clamp(lineDurationMs, 1, 100);
-    if (m_waterfallLineDurationMs == clamped) {
+    // Renamed off `…LineDurationMs` because the name was the trap: what arrives
+    // here is the 1..100 waterfall RATE, low slow / high fast, not milliseconds.
+    // Reading it as ms is what inverted the control on the HL2 (#4606), and this
+    // was the one remaining setter still asserting the wrong unit. Auto mode
+    // ignores the value entirely today and requests the fastest validated Kiwi
+    // speed; a future auto that actually follows the rate must convert through
+    // core/WaterfallRate.h, not divide.
+    const int clamped = std::clamp(rate,
+                                   AetherSDR::WaterfallRate::kMin,
+                                   AetherSDR::WaterfallRate::kMax);
+    if (m_displayWaterfallRate == clamped) {
         return;
     }
 
-    m_waterfallLineDurationMs = clamped;
+    m_displayWaterfallRate = clamped;
     sendWaterfallRateToServer();
 }
 
@@ -1391,11 +1410,15 @@ void KiwiSdrClient::sendTrackedSliceToServer()
             << "high_cut=" << highCutHz;
         return;
     }
-    sendSoundCommand(QStringLiteral("SET mod=%1 low_cut=%2 high_cut=%3 freq=%4")
-        .arg(mode)
-        .arg(lowCutHz)
-        .arg(highCutHz)
-        .arg(freqKhz, 0, 'f', 3));
+    const bool cwLowerSideband =
+        m_trackedMode.trimmed().compare(QStringLiteral("CWL"), Qt::CaseInsensitive) == 0;
+    // Nyquist of the negotiated sound-stream rate, not the ~12 kHz default —
+    // the Kiwi renegotiates m_soundSampleRateHz per connection (8-48 kHz).
+    const int maxAudioBandwidthHz =
+        static_cast<int>(m_soundSampleRateHz / 2.0);
+    sendSoundCommand(KiwiSdrProtocol::formatSoundTuneCommand(
+        mode, lowCutHz, highCutHz, freqKhz, m_trackedCwPitchHz, cwLowerSideband,
+        maxAudioBandwidthHz));
 }
 
 void KiwiSdrClient::sendReceiverControlsToServer()
@@ -1761,8 +1784,7 @@ QString KiwiSdrClient::kiwiMode() const
         || mode == QStringLiteral("RTTY")) {
         return QStringLiteral("usb");
     }
-    if (mode == QStringLiteral("CW") || mode == QStringLiteral("CWU")
-        || mode == QStringLiteral("CWL")) {
+    if (isCwModeString(mode)) {
         return QStringLiteral("cw");
     }
     if (mode == QStringLiteral("NFM") || mode == QStringLiteral("FM")) {
@@ -1785,7 +1807,10 @@ int KiwiSdrClient::kiwiLowCutHz() const
         return 100;
     }
     if (mode == QStringLiteral("cw")) {
-        return 400;
+        // Symmetric about the carrier, matching how Flex reports its CW
+        // passband — formatSoundTuneCommand() shifts this by the CW pitch,
+        // so an already pitch-centered fallback would get shifted twice.
+        return -400;
     }
     if (mode == QStringLiteral("nfm")) {
         return -6000;
@@ -1807,7 +1832,7 @@ int KiwiSdrClient::kiwiHighCutHz() const
         return 2900;
     }
     if (mode == QStringLiteral("cw")) {
-        return 800;
+        return 400;
     }
     if (mode == QStringLiteral("nfm")) {
         return 6000;

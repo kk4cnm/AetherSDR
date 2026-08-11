@@ -7,6 +7,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QVBoxLayout>
 
@@ -38,14 +39,15 @@ CopyAssistSettingsDialog::CopyAssistSettingsDialog(QWidget* parent)
     m_gpu->setObjectName(QStringLiteral("CopyAssistGpuCombo"));
     m_gpu->setAccessibleName(tr("Copy Assist compute device"));
     m_gpu->setToolTip(tr("Which device runs the model (a GPU, or CPU)"));
+    m_gpu->addItem(tr("Detecting…"), kGpuDiscoveryPending);
     connect(m_gpu, &QComboBox::currentIndexChanged, this,
             [this](int) { emit gpuChanged(currentGpu()); });
     m_gpuLabel = new QLabel(tr("Compute:"), this);
     form->addRow(m_gpuLabel, m_gpu);
-    // Hidden until the controller reports a GPU exists (CPU-only hosts show no
-    // device picker at all).
-    m_gpuLabel->hide();
-    m_gpu->hide();
+    // Device discovery can initialize Metal and compile its embedded shader
+    // library. Keep the row visible but inactive while that work runs off the
+    // GUI thread; CPU-only hosts hide it once discovery finishes.
+    setGpuSelectorEnabled(false);
 
     m_language = new QComboBox(this);
     m_language->setObjectName(QStringLiteral("CopyAssistLanguageCombo"));
@@ -161,6 +163,33 @@ CopyAssistSettingsDialog::CopyAssistSettingsDialog(QWidget* parent)
     thrRow->addWidget(m_spkThresholdValue);
     form->addRow(tr("Match threshold:"), thrRow);
 
+    // Boundary-word recovery / segment overlap (RFC #4821): carry a little
+    // trailing audio across a forced segment cut so a word split at the boundary
+    // isn't lost. 0 = off (default); opt-in. Applied live, no engine rebuild.
+    auto* ovRow = new QHBoxLayout;
+    m_overlap = new QSlider(Qt::Horizontal, this);
+    m_overlap->setObjectName(QStringLiteral("CopyAssistOverlapSlider"));
+    m_overlap->setAccessibleName(tr("Copy Assist boundary overlap"));
+    m_overlap->setRange(0, 2000);      // ms of trailing audio carried forward
+    m_overlap->setSingleStep(250);
+    m_overlap->setPageStep(250);
+    m_overlap->setTickInterval(250);
+    m_overlap->setTickPosition(QSlider::TicksBelow);
+    m_overlap->setValue(0);
+    m_overlap->setToolTip(tr("Carry this much trailing audio across a forced segment "
+                             "cut to recover a word split at the boundary (0 = off)"));
+    m_overlapValue = new QLabel(tr("Off"), this);
+    m_overlapValue->setAccessibleName(tr("Boundary overlap value"));
+    m_overlapValue->setMinimumWidth(48);
+    m_overlapValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    connect(m_overlap, &QSlider::valueChanged, this, [this](int v) {
+        m_overlapValue->setText(v > 0 ? tr("%1 ms").arg(v) : tr("Off"));
+        emit boundaryOverlapChanged(v);
+    });
+    ovRow->addWidget(m_overlap, 1);
+    ovRow->addWidget(m_overlapValue);
+    form->addRow(tr("Boundary overlap:"), ovRow);
+
     root->addLayout(form);
     root->addStretch(1); // headroom for further options added here later
 }
@@ -196,6 +225,11 @@ void CopyAssistSettingsDialog::addGpuDevice(int index, const QString& name)
     m_gpu->addItem(name, index);
 }
 
+void CopyAssistSettingsDialog::clearGpuDevices()
+{
+    m_gpu->clear();
+}
+
 void CopyAssistSettingsDialog::setCurrentGpu(int index)
 {
     const int idx = m_gpu->findData(index);
@@ -206,13 +240,21 @@ void CopyAssistSettingsDialog::setCurrentGpu(int index)
 
 int CopyAssistSettingsDialog::currentGpu() const
 {
-    return m_gpu->currentData().toInt();
+    bool ok = false;
+    const int index = m_gpu->currentData().toInt(&ok);
+    return ok ? index : kGpuDiscoveryPending;
 }
 
 void CopyAssistSettingsDialog::setGpuSelectorVisible(bool on)
 {
     m_gpuLabel->setVisible(on);
     m_gpu->setVisible(on);
+}
+
+void CopyAssistSettingsDialog::setGpuSelectorEnabled(bool on)
+{
+    m_gpuLabel->setEnabled(on);
+    m_gpu->setEnabled(on);
 }
 
 void CopyAssistSettingsDialog::addLanguage(const QString& code, const QString& name)
@@ -310,6 +352,23 @@ void CopyAssistSettingsDialog::setSpeakerThreshold(int percent)
 int CopyAssistSettingsDialog::speakerThreshold() const
 {
     return m_spkThreshold->value();
+}
+
+void CopyAssistSettingsDialog::setBoundaryOverlapMs(int ms)
+{
+    // Programmatic set: don't echo back out as an operator edit. Without this,
+    // any post-construction call (settings reload, reset-to-defaults, a future
+    // profile switch) would round-trip straight into saveInt("AsrBoundaryOverlapMs")
+    // and re-write what it just read. The label — normally driven by valueChanged
+    // — is updated explicitly here since that signal is suppressed.
+    const QSignalBlocker block(m_overlap);
+    m_overlap->setValue(ms);
+    m_overlapValue->setText(ms > 0 ? tr("%1 ms").arg(ms) : tr("Off"));
+}
+
+int CopyAssistSettingsDialog::boundaryOverlapMs() const
+{
+    return m_overlap->value();
 }
 
 } // namespace AetherSDR

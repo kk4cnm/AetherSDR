@@ -30,7 +30,7 @@ The upstream README follows.
 
 AetherSDR brings full FlexRadio operation to Linux, macOS, and Windows — each a native build, no Wine or virtual machines. A native aarch64 build also runs on Raspberry Pi and other embedded ARM devices. Built from the ground up with Qt6 and C++20, it speaks the SmartSDR protocol natively and aims to replicate the full SmartSDR experience.
 
-**Current version: 26.7.4.1** — CalVer (`YY.M.patch[.hotfix]`). | [Download](https://github.com/aethersdr/AetherSDR/releases/latest) | [Discussions](https://github.com/aethersdr/AetherSDR/discussions) | [What's New](https://github.com/aethersdr/AetherSDR/releases)
+**Current version: 26.8.2** — CalVer (`YY.M.patch[.hotfix]`). | [Download](https://github.com/aethersdr/AetherSDR/releases/latest) | [Discussions](https://github.com/aethersdr/AetherSDR/discussions) | [What's New](https://github.com/aethersdr/AetherSDR/releases)
 
 > **Native builds for Linux, macOS, and Windows** — Linux AppImage (x86-64 + aarch64), macOS DMG (Apple Silicon + Intel), Windows installer and portable ZIP. Every platform is built, tested in CI, and released together.
 
@@ -50,9 +50,9 @@ AetherSDR brings full FlexRadio operation to Linux, macOS, and Windows — each 
 - **DAX virtual audio + IQ** — 4 RX + 1 TX channels and raw I/Q at 24–192 kHz for WSJT-X / fldigi / VARA / JS8Call, plus a per-slice **WFM demodulator** for satellite data
 - **AetherModem packet radio** — KISS-over-TCP TNC, connected-mode AX.25 BBS, a personal mailbox, and an **APRS client** (station map, GPS beacon, messaging) with a Direwolf-derived VHF demodulator
 - **AetherSweep** — in-panadapter SWR analyzer with log scale, threshold-band shading, and interpolated bandwidth at SWR ≤ 1.5 / 2.0
-- **SpotHub** — DX Cluster, RBN, WSJT-X, POTA, and FreeDV Reporter spots with auto-mode switch
+- **SpotHub** — DX Cluster, RBN, WSJT-X, POTA, FreeDV Reporter, N1MM+/DXLog contest bandmap, the EiBi shortwave broadcast schedule, and the KiwiSDR DX Community database, with auto-mode switch and per-feed spot colouring
 - **CW operator suite** — real-time Morse decoder, MIDI/keyboard straight-key & iambic paddles with full QSK, optional Quindar tones
-- **Copy Assist (speech-to-text)** — on-device transcription of received voice via whisper.cpp, docked under the waterfall with confidence color-coding; CPU or GPU (Vulkan/Metal, auto-detected), download-on-demand models, and an optional remote OpenAI-compatible endpoint (see [`docs/asr-copy-assist.md`](docs/asr-copy-assist.md))
+- **Copy Assist (speech-to-text)** — on-device transcription of received voice via whisper.cpp, docked under the waterfall with confidence color-coding; CPU or GPU (Vulkan/Metal, auto-detected), download-on-demand models, and an optional remote OpenAI-compatible endpoint. Not in the Intel macOS build — it would force a macOS 15.5 floor on hardware that mostly cannot reach it (see [`docs/asr-copy-assist.md`](docs/asr-copy-assist.md))
 - **FreeDV RADE** — AI digital-voice codec with a client-side neural encoder/decoder
 - **SmartLink remote + TCI v2.0 server** — Auth0/TLS WAN operation, and CAT + audio + IQ + CW + spots over a single TCI WebSocket
 - **Broad hardware control** — rigctld + virtual-serial CAT, MIDI mapping, the FlexControl knob, serial PTT/CW keying, and Multi-Flex operation alongside SmartSDR/Maestro
@@ -86,10 +86,24 @@ Works with any FlexRadio transceiver, including:
 - ML-, CL-, and RT-series devices
 
 Supported external devices include the 4O3A/FlexRadio PGXL (Power Genius XL)
-power amplifier and TGXL (Tuner Genius XL) antenna tuner.
+power amplifier and TGXL (Tuner Genius XL) antenna tuner, and — outside the
+radio seam entirely — ACOM S-series and SPE Expert (1.3K-FA / 1.5K-FA / 2K-FA)
+amplifiers over serial or ser2net TCP.
 
 Active test target is FLEX-8600 firmware 4.2.18 (SmartSDR protocol v1.4.0.0);
 earlier 4.x firmware works; v3.x is unsupported.
+
+**Other radio families** ride the vendor-neutral `IRadioBackend` seam. Neither
+is a supported family yet, and FlexRadio remains the supported target:
+
+- **Hermes-Lite 2** — **experimental**. Four independent receivers, SSB voice,
+  CW/RTTY decoding, AX.25 packet, band switching with hardware filters, manual
+  notch filters, host frequency calibration and per-radio state restore.
+- **Networked Icom** — **early**. CI-V over the RS-BA1 UDP transport, brought up
+  on the IC-705 (receive, scope, transmit, FT8). Only the IC-705 and IC-7300MK2
+  are verified against their own CI-V guides — an unrecognised model gets no
+  scope and no transmit rather than optimistic defaults.
+  transmit rather than optimistic defaults.
 
 No radio at all? **Demo mode** runs the full UI against a synthetic backend
 that generates its own audio and spectrum.
@@ -103,7 +117,7 @@ MIDI, Stream Deck/StreamController plugins, and generic USB-serial adapters:
 - Icom RC-28 USB remote encoder
 - Griffin PowerMate USB knob
 - Contour ShuttleXpress and ShuttlePro v2 jog controllers
-- MIDI controllers with learn mode, profiles, and relative-encoder support
+- MIDI controllers with learn mode, manual mapping entry, profiles, and relative-encoder support
 - Elgato Stream Deck devices through the bundled macOS/Windows Stream Deck plugin
 - Stream Deck devices on Linux through the bundled StreamController plugin
 - USB-serial PTT/CW interfaces for foot switches, straight keys, iambic paddles,
@@ -131,13 +145,23 @@ Pre-built binaries are available from [Releases](https://github.com/aethersdr/Ae
 
 Install all dependencies for a full-featured build. Optional packages are noted — the build succeeds without them but the corresponding features are disabled.
 
+**Qt 6.8 or newer is required.** This is the same Qt the release binaries are
+built against (6.8.3 LTS), so what CI compiles is what ships. Distro Qt clears
+it on Debian Trixie, Ubuntu 25.10+, Fedora 41+ and Arch. It does **not** clear
+on **Ubuntu 24.04 LTS**, which ships Qt 6.4.2 — build there against a Qt from
+[aqtinstall](https://github.com/miurahr/aqtinstall) or the Qt online installer
+and point CMake at it with `-DCMAKE_PREFIX_PATH=/path/to/Qt/6.8.3/gcc_64`.
+On **macOS** the Qt does not come from Homebrew at all — see the macOS note
+below the install commands.
+
 ```bash
 # Arch / CachyOS / Manjaro
 sudo pacman -S qt6-base qt6-multimedia qt6-websockets qt6-serialport \
   qt6-shadertools cmake ninja pkgconf autoconf automake libtool \
   fftw portaudio hidapi qtkeychain-qt6
 
-# Ubuntu 24.04+ / Debian / Linux Mint
+# Debian Trixie / Ubuntu 25.10+ / Linux Mint 23+
+# (Ubuntu 24.04's Qt is 6.4.2 — below the floor; see the note above.)
 sudo apt install qt6-base-dev qt6-base-private-dev qt6-multimedia-dev \
   qt6-websockets-dev qt6-serialport-dev qt6-shader-baker qt6-shadertools-dev \
   cmake ninja-build pkg-config autoconf automake libtool \
@@ -151,10 +175,45 @@ sudo dnf install qt6-qtbase-devel qt6-qtbase-private-devel qt6-qtmultimedia-deve
   cmake ninja-build autoconf automake libtool \
   fftw3-devel portaudio-devel hidapi-devel qtkeychain-qt6-devel
 
-# macOS (Homebrew)
-brew install qt@6 ninja cmake pkgconf autoconf automake libtool \
-  fftw portaudio hidapi qtkeychain
+# macOS (Homebrew) — everything EXCEPT Qt and qtkeychain; see the note below
+brew install ninja cmake pkgconf autoconf automake libtool \
+  fftw portaudio hidapi
 ```
+
+> **macOS note — Qt and qtkeychain do not come from Homebrew.** Homebrew's `qt`
+> formula (aliased `qt6` and `qt@6`) is a *rolling* release — 6.11.1 at the time
+> of writing — while the DMG ships 6.8.3 LTS like every other artifact. Building
+> against Homebrew's Qt means testing a Qt no release ships. Install the matching
+> one and point CMake at it:
+>
+> ```bash
+> # A venv rather than a bare `pip install`: a PEP 668 python3 refuses the latter.
+> python3 -m venv ~/.venv/aqt && ~/.venv/aqt/bin/pip install aqtinstall
+> ~/.venv/aqt/bin/aqt install-qt mac desktop 6.8.3 clang_64 \
+>   -m qtmultimedia qtwebsockets qtserialport qtshadertools \
+>   --outputdir ~/Qt
+> cmake -B build -DCMAKE_PREFIX_PATH="$HOME/Qt/6.8.3/macos;$(brew --prefix)"
+> ```
+>
+> `clang_64` is the only macOS desktop build Qt publishes, and it is universal2 —
+> there is no separate arm64 archive to pick. `$(brew --prefix)` stays on the
+> path for fftw, portaudio and hidapi.
+>
+> Homebrew's `qtkeychain` is left out for a related reason: the formula depends
+> on `qtbase`, so installing it pulls a second Qt in behind your back. Build it
+> against the Qt you just installed instead — or skip it and build without
+> SmartLink credential persistence:
+>
+> ```bash
+> CMAKE_PREFIX_PATH="$HOME/Qt/6.8.3/macos" bash scripts/setup/setup-qtkeychain.sh
+> ```
+>
+> **Two Qt installations visible to CMake at once is a real failure, not a
+> theoretical one** — it is what #711 and #812 were, and `CMakeLists.txt` puts
+> `$(brew --prefix)/include` on the global include path on macOS, so a Homebrew
+> Qt is discoverable whether or not you asked for it. If you have one,
+> `brew uninstall qt` (plus whatever pulled it in) before building. The release
+> workflow asserts this; your machine will not.
 
 <details>
 <summary>What each dependency enables</summary>
@@ -198,8 +257,8 @@ is required during configure or build.
 ### Windows 11
 
 Prerequisites: Visual Studio 2022 (Build Tools, Community, or higher) with the
-MSVC C++ workload, CMake 3.25+, Ninja, and Qt 6.7+ (`msvc2022_64`; the release
-binaries ship 6.8.3 LTS).
+MSVC C++ workload, CMake 3.25+, Ninja, and Qt 6.8+ (`msvc2022_64`; both CI and
+the release binaries use 6.8.3 LTS).
 
 ```bat
 :: 1. Activate the MSVC environment. Adjust the edition (BuildTools / Community /
@@ -234,11 +293,54 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_PREFIX_PATH="%
 cmake --build build --target AetherSDR
 ```
 
-### Qt 6.7+ for GPU Spectrum Rendering
+### GPU Spectrum Rendering
 
-GPU-accelerated spectrum/waterfall rendering requires Qt 6.7 or greater. If your distribution ships with an older version (e.g., Ubuntu 24.04, Debian 12, or Mint 21–22 include Qt 6.4.2), the build system automatically disables GPU rendering and falls back to the CPU-based `QPainter` path. (Release binaries ship Qt 6.8.3 LTS; the 6.7 floor is the source-build minimum for QRhi.)
+GPU-accelerated spectrum/waterfall rendering requires Qt 6.7 or greater (`QRhiWidget`). Since the build now requires Qt 6.8 as a minimum, no build is held back by the Qt version any more — the aarch64 AppImage included. What decides whether a given binary renders via QRhi is the `AETHER_GPU_SPECTRUM` build option, and for a source build whether Qt's private GUI headers are installed: CMake turns the option off with `GPU spectrum rendering disabled — Qt6GuiPrivate not found` when they are missing (install `qt6-base-private-dev` / `qt6-qtbase-private-devel`).
 
-To use GPU acceleration on these systems, install Qt 6.7+ manually:
+The CPU `QPainter` path is a **build-time alternative, not a runtime fallback**. `AETHER_GPU_SPECTRUM` selects `SpectrumWidget`'s base class — `QRhiWidget` or `QWidget` — and `SpectrumWidget::paintEvent()`, which is what draws the spectrum on the CPU, is compiled only into the `QWidget` build. (A GPU build still uses `QPainter`, but only to rasterise overlays into textures QRhi then composites.) Of the shipped artifacts only the Intel macOS DMG is built the other way, and deliberately: `QRhiWidget` misbehaves on older Metal/OpenGL hardware.
+
+Having no GPU is usually a non-event, because in practice "no GPU" means a software rasterizer rather than nothing. QRhi comes up on whatever the platform provides — llvmpipe or softpipe (Mesa), WARP or Microsoft Basic Render (D3D11), SwiftShader — and the app detects it and says so: **Help ▸ About** shows a `Renderer:` line reading `CPU QRhi (…)` rather than `GPU QRhi (…)`, naming the backend and device. Rendering is correct, just slow.
+
+If QRhi cannot initialise at all — no usable GL/D3D/Metal, as on a headless host, in some VMs, or behind a broken driver — there is nothing to fall back to. The spectrum does not draw, and the failure is reported by Qt rather than by AetherSDR: the log records `QRhiWidget: QRhi is not supported on this platform.` or `QRhiWidget: No QRhi`, and `QRhiWidget::renderFailed()` fires with nothing listening, so there is no notice in the UI. The rest of the app (controls, audio, radio I/O) is unaffected.
+
+`AETHER_NO_GPU=1` forces software OpenGL on an already-built binary, without a rebuild:
+
+```bash
+AETHER_NO_GPU=1 ./AetherSDR-*.AppImage
+```
+
+That is the escape hatch if a GPU or driver renders the spectrum incorrectly — worth trying first on Raspberry Pi and other systems whose Mesa driver is newer than its hardware.
+
+### Wayland and XWayland
+
+On a Wayland session AetherSDR chooses the Qt platform based on whether a
+display is attached:
+
+- **A display is connected** → `wayland;xcb` (native Wayland when the platform
+  plugin is available, XWayland otherwise). Native Wayland avoids the GLX
+  `BadAccess` crash that XWayland can produce when opening child dialogs on some
+  compositors, and renders correctly under fractional scaling instead of being
+  bitmap-scaled by the compositor.
+- **Headless** — no connected display, e.g. a remote Raspberry Pi reached over
+  VNC — → `xcb;wayland`. With no DRM scanout, native-Wayland hardware GL cannot
+  allocate a window surface and the spectrum renders black under an
+  `EGL_BAD_MATCH` error storm; XWayland allocates its buffers through the X
+  server and works. AetherSDR detects this from the DRM connector status and
+  flips the order automatically; the chosen platform is recorded at startup in
+  the log (`Platform: Wayland session, display presence …`).
+
+Setting `QT_QPA_PLATFORM` yourself always wins — override in either direction:
+
+```bash
+QT_QPA_PLATFORM=xcb ./AetherSDR-*.AppImage            # force XWayland
+QT_QPA_PLATFORM='wayland;xcb' ./AetherSDR-*.AppImage  # force native Wayland
+```
+
+The second form is the way back to native Wayland on a headless session whose
+XWayland mishandles child dialogs (the GLX `BadAccess` above) — the automatic
+choice there is `xcb;wayland`, so you would otherwise be on XWayland.
+
+On a distribution whose Qt is older than the required 6.8 (notably Ubuntu 24.04 LTS at 6.4.2), install a newer Qt manually:
 
 1. **Option 1: Using a PPA (Ubuntu/Mint)**
    The `kubuntu-backports` PPA may provide a newer Qt — verify the version it ships before relying on it.
@@ -269,14 +371,24 @@ sudo cmake --install build
 Currently in flight:
 
 - **aetherd** — a vendor-neutral `IRadioBackend` seam so radio-family logic
-  lives behind a stable interface. Three backends ride it today (Flex, HL2,
-  and the demo simulator); the remaining step is the versioned protocol that
-  splits a headless engine from thin UI clients.
-- **Hermes-Lite 2** — an **experimental** non-Flex backend on that seam. Not
-  yet a supported radio family: remaining work is wider mode coverage,
-  panadapter parity with the Flex path, and hardening the raw-IQ DSP chain.
-- **AppSettings nested-JSON refactor**, **TX DSP chain visual rebuild**, and
-  the **Flathub submission**.
+  lives behind a stable interface. Four backends ride it today (Flex, HL2,
+  networked Icom, and the demo simulator); the remaining step is the versioned
+  protocol that splits a headless engine from thin UI clients.
+- **Hermes-Lite 2** — an **experimental** non-Flex backend on that seam, now
+  running four independent receivers, the SSB voice chain, CW/RTTY decoding,
+  AX.25 packet, band switching with hardware filters, memory channels, manual
+  notch filters, host frequency calibration and per-radio operating-state
+  restore. Not yet a supported radio family: remaining work is wider mode
+  coverage, panadapter parity with the Flex path, and hardening the raw-IQ DSP
+  chain.
+- **Networked Icom** — an **early** CI-V/RS-BA1 backend on the same seam,
+  brought up on the IC-705 and IC-7300. Remaining work is transmit confirmation
+  beyond the 705, per-model SET-menu mapping, and the rest of the control
+  surface.
+- **AppSettings nested-JSON refactor** — the storage layer moved to SQLite with
+  per-radio versioned feature documents; the remaining work is migrating the
+  legacy flat keys.
+- **TX DSP chain visual rebuild** and the **Flathub submission**.
 
 See [`ROADMAP.md`](ROADMAP.md) for the full picture and the community backlog,
 and the [issue tracker](https://github.com/aethersdr/AetherSDR/issues) for
@@ -305,7 +417,9 @@ PRs, bug reports, and feature requests welcome! See [CONTRIBUTING.md](CONTRIBUTI
   [nigelfenton/Aether-gate](https://github.com/nigelfenton/Aether-gate).)*
 
 AetherSDR integrates radios that earn deep native support directly in-engine; the
-gate covers the long tail of legacy/CAT radios and dongles.
+gate covers the long tail of legacy/CAT radios and dongles. Networked Icoms now
+have an in-engine CI-V backend, so for those the gate is the fallback for models
+the native backend does not yet cover.
 
 ---
 

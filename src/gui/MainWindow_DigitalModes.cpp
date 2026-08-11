@@ -143,6 +143,40 @@ void MainWindow::startKissTncOnStartupIfConfigured()
 #endif
 }
 
+Ax25HfPacketDecodeDialog* MainWindow::ensureAx25HfPacketDecodeDialog()
+{
+    if (m_ax25HfPacketDecodeDialog)
+        return m_ax25HfPacketDecodeDialog.data();
+
+    // Construct hidden and persistent, exactly as
+    // startKissTncOnStartupIfConfigured() does. The automation bridge must be
+    // able to drive the modem on a headless soak box where nobody ever opened
+    // the window; the dialog is a service host, not just a view.
+    TncSettings::migrateLegacy();
+    auto* dlg = new Ax25HfPacketDecodeDialog(m_audio, &m_radioModel, activeSlice(), this);
+    dlg->setFramelessMode(
+        AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
+    m_ax25HfPacketDecodeDialog = dlg;
+    trackPersistentDialog(dlg);
+#ifdef HAVE_MQTT
+    dlg->setMqttClient(m_mqttClient);
+#endif
+    return dlg;
+}
+
+QJsonObject MainWindow::automationModemCommand(const QString& verb,
+                                               const QString& action,
+                                               const QString& value)
+{
+    Ax25HfPacketDecodeDialog* dlg = ensureAx25HfPacketDecodeDialog();
+    if (!dlg) {
+        return QJsonObject{
+            {QStringLiteral("ok"), false},
+            {QStringLiteral("error"), QStringLiteral("could not construct the AetherModem window")}};
+    }
+    return dlg->automationCommand(verb, action, value);
+}
+
 // External-controller methods (FlexControl, HID encoders / RC-28 / TMate 2 /
 // Ulanzi / PowerMate / Shuttle, StreamDeck labels, control-devices snapshot)
 // live in MainWindow_Controllers.cpp (#3351 Phase 1a).
@@ -243,6 +277,51 @@ void MainWindow::activateRADE(int sliceId)
 
     auto* s = m_radioModel.slice(sliceId);
     if (!s) return;
+
+    // RADE's receive path is DAX channel audio (PanadapterStream::daxAudioReady),
+    // and only a Flex backend owns a PanadapterStream — RadioModel leaves
+    // panStream() null for every other family. The connect() further down
+    // dereferenced it bare, so selecting RADE on a Hermes-Lite 2 was a SEGFAULT,
+    // not a decline. Same shape as the null-deref that crashed every HL2 connect
+    // three seconds in (HERMES.md §6 gap 1) and as the startDax() guard, which
+    // this deliberately mirrors.
+    //
+    // Checked HERE rather than at the connect: everything between this point and
+    // there mutates real station state — it moves the TX-slice badge, installs a
+    // PTT-off hook on TransmitModel, calls setRadeMode() and opens mic capture.
+    // Guarding only the connect would leave a radio that is half in RADE mode
+    // with no receive path and an intercepted unkey, which is worse than the
+    // crash because it looks like it worked.
+    //
+    // Declining is the honest answer, not merely the safe one. A backend that
+    // demodulates in-process could carry RADE over the seam one day, but nothing
+    // routes modem audio there today, so there is no path to take.
+    if (!m_radioModel.panStream()) {
+        qCWarning(lcRade) << "MainWindow: RADE needs DAX audio, which this radio"
+                          << "does not provide — refusing to activate on slice"
+                          << sliceId;
+        // Un-stick the control that asked. RADE is selected by a TOGGLE
+        // (RxApplet/VfoWidget::radeActivated), not by the slice mode — it runs
+        // on an ordinary DIGU/DIGL slice — so the slice's mode is the
+        // operator's choice and is deliberately left alone. What must be reset
+        // is the toggle, which has already drawn itself active; the same three
+        // setters deactivateRADE() uses, so a decline and a teardown leave the
+        // UI in the identical state.
+        if (auto* sw = spectrumForSlice(s)) {
+            if (auto* vfo = sw->vfoWidget(sliceId))
+                vfo->setRadeActive(false);
+        }
+        if (m_appletPanel) {
+            m_appletPanel->phoneCwApplet()->setRadeActive(false);
+            if (auto* applet = m_appletPanel->radeApplet())
+                applet->setRadeActive(false);
+        }
+        QMessageBox::warning(this, tr("RADE Unavailable"),
+            tr("RADE needs DAX audio, which this radio does not provide.\n\n"
+               "RADE's modem receives on a DAX channel, and only a FlexRadio "
+               "offers one."));
+        return;
+    }
 
     // Capture TX slice owner before potentially moving the badge, so the
     // failure path can restore it.  -1 means no TX slice existed.
@@ -883,6 +962,21 @@ void MainWindow::showFreeDvReporter()
         connect(m_freedvClient, &FreeDvClient::stationRemoved,
                 m_freedvReporterDialog, &FreeDvReporterDialog::onStationRemoved,
                 Qt::QueuedConnection);
+        // Status message (#4231) — the client lives on m_spotThread, so the
+        // send hops threads via invokeMethod (mirrors the SpotHub wiring in
+        // MainWindow_Menus.cpp), and the enable/disable state comes back over
+        // a queued connection.
+        connect(m_freedvReporterDialog, &FreeDvReporterDialog::messageChanged,
+                this, [this](const QString& msg) {
+            QMetaObject::invokeMethod(m_freedvClient,
+                                      [this, msg] { m_freedvClient->updateMessage(msg); });
+        });
+        connect(m_freedvClient, &FreeDvClient::reportingStateChanged,
+                m_freedvReporterDialog, &FreeDvReporterDialog::setReportingActive,
+                Qt::QueuedConnection);
+        // Seed: reporting may already be on when the dialog is first opened.
+        m_freedvReporterDialog->setReportingActive(
+            m_freedvClient->isReportingEnabled());
         if (auto* s = activeSlice())
             m_freedvReporterDialog->setActiveSlice(s);
         // Seed with current state — bulk_update fires at connect time, before the
@@ -906,6 +1000,9 @@ void MainWindow::showFreeDvReporter()
             grid = m_freedvClient->myGrid();
         m_freedvReporterDialog->setMyGrid(grid);
     }
+    // Re-read the message every open so an edit made in SpotHub's FreeDV tab
+    // (same FreeDvMyMessage setting) doesn't leave this field stale (#4231).
+    m_freedvReporterDialog->reloadMessage();
     m_freedvReporterDialog->show();
     m_freedvReporterDialog->raise();
     m_freedvReporterDialog->activateWindow();

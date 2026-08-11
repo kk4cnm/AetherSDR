@@ -33,12 +33,14 @@ class TunerApplet;
 class AmpApplet;
 class DemoApplet;
 class AcomApplet;
+class SpeApplet;
 class TxApplet;
 class PhoneCwApplet;
 class PhoneApplet;
 class EqApplet;
 class WaveApplet;
 class AetherClockApplet;
+class MiniPanApplet;
 class ClientEqApplet;
 class ClientCompApplet;
 class ClientGateApplet;
@@ -98,12 +100,14 @@ public:
     AmpApplet*    ampApplet()     { return m_ampApplet; }
     DemoApplet*   demoApplet()    { return m_demoApplet; }
     AcomApplet*   acomApplet()    { return m_acomApplet; }
+    SpeApplet*    speApplet()     { return m_speApplet; }
     TxApplet*       txApplet()       { return m_txApplet; }
     PhoneCwApplet*  phoneCwApplet()  { return m_phoneCwApplet; }
     PhoneApplet*    phoneApplet()    { return m_phoneApplet; }
     EqApplet*       eqApplet()       { return m_eqApplet; }
     WaveApplet*     waveApplet() const { return m_waveApplet; }
     AetherClockApplet* aetherClockApplet() const { return m_aetherClockApplet; }
+    MiniPanApplet*  miniPanApplet() const { return m_miniPanApplet; }
     // Phase 7.1: each side has its own CEQ applet — clientEqTxApplet()
     // is the original "ceq" tile bound to TX, clientEqRxApplet() is
     // the new "ceq-rx" tile bound to RX.  clientEqApplet() retained as
@@ -164,11 +168,42 @@ public:
     // radio-relayed PGXL and a direct-connected ACOM amplifier at once.
     void setAcomVisible(bool visible);
 
+    // Show/hide the SPE button and applet based on a direct SPE Expert
+    // amplifier connection. Independent of setAmpVisible/setAcomVisible for
+    // the same multi-amplifier-station reason.
+    void setSpeVisible(bool visible);
+
     // Show/hide the AG button and applet based on Antenna Genius presence.
     void setAgVisible(bool visible);
 
     // Show/hide the ShackSwitch applet based on device presence.
     void setShackSwitchVisible(bool visible);
+
+    // Show/hide the PROF button and applet based on whether the connected radio
+    // has an on-radio profile store (RadioCapabilities::hasProfiles).
+    //
+    // Unlike TUN/AMP/AG these are NOT markHardwareConditional() at
+    // construction: PROF and DAX have always been in defaultButtonOrder() and
+    // users have them in saved layouts, so the button starts available and only
+    // a connected radio that reports the capability false takes it away. A
+    // disconnected session keeps both, which is what the operator saw before.
+    void setProfilesVisible(bool visible);
+    // Capability passthrough to the Phone/CW applet — same shape as above.
+    void setSelectableMicInputs(bool selectable);
+    void setMicLevelMeterAvailable(bool available);
+    void setRadioFilterWidths(const QList<int>& widthsHz);
+
+    // Show/hide the DAX and DAX-IQ buttons and applets based on whether the
+    // connected radio produces per-slice audio / per-pan IQ streams
+    // (RadioCapabilities::hasDaxStreams). Same not-markHardwareConditional
+    // reasoning as setProfilesVisible above.
+    void setDaxStreamsVisible(bool visible);
+
+    // Show/hide the EQ button and applet — the radio's own 8-band hardware
+    // equalizer (RadioCapabilities::hasRadioSideDsp). Deliberately does NOT
+    // touch the Aetherial RX/TX EQ tiles ("ceq" / "ceq-rx"), which are
+    // host-side and are what a radio without a hardware EQ uses instead.
+    void setHardwareEqVisible(bool visible);
 
     // Reset applet order to default
     void resetOrder();
@@ -254,10 +289,20 @@ private:
         QString      tooltip; // hover description for the picker
         QPushButton* btn{nullptr};
         bool         hardwareAvailable{true};
+        // Whether this applet opens by default when Applet_<id> is UNSET.
+        //
+        // Recorded because the re-enable path has to answer "should this be
+        // open?" for an applet the operator has never touched, and the honest
+        // answer is the applet's own default — not a blanket yes. PROF, DAX and
+        // IQ are created closed; assuming otherwise force-opened all three on
+        // the first connect and then persisted that. See
+        // updateHardwareAvailability().
+        bool         defaultOn{true};
     };
 
     void registerBarButton(const QString& id, const QString& label,
-                           const QString& tooltip, QPushButton* btn);
+                           const QString& tooltip, QPushButton* btn,
+                           bool defaultOn = true);
     void applyBarLayout();
     void setDrawerOpen(bool open);
     void openFavoritesPicker();
@@ -268,6 +313,12 @@ private:
     void updateHardwareAvailability(const QString& id,
                                     const QString& appletKey,
                                     bool hardwareVisible);
+    // updateHardwareAvailability() plus the container hide it deliberately
+    // omits, with the operator's persisted open/closed preference preserved
+    // across the round trip. Backs the capability-driven setXVisible() methods.
+    void applyCapabilityVisibility(const QString& id,
+                                   const QString& appletKey,
+                                   bool available);
     void markHardwareConditional(const QString& id);
     void persistVuMeterSettings() const;
     void showStandardMeterContextMenu(QWidget* source, const QPoint& position);
@@ -295,12 +346,15 @@ private:
     QPushButton* m_ampBtn{nullptr};
     AcomApplet*  m_acomApplet{nullptr};
     QPushButton* m_acomBtn{nullptr};
+    SpeApplet*   m_speApplet{nullptr};
+    QPushButton* m_speBtn{nullptr};
     TxApplet*      m_txApplet{nullptr};
     PhoneCwApplet* m_phoneCwApplet{nullptr};
     PhoneApplet*   m_phoneApplet{nullptr};
     EqApplet*      m_eqApplet{nullptr};
     WaveApplet*    m_waveApplet{nullptr};
     AetherClockApplet* m_aetherClockApplet{nullptr};
+    MiniPanApplet* m_miniPanApplet{nullptr};
     ClientEqApplet* m_clientEqTxApplet{nullptr};
     ClientEqApplet* m_clientEqRxApplet{nullptr};
     ClientCompApplet* m_clientCompApplet{nullptr};

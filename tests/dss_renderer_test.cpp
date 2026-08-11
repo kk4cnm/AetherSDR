@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <utility>
 
 namespace {
@@ -47,7 +48,11 @@ int testFrequencyReprojection()
     DssRenderer renderer;
     QVector<float> bins(DssRenderer::kCols, -100.0f);
     bins[DssRenderer::kCols / 2] = -40.0f;
-    renderer.pushRow(bins);
+    renderer.pushRow(bins, 14.0, 1.0);
+    if (std::abs(renderer.rowCenterMhzAtAge(0) - 14.0) > 1.0e-9
+        || std::abs(renderer.rowBandwidthMhzAtAge(0) - 1.0) > 1.0e-9) {
+        return fail("live DSS row must retain its capture frame");
+    }
 
     const int beforeCount = renderer.rowCount();
     const quint64 beforeGeneration = renderer.rowGeneration();
@@ -68,7 +73,199 @@ int testFrequencyReprojection()
     if (std::abs(actualBin - expectedBin) > 3) {
         return fail("frequency reprojection should shift history into the new viewport");
     }
+    if (std::abs(renderer.rowCenterMhzAtAge(0) - 14.25) > 1.0e-9
+        || std::abs(renderer.rowBandwidthMhzAtAge(0) - 1.0) > 1.0e-9) {
+        return fail("reprojected DSS row must adopt its destination frame");
+    }
 
+    QVector<float> newFrame(DssRenderer::kCols, -72.0f);
+    renderer.pushRow(newFrame, 14.5, 1.0);
+    if (std::abs(
+            renderer.rowDataRing(renderer.headRing())[DssRenderer::kCols - 1]
+            - newFrame[0]) > 0.1f) {
+        return fail("direct DSS reprojection must break the old temporal frame");
+    }
+    if (std::abs(renderer.rowCenterMhzAtAge(0) - 14.5) > 1.0e-9
+        || std::abs(renderer.rowCenterMhzAtAge(1) - 14.25) > 1.0e-9) {
+        return fail("adjacent DSS rows must keep independent capture frames");
+    }
+
+    return 0;
+}
+
+int testSupplementalCoverageDoesNotReplaceFft()
+{
+    DssRenderer renderer;
+    DssRenderer baseline;
+    QVector<float> fft(DssRenderer::kCols, -95.0f);
+    fft[DssRenderer::kCols / 2] = -35.0f;
+    QVector<float> supplemental(DssRenderer::kCols, -70.0f);
+    baseline.pushRow(fft, 14.2, 0.2);
+    renderer.pushRowWithSupplemental(
+        fft, 14.2, 0.2,
+        supplemental, 14.2, 0.4);
+
+    const int ring = renderer.headRing();
+    const int baselineRing = baseline.headRing();
+    for (int column = 0; column < DssRenderer::kCols; ++column) {
+        if (std::abs(
+                renderer.rowDataRing(ring)[column]
+                - baseline.rowDataRing(baselineRing)[column])
+            > 0.001f) {
+            return fail("supplemental coverage must not replace exact FFT bins");
+        }
+    }
+    if (strongestBin(renderer) != strongestBin(baseline)) {
+        return fail("supplemental coverage must not replace exact FFT bins");
+    }
+    if (std::abs(
+            renderer.rowSupplementalDataRing(ring)[0] - (-70.0f))
+        > 0.1f
+        || renderer.rowSupplementalCoverageRing(ring)[0] == 0) {
+        return fail("supplemental coverage should be retained in separate channels");
+    }
+    if (std::abs(renderer.rowSupplementalCenterMhzAtAge(0) - 14.2)
+            > 1.0e-9
+        || std::abs(renderer.rowSupplementalBandwidthMhzAtAge(0) - 0.4)
+            > 1.0e-9) {
+        return fail("supplemental coverage must retain its wider frequency frame");
+    }
+    return 0;
+}
+
+int testSupplementalCoverageRejectsTransientSpikes()
+{
+    DssRenderer renderer;
+    QVector<float> fft(DssRenderer::kCols, -95.0f);
+    QVector<float> supplemental(DssRenderer::kCols, -110.0f);
+    for (int row = 0; row < 2; ++row) {
+        renderer.pushRowWithSupplemental(
+            fft, 14.2, 0.2,
+            supplemental, 14.2, 0.4);
+    }
+
+    QVector<float> transient = supplemental;
+    const int center = DssRenderer::kCols / 2;
+    transient[center] = -20.0f;
+    renderer.pushRowWithSupplemental(
+        fft, 14.2, 0.2,
+        transient, 14.2, 0.4);
+    if (std::abs(
+            renderer.rowSupplementalDataRing(renderer.headRing())[center]
+            - (-110.0f))
+        > 0.1f) {
+        return fail(
+            "supplemental DSS coverage must reject one-row tile spikes");
+    }
+
+    // A real carrier that persists for a second row must still emerge; the
+    // filter rejects isolated maxima rather than flattening supplemental data.
+    renderer.pushRowWithSupplemental(
+        fft, 14.2, 0.2,
+        transient, 14.2, 0.4);
+    if (renderer.rowSupplementalDataRing(renderer.headRing())[center]
+        <= -100.0f) {
+        return fail(
+            "persistent supplemental DSS peaks must survive spike rejection");
+    }
+
+    QVector<float> newFrame(DssRenderer::kCols, -75.0f);
+    renderer.pushRowWithSupplemental(
+        fft, 14.2, 0.2,
+        newFrame, 14.5, 0.6);
+    if (std::abs(
+            renderer.rowSupplementalDataRing(renderer.headRing())[center]
+            - (-75.0f))
+        > 0.1f) {
+        return fail(
+            "supplemental DSS frame changes must break temporal smoothing");
+    }
+    return 0;
+}
+
+int testRetainedHistoryZoomRoundTrip()
+{
+    DssRenderer renderer;
+    renderer.setHistoryCapacityRows(8);
+
+    QVector<float> bins(DssRenderer::kCols, -120.0f);
+    for (int i = 208; i < 304; ++i) {
+        bins[i] = -65.0f + static_cast<float>(i % 11);
+    }
+    for (int i = 0; i < 6; ++i) {
+        renderer.pushRow(bins);
+        renderer.appendHistoryRow(bins, 14.0, 1.0, -200.0f);
+    }
+
+    std::array<float, DssRenderer::kCols> before{};
+    const float* beforeRow = renderer.rowDataRing(renderer.headRing());
+    std::copy_n(beforeRow, DssRenderer::kCols, before.begin());
+    const int headBefore = renderer.headRing();
+    const int countBefore = renderer.rowCount();
+
+    // A direct compact-ring round trip is lossy: the 1 MHz source is reduced
+    // to only a few columns in the 100 MHz view, then those columns are
+    // magnified on the way back. Frame-stamped retained rows must remain the
+    // source for both remaps so the original trace returns intact without
+    // resetting the live ring or interrupting its scrolling phase.
+    renderer.reprojectFrequencyFrame(
+        14.0, 1.0, 14.0, 100.0, -200.0f, true);
+    if (renderer.headRing() != headBefore || renderer.rowCount() != countBefore) {
+        return fail("DSS zoom must preserve the live ring and scrolling phase");
+    }
+    const float* wideRow = renderer.rowDataRing(renderer.headRing());
+    const quint8* wideCoverage =
+        renderer.rowCoverageRing(renderer.headRing());
+    if (wideCoverage[0] != 0
+        || wideCoverage[DssRenderer::kCols - 1] != 0
+        || wideCoverage[DssRenderer::kCols / 2] == 0
+        || std::abs(wideRow[0] - (-200.0f)) > 0.1f
+        || std::abs(wideRow[DssRenderer::kCols - 1] - (-200.0f)) > 0.1f) {
+        return fail("DSS zoom gaps must retain visible floor samples with an "
+                    "independent uncovered marker");
+    }
+    renderer.reprojectFrequencyFrame(
+        14.0, 100.0, 14.0, 1.0, -200.0f, true);
+
+    const float* afterRow = renderer.rowDataRing(renderer.headRing());
+    const quint8* afterCoverage =
+        renderer.rowCoverageRing(renderer.headRing());
+    for (int i = 0; i < DssRenderer::kCols; ++i) {
+        if (std::abs(afterRow[i] - before[i]) > 0.1f) {
+            return fail("retained DSS history must survive an extreme zoom round trip");
+        }
+        if (afterCoverage[i] == 0) {
+            return fail("retained DSS coverage must return after a zoom round trip");
+        }
+    }
+
+    QVector<float> newFrame(DssRenderer::kCols, -74.0f);
+    renderer.pushRow(newFrame);
+    const float* firstNewRow = renderer.rowDataRing(renderer.headRing());
+    if (std::abs(firstNewRow[0] - newFrame[0]) > 0.1f) {
+        return fail("first post-zoom DSS row must not blend with the old frequency frame");
+    }
+
+    return 0;
+}
+
+int testRetainedHistoryFrameChangeBreaksTemporalBlend()
+{
+    DssRenderer renderer;
+    renderer.setHistoryCapacityRows(8);
+
+    QVector<float> strong(DssRenderer::kCols, -40.0f);
+    for (int i = 0; i < 4; ++i) {
+        renderer.appendHistoryRow(strong, 14.0, 1.0, -200.0f);
+    }
+    QVector<float> quiet(DssRenderer::kCols, -120.0f);
+    renderer.appendHistoryRow(quiet, 14.0, 0.1, -200.0f);
+    renderer.rebuildVisibleFromHistory(0, 14.0, 0.1, -200.0f);
+
+    const float* row = renderer.rowDataRing(renderer.headRing());
+    if (std::abs(row[DssRenderer::kCols / 2] - quiet[0]) > 0.1f) {
+        return fail("retained DSS smoothing must stop across a frequency-frame change");
+    }
     return 0;
 }
 
@@ -360,6 +557,241 @@ int testDcEdgeSpikeFlattening()
     return 0;
 }
 
+int testOverhangSurvivesUncoveredRows()
+{
+    // Reproduces the transmit case: the FFT-derived producer that paces rows
+    // during TX appends with NO supplemental, so the front row loses its
+    // overhang while the rest of the screen still has it. Driving the span off
+    // the front row alone collapsed the whole surface on every over.
+    constexpr double kTargetBw = 0.2;
+    constexpr double kTileBw = 0.24;
+    DssRenderer renderer;
+    QVector<float> fft(DssRenderer::kCols, -95.0f);
+    QVector<float> tile(DssRenderer::kCols, -100.0f);
+
+    for (int i = 0; i < 8; ++i) {
+        renderer.pushRowWithSupplemental(
+            fft, 14.1, kTargetBw, tile, 14.1, kTileBw);
+    }
+    if (std::abs(renderer.newestSupplementalBandwidthMhz(kTargetBw) - kTileBw)
+            > 1.0e-9) {
+        return fail("a covered front row must report its own overhang");
+    }
+
+    // Key up: several supplemental-less rows arrive on top.
+    for (int i = 0; i < 5; ++i) {
+        renderer.pushRow(fft, 14.1, kTargetBw);
+    }
+    if (renderer.rowSupplementalBandwidthMhzAtAge(0) != 0.0) {
+        return fail("the transmit-era front row should carry no overhang");
+    }
+    if (std::abs(renderer.newestSupplementalBandwidthMhz(kTargetBw) - kTileBw)
+            > 1.0e-9) {
+        return fail("overhang must survive uncovered rows at the front while "
+                    "covered rows are still on screen");
+    }
+
+    // Once every covered row has scrolled out of the VISIBLE ring there really
+    // is no overhang on screen, and reporting none is then correct.
+    for (int i = 0; i < DssRenderer::kVisibleRows; ++i) {
+        renderer.pushRow(fft, 14.1, kTargetBw);
+    }
+    if (renderer.newestSupplementalBandwidthMhz(kTargetBw) != 0.0) {
+        return fail("overhang must lapse once no covered row remains visible");
+    }
+
+    // A tile no wider than the viewport is not an overhang, and a degenerate
+    // target must not be divided by downstream.
+    DssRenderer narrow;
+    narrow.pushRowWithSupplemental(fft, 14.1, kTargetBw, tile, 14.1, kTargetBw);
+    if (narrow.newestSupplementalBandwidthMhz(kTargetBw) != 0.0) {
+        return fail("a tile no wider than the viewport is not an overhang");
+    }
+    if (renderer.newestSupplementalBandwidthMhz(0.0) != 0.0
+        || renderer.newestSupplementalBandwidthMhz(
+               std::numeric_limits<double>::quiet_NaN()) != 0.0) {
+        return fail("a degenerate viewport width must report no overhang");
+    }
+    return 0;
+}
+
+int testRowSpanTaper()
+{
+    constexpr float kMax = DssRenderer::kMaxRowSpanFactor;
+    const auto span = [](double supp, double target, int pct) {
+        return DssRenderer::rowSpanFactorFor(supp, target, pct);
+    };
+
+    // A source with no usable overhang must keep the clipped trapezoid at EVERY
+    // setting — the slider must never widen into spectrum never captured.
+    for (const int pct : {0, 50, 100}) {
+        if (span(0.2, 0.2, pct) != 1.0f        // exactly the viewport
+            || span(0.1, 0.2, pct) != 1.0f     // narrower than the viewport
+            || span(0.0, 0.2, pct) != 1.0f) {
+            return fail("no overhang must keep the clipped trapezoid");
+        }
+    }
+
+    // Degenerate frames must not widen either. A zero/negative target would
+    // divide by zero and a NaN would poison the mesh uniform.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double inf = std::numeric_limits<double>::infinity();
+    for (const int pct : {0, 100}) {
+        if (span(0.23, 0.0, pct) != 1.0f
+            || span(0.23, -0.2, pct) != 1.0f
+            || span(0.23, nan, pct) != 1.0f
+            || span(nan, 0.2, pct) != 1.0f
+            || span(inf, 0.2, pct) != 1.0f
+            || span(0.23, inf, pct) != 1.0f) {
+            return fail("a degenerate frequency frame must not widen the mesh");
+        }
+    }
+
+    // The percentage scales the AVAILABLE span, not the absolute maximum: with
+    // a 1.2x tile, 100 must reach exactly 1.2 and 50 exactly halfway. An
+    // absolute reading would put 50 at 1.333 and clamp it back to 1.2, which is
+    // the dead-travel bug this mapping exists to avoid.
+    if (std::abs(span(0.24, 0.2, 100) - 1.2f) > 0.0001f) {
+        return fail("100% must spend the whole available overhang");
+    }
+    if (std::abs(span(0.24, 0.2, 50) - 1.1f) > 0.0001f) {
+        return fail("50% must spend half the available overhang");
+    }
+    if (span(0.24, 0.2, 0) != 1.0f) {
+        return fail("0% must restore the clipped trapezoid");
+    }
+
+    // Monotone in the setting, so every step of the control does something.
+    float previous = span(0.24, 0.2, 0);
+    for (int pct = 10; pct <= 100; pct += 10) {
+        const float current = span(0.24, 0.2, pct);
+        if (!(current > previous)) {
+            return fail("every step of the span control must widen the surface");
+        }
+        previous = current;
+    }
+
+    // An overhang past the cap saturates rather than overhanging pointlessly.
+    if (std::abs(span(2.0, 0.2, 100) - kMax) > 0.0001f) {
+        return fail("an overhang beyond the cap must saturate");
+    }
+
+    // Out-of-range settings clamp rather than extrapolating past the cap or
+    // inverting the surface.
+    if (span(0.24, 0.2, -50) != 1.0f
+        || std::abs(span(0.24, 0.2, 500) - 1.2f) > 0.0001f) {
+        return fail("the span setting must clamp to 0..100");
+    }
+
+    return 0;
+}
+
+int testRowSpanGeometry()
+{
+    constexpr float kMax = DssRenderer::kMaxRowSpanFactor;
+
+    // Span 1.0 is a strict identity: the CPU fallback and every existing caller
+    // depend on today's rendering being untouched when no overhang exists.
+    for (const float meshUnit : {0.0f, 0.25f, 0.5f, 1.0f}) {
+        if (std::abs(DssRenderer::rowFrequencyUnit(meshUnit, 1.0f) - meshUnit)
+                > 0.0001f) {
+            return fail("span 1.0 must map mesh columns to themselves");
+        }
+    }
+    for (const float depth : {0.0f, 0.5f, 1.0f}) {
+        if (std::abs(DssRenderer::rowScreenCoverage(depth, 1.0f)
+                     - DssRenderer::depthScale(depth)) > 0.0001f) {
+            return fail("span 1.0 must leave row coverage untouched");
+        }
+    }
+    if (DssRenderer::wedgeFreeDepth(1.0f) != 0.0f) {
+        return fail("span 1.0 must close no part of the wedge");
+    }
+
+    // The point of the whole change: at the widest useful span the NEAR rows
+    // overhang the plot and the DEEPEST row lands exactly on its edge, so no
+    // depth is left with a wedge.
+    if (!(DssRenderer::rowScreenCoverage(0.0f, kMax) > 1.0f)) {
+        return fail("the front row must overhang the plot edges");
+    }
+    if (std::abs(DssRenderer::rowScreenCoverage(1.0f, kMax) - 1.0f) > 0.0001f) {
+        return fail("the deepest row must land exactly on the plot edge");
+    }
+    if (std::abs(DssRenderer::wedgeFreeDepth(kMax) - 1.0f) > 0.0001f) {
+        return fail("the widest span must close the wedge at every depth");
+    }
+    // Coverage must fall monotonically front to back and never dip below the
+    // plot until the wedge-free depth is passed.
+    float previous = DssRenderer::rowScreenCoverage(0.0f, kMax);
+    for (int step = 1; step <= 20; ++step) {
+        const float depth = static_cast<float>(step) / 20.0f;
+        const float coverage = DssRenderer::rowScreenCoverage(depth, kMax);
+        if (coverage > previous + 0.0001f) {
+            return fail("row coverage must narrow with depth");
+        }
+        if (coverage < 1.0f - 0.0001f) {
+            return fail("no row may fall inside the plot at the widest span");
+        }
+        previous = coverage;
+    }
+
+    // A partial overhang closes the wedge from the FRONT, and wedgeFreeDepth
+    // must agree with where coverage actually crosses the plot edge.
+    constexpr float kFlexSpan = 1.2f;   // a FLEX tile runs about 1.2x
+    const float flexSpan = DssRenderer::rowSpanFactorForOverhang(kFlexSpan);
+    if (std::abs(flexSpan - kFlexSpan) > 0.0001f) {
+        return fail("an overhang below the cap should be used in full");
+    }
+    if (!(DssRenderer::rowScreenCoverage(0.0f, flexSpan) > 1.0f)
+        || !(DssRenderer::rowScreenCoverage(1.0f, flexSpan) < 1.0f)) {
+        return fail("a partial overhang must overhang the front and not the back");
+    }
+    const float crossing = DssRenderer::wedgeFreeDepth(flexSpan);
+    if (!(crossing > 0.0f) || !(crossing < 1.0f)) {
+        return fail("a partial overhang must close part of the wedge");
+    }
+    if (std::abs(DssRenderer::rowScreenCoverage(crossing, flexSpan) - 1.0f)
+            > 0.0001f) {
+        return fail("wedgeFreeDepth must be where coverage reaches the edge");
+    }
+
+    // Data past the cap is off-plot; taking it would only overhang further.
+    if (std::abs(DssRenderer::rowSpanFactorForOverhang(4.0f) - kMax) > 0.0001f) {
+        return fail("overhang beyond the cap must clamp");
+    }
+    // No overhang, or a degenerate one, must keep the clipped trapezoid rather
+    // than widening into spectrum that was never captured.
+    if (DssRenderer::rowSpanFactorForOverhang(1.0f) != 1.0f
+        || DssRenderer::rowSpanFactorForOverhang(0.5f) != 1.0f
+        || DssRenderer::rowSpanFactorForOverhang(
+               std::numeric_limits<float>::quiet_NaN()) != 1.0f) {
+        return fail("a missing overhang must keep the clipped trapezoid");
+    }
+
+    // The projection must be span-INDEPENDENT: widening changes what a row
+    // covers, never where a frequency lands. This is what keeps the converging
+    // slant, the frequency ruler and every marker exactly where they were.
+    for (const float span : {1.0f, 1.2f, kMax}) {
+        for (const float depth : {0.0f, 0.4f, 1.0f}) {
+            constexpr float kSignalUnit = 0.3f;
+            // Solve for the mesh column carrying this frequency, project it,
+            // and it must land on the unwidened position.
+            const float meshUnit = 0.5f + (kSignalUnit - 0.5f) / span;
+            const float freqUnit =
+                DssRenderer::rowFrequencyUnit(meshUnit, span);
+            const double screenX =
+                0.5 + (freqUnit - 0.5) * DssRenderer::depthScale(depth);
+            if (std::abs(screenX
+                         - DssRenderer::projectPerspective(
+                               kSignalUnit, depth).x()) > 0.0001) {
+                return fail("widening a row must not move an in-band signal");
+            }
+        }
+    }
+
+    return 0;
+}
+
 int testPerspectiveProjection()
 {
     const QPointF frontLeft =
@@ -462,6 +894,18 @@ int main()
     if (int rc = testFrequencyReprojection(); rc != 0) {
         return rc;
     }
+    if (int rc = testSupplementalCoverageDoesNotReplaceFft(); rc != 0) {
+        return rc;
+    }
+    if (int rc = testSupplementalCoverageRejectsTransientSpikes(); rc != 0) {
+        return rc;
+    }
+    if (int rc = testRetainedHistoryZoomRoundTrip(); rc != 0) {
+        return rc;
+    }
+    if (int rc = testRetainedHistoryFrameChangeBreaksTemporalBlend(); rc != 0) {
+        return rc;
+    }
     if (int rc = testRetainedHistoryOffset(); rc != 0) {
         return rc;
     }
@@ -493,6 +937,15 @@ int main()
         return rc;
     }
     if (int rc = testDcEdgeSpikeFlattening(); rc != 0) {
+        return rc;
+    }
+    if (int rc = testOverhangSurvivesUncoveredRows(); rc != 0) {
+        return rc;
+    }
+    if (int rc = testRowSpanTaper(); rc != 0) {
+        return rc;
+    }
+    if (int rc = testRowSpanGeometry(); rc != 0) {
         return rc;
     }
     if (int rc = testPerspectiveProjection(); rc != 0) {

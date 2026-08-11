@@ -173,7 +173,17 @@ void SimBackend::onAudioTick()
         const QVector<float> frame = m_keyed
             ? QVector<float>(NoiseMixer::kFrameLen, 0.0f)
             : m_audio.mixFrame();
-        emit audioFrameReady(toStereoBytes(frame));
+        const QByteArray stereo = toStereoBytes(frame);
+        emit audioFrameReady(stereo);
+        // Per-slice audio too, on this backend's single slice.
+        //
+        // Not optional: the TCI receiver channels are fed from
+        // sliceAudioFrameReady, because the mixed feed cannot say which slice a
+        // buffer belongs to. That routing used to be a hardcoded "channel 1"
+        // fed from audioFrameReady, which worked only while every in-process
+        // backend had exactly one receiver. Demo mode still does — but it has to
+        // SAY so, or TCI audio in demo mode goes silent.
+        emit sliceAudioFrameReady(kSliceId, stereo);
 
         // A panadapter row a few times a second (not every audio frame — the
         // display updates far slower than audio). ~20 fps at the 5.33 ms frame ≈
@@ -283,6 +293,7 @@ RadioCapabilities SimBackend::capabilities() const
 {
     RadioCapabilities caps;
     caps.family = familyName();
+    caps.manufacturer = QStringLiteral("AetherSDR");
     caps.model  = demoModelName();
     caps.maxSlices = 1;          // Phase 1: a single slice. Phase 2 raises this.
     caps.maxPanadapters = 1;
@@ -294,6 +305,44 @@ RadioCapabilities SimBackend::capabilities() const
     caps.hasTuner = false;
     caps.hasAmplifier = false;
     caps.hasExtendedDsp = false;
+    caps.hasLmsNoiseFilters = false;
+    caps.hasManualNotch = false;
+    // Synthesised signals come out exactly where the demo says they are; there
+    // is no oscillator to be wrong about.
+    caps.hostFrequencyCalibration = false;
+    // The simulator has no profile store to list, load or save into.
+    caps.hasProfiles = false;
+    caps.hasSelectableMicInputs = false;
+
+    // The demo has no transmitter and no radio to ship audio to.
+    caps.takesTxAudioOverSeam = false;
+    // Continuous/unknown — the operator keeps their own width list.
+    caps.rxFilterWidthsHz = {};
+    // Synthetic audio only; nothing to route to a virtual device.
+    caps.hasDaxStreams = false;
+    caps.hasRadioSideDsp = false;        // synthetic scene; no firmware DSP
+    // No radio-side display engine either — the demo's rows carry no black level.
+    caps.hasRadioSideWaterfallAutoBlack = false;
+    // No command plane at all: no radio-side CW text keyer, no voice keyer, and
+    // a simulator that cannot key has nothing to be full duplex about.
+    caps.hasRadioSideCwKeyer = false;
+    caps.hasVoiceKeyer = false;
+    caps.hasFullDuplex = false;
+    caps.hasWaveforms = false;
+    caps.hasMultiClientSessions = false;
+    // No manual notch. The synthetic scene has an auto-notch in its mixer, but
+    // nothing implements a placed, tracking null — so the +TNF button and the
+    // panadapter's add-notch entries stay hidden here rather than appearing and
+    // doing nothing.
+    caps.maxNotchFilters = 0;
+    caps.notchHasDepth = false;
+    caps.notchMinWidthHz = 0.0;
+    caps.notchMaxWidthHz = 0.0;
+    caps.hasGpsLocation = false;         // synthetic radio has no position source
+    caps.hasSupplyVoltageTelemetry = false;   // synthetic scene; no PA rail
+    // The demo radio regenerates its synthetic scene on every connect; there
+    // is no operating state worth resurrecting across sessions.
+    caps.clientSettingsDomains = {};
     return caps;
 }
 
@@ -371,18 +420,16 @@ void SimBackend::emitInitialState()
     emit panCenterBandwidthChanged(QStringLiteral("0x40000000"),
                                    m_sliceFreqMhz, kDemoPanBandwidthMhz);
 
-    // …and the waterfall row interval, for exactly the same reason. The synthetic
-    // connect declares `line_duration=48` on a proper `display waterfall` status
-    // line, but RadioModel decodes that through m_flexBackend->
-    // decodeWaterfallLineDuration(), which is null in demo mode — so the value was
-    // parsed off the wire and dropped. PanadapterModel::waterfallLineDuration()
-    // stayed 0 and the neutral row pacer fell back to its 100 ms default, which is
-    // why the runtime reported 100 rather than the declared 48 (measured: 9.71
-    // rows/sec = 103 ms, against the 20.8/sec the demo actually produces).
-    // panWaterfallLineDurationChanged is the universal seam signal RadioModel
-    // wires for every backend, so emitting it here closes the gap.
+    // …and the waterfall rate, for exactly the same reason. The synthetic connect
+    // declares it on a proper `display waterfall` status line, but RadioModel
+    // decodes that through m_flexBackend->decodeWaterfallLineDuration(), which is
+    // null in demo mode — so the value was parsed off the wire and dropped, and
+    // PanadapterModel::waterfallLineDuration() stayed 0 while the neutral row
+    // pacer fell back to its own default. panWaterfallLineDurationChanged is the
+    // universal seam signal RadioModel wires for every backend, so emitting it
+    // here closes the gap.
     emit panWaterfallLineDurationChanged(QStringLiteral("0x40000000"),
-                                         kWaterfallLineDurationMs);
+                                         kWaterfallRate);
 
     // One active slice on a sensible default, so the UI has something live to
     // show the moment demo mode connects. Same rationale as the pan above: the
@@ -461,7 +508,7 @@ void SimBackend::setSliceAgc(int sliceId, const QString& mode, int thresholdDb)
     emit sliceChanged(kSliceId, d);
 }
 
-void SimBackend::setPanCenter(const QString& panId, double hz)
+void SimBackend::setPanCenter(const QString& panId, double hz, PanCenterIntent)
 {
     // The demo's panadapter centre is driven by its owned PanadapterStream (Route
     // A), which paints a fixed synthetic window around the slice, so there is no

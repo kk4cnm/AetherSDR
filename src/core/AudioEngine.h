@@ -16,6 +16,7 @@
 #include <mutex>
 #include <QBuffer>
 #include <QByteArray>
+#include <QDeadlineTimer>
 #include <QElapsedTimer>
 #include <QFutureSynchronizer>
 #include <QPointer>
@@ -25,6 +26,7 @@
 #include "TxMicChannelNormalizer.h"
 #include "TxCaptureHealthTracker.h"
 #include "SpectralNR.h"
+#include "OpusTxPacer.h"
 
 class QMediaDevices;
 
@@ -173,6 +175,7 @@ public:
     bool isRxStreaming() const { return m_audioSink != nullptr; }
     bool isTxStreaming() const { return m_audioSource != nullptr; }
     bool kiwiSdrAudioTransmitMuted() const;
+    bool hasKiwiSdrAudioSource(const QString& sourceId) const;
     int  txInputSampleRate() const { return m_txInputRate; }
     int  txInputChannelCount() const { return m_txInputChannels; }
     bool txInputResamplingTo24k() const { return m_txNeedsResample; }
@@ -227,6 +230,7 @@ public:
     void setNr2NpeMethod(int method);
     void setNr2AeFilter(bool on);
     QJsonObject nr2RuntimeDiagnostics() const;
+    QJsonObject opusTxPacingDiagnostics() const;
     Q_INVOKABLE void setNr2UseOriginalGeometry(bool useOriginal);
     // Tell the engine the main RX source is (or is not) the demo, so the main NR2
     // filter uses the original 256/2 geometry the demo's tiny frames need. Rebuilds
@@ -239,6 +243,10 @@ public:
     // Client-side RN2 (RNNoise neural noise suppression)
     Q_INVOKABLE void setRn2Enabled(bool on);
     bool rn2Enabled() const { return m_rn2Enabled.load(); }
+    // RN2 dry mix — fraction of the original spectrum RN2 leaves in the RX
+    // output (Rn2SettingsModel owns the value). Applies to every live RX RN2
+    // instance; the TX path keeps full suppression.
+    void setRn2DryMix(float value);
 
     // Client-side RN2 — TX path (mic pre-amp).  Runs on the voice path
     // in onTxAudioReady() AFTER the RADE/DAX early-returns, so digital
@@ -585,6 +593,8 @@ public slots:
     void setKiwiSdrAudioSourceEnabled(const QString& sourceId, bool on);
     void setKiwiSdrAudioSourceGain(const QString& sourceId, float gainPercent);
     void setKiwiSdrAudioSourceMuted(const QString& sourceId, bool muted);
+    void setKiwiSdrAudioSourceKeepDuringTx(const QString& sourceId, bool keep);
+    void setKiwiSdrAudioSourceResumeHold(const QString& sourceId, int holdMs);
     void setKiwiSdrAudioSourcePan(const QString& sourceId, int pan);
     void setKiwiSdrAudioTransmitMuted(bool muted);
     void removeKiwiSdrAudioSource(const QString& sourceId);
@@ -624,10 +634,15 @@ signals:
     // RX panStream::audioDataReady() path so CwDecoder::feedAudio()
     // accepts it without a separate adapter.
     void txDecodeAudioReady(const QByteArray& pcm24kStereoFloat);
+    // `channels` is carried explicitly (#4489) rather than left for a consumer
+    // to infer from the block's byte count — every current emit site passes 2
+    // (interleaved stereo, see writeAudio()), but a consumer must not assume
+    // that stays true; it must read this argument.
     void receivePresentationPostDspAudioReady(const QString& source,
                                               const QString& sourceId,
-                                              const QByteArray& pcmStereoFloat,
-                                              int sampleRate);
+                                              const QByteArray& pcmFloat,
+                                              int sampleRate,
+                                              int channels);
     void receivePresentationOutputAudioReady(const QString& source,
                                              const QString& sourceId,
                                              const QByteArray& pcmStereoFloat,
@@ -718,6 +733,18 @@ private:
         int presentationDelayMs{0};
         bool enabled{false};
         bool muted{false};
+        // Transmit gating is presentation-only for managed Kiwi sources:
+        // the feed, jitter buffer, and DSP keep running through TX, and
+        // only the final mix contribution is ramped to zero. With
+        // keepAudioDuringTx set the source stays audible during TX.
+        // txResumeHoldMs > 0 keeps the gate closed that long past unkey so
+        // the resume lands on post-TX audio instead of the operator's own
+        // delayed TX tail (default QDeadlineTimer is already expired, so
+        // an unarmed deadline never holds the gate).
+        bool keepAudioDuringTx{false};
+        int txResumeHoldMs{0};
+        QDeadlineTimer txResumeDeadline;
+        float txGateGain{1.0f};
         bool prebuffering{false};
         bool dspInitializationPending{false};
     };
@@ -768,7 +795,8 @@ private:
     ExternalRxAudioSourceState* externalKiwiSource(const QString& sourceId,
                                                    bool create);
     bool kiwiSdrAudioActive() const;
-    bool externalKiwiSourceAudible(const ExternalRxAudioSourceState& source) const;
+    bool externalKiwiSourceProcessing(
+        const ExternalRxAudioSourceState& source) const;
     bool anyExternalKiwiAudioEnabled() const;
     bool anyExternalKiwiBufferQueued() const;
     qsizetype externalKiwiOutputBufferBytes() const;
@@ -923,8 +951,11 @@ private:
     std::atomic<bool>  m_opusTxEnabled{false}; // Opus TX encoding for SmartLink
     std::unique_ptr<class OpusCodec> m_opusTxCodec; // lazy-init on first TX with Opus
     QByteArray    m_opusTxAccumulator;  // accumulate stereo samples for Opus frame
-    QVector<QByteArray> m_opusTxQueue;  // pacing queue for even 10ms packet delivery
+    OpusTxPacer   m_opusTxPacer;
     QTimer*       m_opusTxPaceTimer{nullptr};
+    QElapsedTimer m_opusTxPaceClock;
+    QElapsedTimer m_opusTxDropLogTimer;
+    quint64       m_opusTxDropsSinceLog{0};
 
     // Client-side PC mic metering (accumulated over ~50ms window)
     float         m_pcMicPeak{0.0f};
@@ -1177,7 +1208,6 @@ private:
     QTimer* m_wsprPumpTimer{nullptr};
     QElapsedTimer m_wsprPumpClock;
     qint64 m_wsprPumpedFrames{0};
-    QByteArray m_wsprInt16Scratch;
     QByteArray m_wsprFloatScratch;
     // DAX TX mode borrowed for the duration of a WSPR frame so the mic path
     // cannot produce a second packet stream against the same m_txPacketCount.
@@ -1209,6 +1239,12 @@ private:
     std::mutex m_dspInitializationTasksMutex;
     bool m_dspInitializationStopping{false};
     std::atomic<bool> m_kiwiSdrAudioTransmitMuted{false};
+    // Audio-thread-only. TX mix gate for the delayed-Flex presentation path
+    // (mirrors ExternalRxAudioSourceState::txGateGain): with a Receive Sync
+    // delay applied, the presentation buffer holds pre-key-down RX audio
+    // that must ramp out of the mix at key-down instead of playing through
+    // the start of the transmission.
+    float             m_flexTxGateGain{1.0f};
     std::atomic<int>  m_flexReceivePresentationDelayMs{0};
     std::atomic<int>  m_kiwiReceivePresentationDelayMs{0};
     QString           m_externalKiwiReceivePresentationDelaySourceId;
@@ -1244,6 +1280,7 @@ private:
     QVector<AutomationAudioCaptureChunk> m_automationCaptureChunks;
     static constexpr int   kKiwiSdrJitterTargetMs = 360;
     static constexpr int   kKiwiSdrBufferCapMs = 1000;
+    static constexpr int   kKiwiSdrTxGateRampMs = 8;
     void resetRxChainStateForSourceSwitch();
     std::unique_ptr<Resampler> m_kiwiSdrRxResampler;
     std::unique_ptr<Resampler> m_kiwiSdrRxResamplerR;

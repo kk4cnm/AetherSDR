@@ -23,7 +23,7 @@ AetherSDR currently supports these control paths:
 - **Built-in keyboard shortcuts** for tuning, audio, transmit, and other common actions.
 - **Custom keyboard bindings** through the shortcut editor.
 - **FlexControl USB tuning knob** through the serial-control path.
-- **MIDI controllers** with learn mode, profiles, and relative-encoder support.
+- **MIDI controllers** with learn mode, manual mapping entry, profiles, and relative-encoder support.
 - **USB HID encoder devices** including:
   - Icom RC-28
   - Griffin PowerMate
@@ -392,6 +392,8 @@ The MIDI dialog lets you:
 - Refresh the port list
 - Turn on **Auto-connect on startup**
 - Use **Learn** mode to bind a control by moving it
+- Use **Manual…** to type in a binding yourself
+- Edit any existing binding with the **✎** button on its row
 - Save named profiles
 - Load saved profiles
 - Clear all bindings if you want to start over
@@ -437,6 +439,38 @@ For slider and knob targets, Learn ignores touch-only NoteOn messages and waits 
 For sliders, leave **Relative** off and use normal absolute mode.
 
 Use **Invert** if the control moves the opposite way from what feels natural.
+
+### Entering a binding manually
+
+Learn is the easiest path, but sometimes typing the binding in directly is better:
+
+- Some controllers send **more than one MIDI message for a single press**. Learn
+  captures whichever message arrives first, which may not be the one you want.
+- You may want to set up bindings from the controller's manual **before the
+  device is connected**.
+- A binding Learn captured may simply need a small correction.
+
+To add a binding by hand, select the parameter as usual and click **Manual…**
+instead of Learn. Enter the channel, the message type (**Note On**,
+**Control Change**, or **Pitch Bend**), and the note or CC number from your
+controller's documentation, then click **OK**. The binding behaves exactly like
+a learned one and is saved immediately.
+
+To correct an existing binding, click the **✎** button on its row. The same form
+opens with the current values filled in — change what you need and click **OK**.
+
+A few details worth knowing:
+
+- **Channel "Any"** matches the message on every MIDI channel. Learn always binds
+  the specific channel it heard, so "Any" is available only through manual entry.
+- If the source you enter is **already bound to another parameter**, AetherSDR
+  asks before replacing it. Two bindings on the same source cannot both respond,
+  so the dialog never lets one silently disable the other.
+- For key and button targets there is no separate Note Off entry: a **Note On**
+  binding automatically follows the release too.
+- **Pitch Bend** messages carry no number, so that field is disabled.
+- The **Relative** checkbox is only meaningful for Control Change bindings, and
+  it is pre-checked for you when you bind the `VFO Tune Knob` to a CC.
 
 ### CW and PTT from MIDI
 
@@ -497,20 +531,57 @@ No build step, npm, or command line is required just to use the plugin.
 
 #### What it controls
 
-The official Elgato plugin currently provides actions across areas such as:
+Actions are grouped into categories in the Stream Deck action list, in this
+order:
 
+- TCI connection status
 - TX
-- Bands
-- Frequency step actions
+- Slice controls, including slice targeting
+- Frequency, covering bands and step actions
 - Modes
-- Audio
+- Audio, both master and per-slice
 - DSP
-- Slice controls
 - DVK record and playback
+- Dials, for Stream Deck + encoder hardware
 
-#### Important note about dials
+#### Choosing which slice the buttons control
 
-The current official Elgato plugin is **button-oriented**. Its manifest advertises keypad-style actions, not dial/controller actions. If you want Stream Deck dial support, the Linux StreamController path below is currently the better fit.
+By default every slice-aware action controls **TRX0** — the first slice —
+which is how the plugin has always behaved.
+
+The **Slice Target** action changes that. Press it to cycle through:
+
+- **TRX0** — always the first slice
+- **TX** — whichever slice currently holds transmit
+- **ACTIVE** — whichever slice has focus in the AetherSDR window
+
+The button's label shows the current choice, and the choice is remembered
+across restarts. It applies to the mode, DSP, squelch, lock, RIT/XIT, split,
+slice volume and slice mute actions, and to the VFO dial.
+
+There is no option to target a specific slice by number. AetherSDR tells a
+control surface how many slices exist only once, when it first connects, and
+never mentions slices being added or removed — so a numbered choice would go
+out of date as soon as you added a slice, and would then quietly act on the
+first slice instead of the one you picked. **TX** and **ACTIVE** are always
+reported as they change, so they cannot go stale.
+
+**PTT, MOX and TUNE deliberately ignore this setting.** They always key
+whichever slice already holds transmit, because AetherSDR decides that itself —
+a control surface cannot choose the slice it transmits on, by design, so that a
+button press can never move you to another band or antenna mid-transmission.
+
+#### Dials
+
+Alongside the keypad actions, the plugin provides dial (encoder) actions for
+Stream Deck + hardware: VFO tuning, RF power, tune carrier power, and volume.
+
+Each dial's push gesture has its own function. The VFO dial cycles the tuning
+step, the RF power and tune power dials cycle their step between 1 W and 5 W,
+and the volume dial mutes the targeted slice.
+
+RF power and tune carrier power are separate radio settings, so they have
+separate dials — setting a low tune level leaves your operating power alone.
 
 #### Linux via OpenDeck (experimental)
 

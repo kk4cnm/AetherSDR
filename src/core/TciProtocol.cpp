@@ -1,7 +1,9 @@
 #ifdef HAVE_WEBSOCKETS
 #include "TciProtocol.h"
 #include "AppSettings.h"
+#include "LogManager.h"
 #include "TciRoutingState.h"
+#include "TciTrxMap.h"
 #include "models/RadioModel.h"
 #include "models/SliceModel.h"
 #include "models/PanadapterModel.h"
@@ -60,9 +62,11 @@ long long TciProtocol::mhzToHz(double mhz)
     return static_cast<long long>(std::round(mhz * 1e6));
 }
 
-TciProtocol::TciProtocol(RadioModel* model, TciRoutingState* routingState)
+TciProtocol::TciProtocol(RadioModel* model, TciRoutingState* routingState,
+                         const TciTrxMap* trxMap)
     : m_model(model)
     , m_routingState(routingState)
+    , m_trxMap(trxMap)
 {}
 
 // ── Mode conversion ────────────────────────────────────────────────────────
@@ -82,7 +86,7 @@ QString TciProtocol::smartsdrToTci(const QString& mode)
     return map.value(mode.toUpper(), "usb");
 }
 
-QString TciProtocol::tciToSmartSDR(const QString& mode)
+QString TciProtocol::tciToSmartSDR(const QString& mode, bool* ok)
 {
     static const QMap<QString, QString> map = {
         {"usb",  "USB"},   {"lsb",  "LSB"},
@@ -92,17 +96,21 @@ QString TciProtocol::tciToSmartSDR(const QString& mode)
         {"digu", "DIGU"},  {"digl", "DIGL"},
         {"rtty", "RTTY"},
     };
-    return map.value(mode.toLower(), "USB");
+    const auto it = map.find(mode.toLower());
+    if (ok) *ok = (it != map.end());
+    return it != map.end() ? it.value() : QStringLiteral("USB");
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 SliceModel* TciProtocol::sliceForTrx(int trx) const
 {
+    if (m_trxMap)
+        return m_trxMap->sliceForTrx(m_model, trx);
     return resolveSliceForTrx(m_model, trx);
 }
 
-SliceModel* TciProtocol::resolveSliceForTrx(RadioModel* model, int trx)
+SliceModel* TciProtocol::resolveSliceForTrxStrict(RadioModel* model, int trx)
 {
     if (!model || !model->isConnected()) return nullptr;
     const QList<SliceModel*> slices = model->slices();
@@ -114,7 +122,17 @@ SliceModel* TciProtocol::resolveSliceForTrx(RadioModel* model, int trx)
     for (auto* s : slices) {
         if (s && s->sliceId() == trx) return s;
     }
-    // Fallback: first slice
+    return nullptr;
+}
+
+SliceModel* TciProtocol::resolveSliceForTrx(RadioModel* model, int trx)
+{
+    if (SliceModel* resolved = resolveSliceForTrxStrict(model, trx))
+        return resolved;
+    // Fallback: first slice. Read paths keep the guess (tci-receivers.md
+    // rule 3); keying paths use the strict resolver instead (#4547).
+    if (!model || !model->isConnected()) return nullptr;
+    const QList<SliceModel*> slices = model->slices();
     return slices.isEmpty() ? nullptr : slices.first();
 }
 
@@ -165,7 +183,8 @@ int TciProtocol::txSliceTrxOrNone(RadioModel* model)
 
 int TciProtocol::txTrx() const
 {
-    const int trx = txSliceTrxOrNone(m_model);
+    const int trx = m_trxMap ? m_trxMap->txSliceTrxOrNone(m_model)
+                             : txSliceTrxOrNone(m_model);
     return trx < 0 ? 0 : trx;  // request/response wire needs a concrete index
 }
 
@@ -212,7 +231,10 @@ QString TciProtocol::generateInitBurst()
     burst += QStringLiteral("if_limits:-48000,48000;");
 
     const auto slices = m_model ? m_model->slices() : QList<SliceModel*>{};
-    int trxCount = slices.size();
+    // #4567: with stable bindings, a transient hole (band-change settle
+    // window) must not advertise a count below an index a client is using —
+    // the map reports 1 + the highest trx in use instead of the list size.
+    int trxCount = m_trxMap ? m_trxMap->trxCount(m_model) : slices.size();
     if (trxCount < 1) trxCount = 1;
     burst += QStringLiteral("trx_count:%1;").arg(trxCount);
     // `channels_count` (plural).  The TCI Protocol PDF spec lists this
@@ -255,7 +277,8 @@ QString TciProtocol::generateInitBurst()
     // state machine).
     if (m_model) {
         for (auto* s : slices) {
-            int trx = tciTrxForSlice(m_model, s);
+            int trx = m_trxMap ? m_trxMap->trxForSlice(m_model, s)
+                               : tciTrxForSlice(m_model, s);
             const long long hz = mhzToHz(s->frequency());
             burst += QStringLiteral("vfo:%1,0,%2;").arg(trx).arg(hz);
             SliceModel* txVfo = sliceForVfo(trx, 1);
@@ -599,7 +622,20 @@ QString TciProtocol::cmdModulation(const QStringList& args, bool isSet)
     }
 
     if (args.size() < 2) return {};
-    QString sdrMode = tciToSmartSDR(args[1]);
+    bool modOk = false;
+    QString sdrMode = tciToSmartSDR(args[1], &modOk);
+    if (!modOk) {
+        // Unrecognised modulation name. The server already advertises the
+        // accepted set in modulations_list at connect time, so anything
+        // outside it is a client error, not something to guess a mode for.
+        // Previously this silently fell through to USB and echoed the
+        // client's own (wrong) name in one notification while a second
+        // notification carried the real "usb" the slice actually became —
+        // two conflicting lines a client can't reconcile (#4523). Dropped
+        // instead, matching the "ignore silently" posture the parser
+        // already takes for unrecognised commands.
+        return {};
+    }
     QMetaObject::invokeMethod(s, [s, sdrMode]() {
         s->setMode(sdrMode);
     }, Qt::QueuedConnection);
@@ -781,7 +817,21 @@ QString TciProtocol::cmdTxGain(const QStringList& args, bool /*isSet*/)
         float g = AppSettings::instance().value("TciTxGain", "1.00").toFloat();
         return QStringLiteral("tx_gain:%1;").arg(qBound(0, qRound(g * 100.0f), 100));
     }
-    int pct = qBound(0, args[args.size() == 1 ? 0 : 1].toInt(), 100);
+    // Same malformed-input shape as cmdVolume above, and the third instance
+    // of it in this file after #4345's DRIVE read: "tx_gain:" splits to a
+    // single empty string rather than an empty arg list, so it reaches the
+    // SET branch, and an unchecked toInt() turns that into 0 — silently
+    // muting the WSJT-X/JTDX TX audio path and broadcasting a well-formed
+    // "tx_gain:0;" that a second client cannot tell from a real change.
+    // Listed as item 2 of #4523's triage plan alongside cmdVolume; dropped
+    // rather than guessed, matching the "ignore silently" posture the parser
+    // already takes for unrecognised commands.
+    bool gainOk = false;
+    const int raw = args[args.size() == 1 ? 0 : 1].toInt(&gainOk);
+    if (!gainOk) {
+        return {};
+    }
+    const int pct = qBound(0, raw, 100);
     m_pendingTxGain = pct;
     m_pendingNotification = QStringLiteral("tx_gain:%1;").arg(pct);
     return {};
@@ -974,6 +1024,14 @@ QString TciProtocol::cmdCwMsg(const QStringList& args)
     if (text.isEmpty()) return {};
     QString cmd = QStringLiteral("cwx send \"%1\"").arg(text);
     QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
+        // Capability check runs HERE, on the model's thread, not in the caller:
+        // this method is driven by the TCI client socket and RadioModel state is
+        // not ours to read from it.
+        if (!model->hasRadioSideCwKeyer()) {
+            qCWarning(lcCat) << "TCI: cw_msg ignored \u2014 radio has no radio-side "
+                                "CW keyer";
+            return;
+        }
         model->sendCmdPublic(cmd, nullptr);
     }, Qt::QueuedConnection);
     return {};
@@ -1115,7 +1173,31 @@ QString TciProtocol::cmdVolume(const QStringList& args, bool /*isSet*/)
     }
 
     // SET — accept either spec form (1 arg) or legacy trx-prefixed (2+ args).
-    const double val = args[args.size() == 1 ? 0 : 1].toDouble();
+    // "volume:" (colon, nothing after it) splits to a single empty string,
+    // not an empty arg list, so it reaches here rather than the GET branch
+    // above — but neither spec form (VOLUME; / VOLUME:arg1;) is "colon with
+    // nothing after it", so it's malformed input. It used to parse via
+    // toDouble() (empty string → 0.0, silently) and apply that as 100% (0 dB
+    // is the top of the range) — the malformed input landing on the loudest
+    // value the command can express (#4523). Checked and dropped instead,
+    // matching the "ignore silently" posture already used for unrecognised
+    // commands; this also catches the same shape for the legacy 2-arg form
+    // (e.g. "volume:0,").
+    //
+    // std::isfinite is part of the same check, not a separate paranoia: Qt's
+    // toDouble() accepts the literals "inf"/"-inf"/"nan" and reports ok, so
+    // they reach the arithmetic below with the ok flag satisfied. "inf" takes
+    // the val >= 1.0 percent branch, std::lround(+inf) is out of long's range
+    // (unspecified), and the narrowing cast lands on 0 — i.e. "volume:inf"
+    // would MUTE the radio and broadcast a well-formed "volume:-60;", the
+    // same undetectable-from-the-wire failure as the empty-argument case, at
+    // the other end of the range. ("1e400" is already rejected: overflow
+    // clears ok, unlike the literal spellings.)
+    bool volOk = false;
+    const double val = args[args.size() == 1 ? 0 : 1].toDouble(&volOk);
+    if (!volOk || !std::isfinite(val)) {
+        return {};
+    }
     const int pct = (val >= 1.0)
         ? std::min(static_cast<int>(std::lround(val)), 100)  // legacy percent
         : volumePercentFromDb(val);                          // spec dB
@@ -1411,6 +1493,11 @@ QString TciProtocol::cmdCwMacros(const QStringList& args)
     if (text.isEmpty()) return {};
     QString cmd = QStringLiteral("cwx send \"%1\"").arg(text);
     QMetaObject::invokeMethod(m_model, [model = m_model, cmd]() {
+        if (!model->hasRadioSideCwKeyer()) {
+            qCWarning(lcCat) << "TCI: cw_macros ignored \u2014 radio has no "
+                                "radio-side CW keyer";
+            return;
+        }
         model->sendCmdPublic(cmd, nullptr);
     }, Qt::QueuedConnection);
     return {};
@@ -1420,6 +1507,7 @@ QString TciProtocol::cmdCwMacrosStop()
 {
     if (!m_model) return {};
     QMetaObject::invokeMethod(m_model, [model = m_model]() {
+        if (!model->hasRadioSideCwKeyer()) return;
         model->sendCmdPublic("cwx clear", nullptr);
     }, Qt::QueuedConnection);
     return {};

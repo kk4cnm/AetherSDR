@@ -66,18 +66,25 @@ public:
     void    cycleSqlModeExternal();
     // Programmatic slider drag from another UI surface.  Branches by mode
     // exactly like the in-applet slider does: Manual writes the current
-    // receive surface; Flex also persists m_sqlManualLevel, while Kiwi keeps
-    // its replacement-source level independent. Auto writes AppSettings
-    // AutoSqlMarginDb and emits autoSqlMarginDbChanged. Off is a no-op.
+    // receive surface; Flex persists the level on the attached SliceModel
+    // (per-slice, #3326) plus AppSettings as the seed for future new
+    // slices, while Kiwi keeps its replacement-source level independent.
+    // Auto writes AppSettings AutoSqlMarginDb and emits
+    // autoSqlMarginDbChanged. Off is a no-op.
     void    setSqlSliderValueExternal(int v);
     void syncStepFromSlice(int stepHz, const QVector<int>& stepList);
     void cycleStepUp();
     void cycleStepDown();
 
     // Step the active slice's RX passband through the per-mode filter preset
-    // list. direction = +1 widens, -1 narrows. Routes through applyFilterPreset
-    // so all modes (LSB/CWL/DIGL/RTTY/AM/CW/USB) get mode-correct edge geometry.
-    void stepFilterWidth(int direction);
+    // list by index offset: +steps moves forward, -steps backward, scaled by
+    // magnitude and clamped at the ends. The shipped preset tables are all
+    // ascending, so + widens and - narrows (what filter_widen/filter_narrow
+    // rely on); a hand-edited FilterPresets_<mode> row is not guaranteed to be
+    // sorted, so the stepping is defined on index order, not on width. Routes
+    // through applyFilterPreset so all modes (LSB/CWL/DIGL/RTTY/AM/CW/USB) get
+    // mode-correct edge geometry.
+    void stepFilterWidth(int steps);
 
     // Connect to transmit model for QSK (break_in) indicator.
     void setTransmitModel(class TransmitModel* txModel);
@@ -169,6 +176,19 @@ private:
     void refreshFilterWidth();   // "AUTO" while adaptive is live, else the width
     void updateModeSettings(const QString& mode);
     void rebuildFilterButtons();
+public:
+    // Narrow the filter buttons to the widths a radio can actually reach.
+    // An EMPTY list restores the operator's own configurable set, so this is
+    // reversible on disconnect rather than a one-way edit of their settings.
+    void setRadioFilterWidths(const QList<int>& widthsHz);
+private:
+    // The list actually in force: the radio's when it declared one, else the
+    // operator's configurable set. Every site that indexes filter buttons must
+    // go through this, or the custom-edge arrays desynchronise from the buttons.
+    const QVector<int>& effectiveFilterWidths() const
+    {
+        return m_radioFilterWidths.isEmpty() ? m_filterWidths : m_radioFilterWidths;
+    }
     void saveFilterPresets();
     void rebuildStepSizes();
     void updateAgcCombo();
@@ -228,6 +248,10 @@ private:
 
     // Filter presets (Hz widths) — per-mode, swapped on mode change
     QVector<int>            m_filterWidths{1800, 2100, 2400, 2700, 3300, 6000};
+    // Non-empty while a radio has declared a fixed filter set. Held separately
+    // so the settings-driven list is not overwritten — reconnecting to a radio
+    // with continuous filters must give the operator their own list back.
+    QVector<int>            m_radioFilterWidths;
     // Parallel "custom edges" — INT_MIN sentinel = use mode rules. (#2259)
     QVector<int>            m_filterCustomLo;
     QVector<int>            m_filterCustomHi;
@@ -272,10 +296,14 @@ private:
     SqlMode      m_sqlMode{SqlMode::Off};
     SqlMode      m_flexSqlMode{SqlMode::Off};
     bool         m_savedSquelchOn{false};
-    // Last user-chosen Manual squelch level (0–100).  Auto mode overwrites
-    // the slice's squelchLevel with algorithm-suggested values every FFT
-    // tick, so we cache the manual value separately and restore it when
-    // the user comes back to Manual.  Seeded from the slice on first attach.
+    // Fallback only, for the rare case no slice is attached (#3326): Auto
+    // mode overwrites the slice's squelchLevel with algorithm-suggested
+    // values every FFT tick, so the manual value needs to be cached
+    // separately to restore when the user comes back to Manual — but that
+    // cache now lives per-slice on SliceModel::manualSquelchLevel(), seeded
+    // when a slice is first created (RadioModel.cpp) from the radio's own
+    // squelch_level when the status frame carries one, else from AppSettings,
+    // so switching the active slice doesn't pull in another slice's threshold.
     int          m_sqlManualLevel{20};
 
     void applySqlModeVisuals();

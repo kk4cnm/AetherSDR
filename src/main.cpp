@@ -1,9 +1,16 @@
 #include "gui/MainWindow.h"
 #include "gui/ConnectionPanel.h"
+#include "gui/FramelessMessageBox.h"
 #include "gui/SliceColorManager.h"
 #include "core/AppSettings.h"
+#include "core/SettingsBootstrap.h"
+#include "core/SettingsCredentialPolicy.h"
+#include "core/SettingsDatabase.h"
+#include "core/SettingsPaths.h"
+#include "core/SettingsSanitizer.h"
 #include "models/Nr2SettingsModel.h"
 #include "core/AutomationBridgeSettings.h"
+#include "core/DisplayPresence.h"
 #include "core/GpuSelector.h"
 #include "core/LogManager.h"
 #include "core/MacMicPermission.h"
@@ -16,6 +23,8 @@
 #ifdef Q_OS_MAC
 #include "MacStartupAbortGuard.h"
 #endif
+
+#include "core/backends/hl2/Hl2EmergencyStop.h"
 
 #include <QApplication>
 #include <QSurfaceFormat>
@@ -91,8 +100,161 @@ static void messageHandler(QtMsgType type, const QMessageLogContext& ctx, const 
     AetherSDR::LogManager::instance().enqueueMessage(type, ctx, msg);
 }
 
+// ── `AetherSDR --config` — settings CLI (RFC #4603 proposal D MVO) ───────────
+// Show/create/delete/export settings and exit, before any GUI initialization.
+// This is the recovery path when a stored value prevents the GUI from starting
+// (e.g. a broken off-screen geometry): it needs a console, not a window.
+// Note: a concurrently RUNNING AetherSDR holds its own in-memory cache and
+// will not see CLI edits until restarted.
+static int runConfigCli(int argc, char* argv[])
+{
+    QCoreApplication app(argc, argv);
+    QCoreApplication::setApplicationName(QStringLiteral("AetherSDR"));
+    QCoreApplication::setOrganizationName(QStringLiteral("AetherSDR"));
+    QCoreApplication::setApplicationVersion(QStringLiteral(AETHERSDR_VERSION));
+
+    const QStringList args = QCoreApplication::arguments();
+    const QString op = args.value(2);
+    const QString key = args.value(3);
+    auto usage = [] {
+        std::fputs(
+            "usage: AetherSDR --config <command>\n"
+            "  list [prefix]      print key<TAB>value for every setting (optionally\n"
+            "                     only keys starting with prefix)\n"
+            "  get <key>          print the value (exit 2 if the key is absent)\n"
+            "  set <key> <value>  create or change a setting\n"
+            "  unset <key>        delete a setting\n"
+            "  export             sanitized dump of the whole store (secrets\n"
+            "                     redacted; diagnostic output, not a backup)\n"
+            "  features [family]  list radio-scoped feature documents\n"
+            "                     (sanitized; written by the app's own\n"
+            "                     features — HL2 state, nicknames, band stacks)\n"
+            "  path               print the settings database path\n",
+            stderr);
+        return 1;
+    };
+
+    if (op == QStringLiteral("path")) {
+        std::printf("%s\n", qPrintable(AetherSDR::SettingsPaths::databasePath()));
+        return 0;
+    }
+
+    auto& settings = AetherSDR::AppSettings::instance();
+    settings.load();  // runs the one-time XML import exactly like the GUI would
+    const QString notice = settings.loadNotice();
+    if (!notice.isEmpty()) {
+        std::fprintf(stderr, "notice: %s\n", qPrintable(notice));
+    }
+
+    if (op == QStringLiteral("list")) {
+        const QString prefix = args.value(3);
+        QStringList keys = settings.allKeysForDiagnostics();
+        keys.sort();
+        for (const QString& k : keys) {
+            if (!prefix.isEmpty() && !k.startsWith(prefix)) {
+                continue;
+            }
+            std::printf("%s\t%s\n", qPrintable(k),
+                        qPrintable(settings.value(k).toString()));
+        }
+        return 0;
+    }
+    if (op == QStringLiteral("get")) {
+        if (key.isEmpty()) {
+            return usage();
+        }
+        if (!settings.contains(key)) {
+            std::fprintf(stderr, "%s: no such key\n", qPrintable(key));
+            return 2;
+        }
+        std::printf("%s\n", qPrintable(settings.value(key).toString()));
+        return 0;
+    }
+    if (op == QStringLiteral("export")) {
+        std::printf("%s", qPrintable(AetherSDR::SettingsSanitizer::dump()));
+        return 0;
+    }
+    if (op == QStringLiteral("features")) {
+        const QString family = args.value(3);
+        const auto rows = settings.radioFeaturesForDiagnostics();
+        for (const auto& row : rows) {
+            if (!family.isEmpty()
+                && !row.first.startsWith(family + QLatin1Char('/'))) {
+                continue;
+            }
+            std::printf("%s\t%s\n", qPrintable(row.first),
+                        qPrintable(AetherSDR::SettingsSanitizer::redactedValue(
+                            row.first, row.second)));
+        }
+        return 0;
+    }
+    if (op == QStringLiteral("set") || op == QStringLiteral("unset")) {
+        if (key.isEmpty() || (op == QStringLiteral("set") && args.size() < 5)) {
+            return usage();
+        }
+        // The credential policy applies to the CLI too (PR #4612 review):
+        // creating a credential row would undo the exodus this store ships
+        // with. unset stays allowed — deleting a credential is always fine.
+        if (op == QStringLiteral("set")
+            && AetherSDR::SettingsSanitizer::isSecretKey(key)) {
+            std::fprintf(stderr,
+                         "refusing: '%s' is a credential-shaped key, and "
+                         "credentials are never stored in the settings "
+                         "database (RFC #4603). Use the app's own UI, which "
+                         "stores it in the OS keychain.\n",
+                         qPrintable(key));
+            return 1;
+        }
+        if (op == QStringLiteral("set")) {
+            settings.setValue(key, args.value(4));
+        } else {
+            settings.remove(key);
+        }
+        settings.save();
+        // Evidence over assertion: confirm the row really persisted by
+        // reading it back from the database file, not the cache.
+        QString persisted;
+        const bool present = AetherSDR::SettingsDatabase::readAppValueFromFile(
+            AetherSDR::SettingsPaths::databasePath(), key, persisted);
+        const bool ok = op == QStringLiteral("set")
+                            ? (present && persisted == args.value(4))
+                            : !present;
+        if (!ok) {
+            std::fprintf(stderr, "error: change did not persist (see warnings "
+                                 "above — store may be read-only)\n");
+            return 1;
+        }
+        std::printf("ok\n");
+        return 0;
+    }
+    return usage();
+}
+
+// The Qt platform-selection decision made on a Wayland session, recorded before
+// the log handler exists and re-emitted next to the GpuSelector summary once
+// logging is up — so a Support bundle shows why we chose xcb vs wayland (the
+// first "why am I on XWayland / why did fractional scaling change" question).
+// nullptr choice = no override applied (not a Wayland session, or the user set
+// QT_QPA_PLATFORM already). The presence itself lives in DisplayPresence.h's
+// accessor (setDetectedDisplayPresence) so SpectrumWidget can read it too.
+static const char* g_qpaPlatformChoice = nullptr;
+
+static const char* displayPresenceName(AetherSDR::DisplayPresence p)
+{
+    switch (p) {
+        case AetherSDR::DisplayPresence::Connected: return "connected";
+        case AetherSDR::DisplayPresence::Headless:  return "headless";
+        case AetherSDR::DisplayPresence::Unknown:   return "unknown";
+    }
+    return "unknown";
+}
+
 int main(int argc, char* argv[])
 {
+    if (argc >= 2 && qstrcmp(argv[1], "--config") == 0) {
+        return runConfigCli(argc, argv);
+    }
+
     // ── Pre-QApplication environment setup ────────────────────────────────
 
     // AETHER_NO_GPU: runtime toggle to force software OpenGL rendering.
@@ -102,25 +264,87 @@ int main(int argc, char* argv[])
         qputenv("QT_OPENGL", "software");
     }
 
-    // Render-adapter selection on multi-GPU systems.  Must run before the GL/D3D
-    // context is created (i.e. before QApplication): sets PRIME offload (Linux)
-    // or QT_D3D_ADAPTER_INDEX (Windows) from the persisted Display-menu choice.
-    AetherSDR::GpuSelector::applyAtStartup();
+    // NOTE ON ORDER: the QT_QPA_PLATFORM block runs BEFORE
+    // GpuSelector::applyAtStartup() below. GpuSelector::willUseWayland() reads
+    // QT_QPA_PLATFORM to decide whether to apply the X11/GLX NVIDIA vendor hint
+    // (__GLX_VENDOR_LIBRARY_NAME), so our platform choice must be in the
+    // environment before it runs — otherwise a headless box that we route to
+    // XWayland/GLX would be mistaken for EGL/Wayland and lose PRIME offload.
+    // applyAtStartup() is otherwise independent (pure sysfs reads + PRIME-var
+    // qputenv, no Qt/GL dependency), so nothing here needs it to go first.
 
     // Prefer native Wayland when running under a Wayland session (#1233).
     // Without this, Qt may fall back to XWayland (xcb platform) where GLX
     // context switching between the main window and child dialogs triggers
     // a BadAccess crash (X_GLXMakeCurrent) on some compositors.
     // Only set when QT_QPA_PLATFORM isn't already configured by the user.
-    // Skip for AppImage: the bundled Qt Wayland plugin may not match the
-    // host compositor's protocol version, causing an abort on init (#1389).
-    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")
-            && !qEnvironmentVariableIsSet("APPIMAGE")) {
+    //
+    // "wayland;xcb", not "wayland": Qt reads the value as an ordered list and
+    // moves to the next entry when a plugin cannot be loaded, so a build or
+    // host without the Wayland plugin lands on xcb instead of aborting with
+    // "no Qt platform plugin could be initialized".
+    //
+    // That abort is precisely what #1389 was. The AppImage forced plain
+    // "wayland" while shipping no Wayland platform plugin inside the AppDir.
+    // The plugin was never missing from the Qt build — qtwayland rides in the
+    // base aqt package — but linuxdeploy-plugin-qt deploys platforms/libqxcb.so
+    // and nothing else unless EXTRA_PLATFORM_PLUGINS names more, so every
+    // Wayland-session user got a binary that would not start. The carve-out
+    // added then — skip this block under APPIMAGE — treated the symptom, and
+    // its stated reason (a bundled plugin mismatching the compositor's protocol
+    // version) described something that never happened: there was no bundled
+    // plugin to mismatch.
+    //
+    // The carve-out is gone because both of its causes are: appimage.yml now
+    // deploys the Wayland platform plugin and asserts it reached the AppDir,
+    // and this fallback turns a missing plugin into a downgrade to XWayland
+    // rather than a failure to start. Removing it also closes a real gap —
+    // AppImage users were the only Linux users not receiving the #1233
+    // XWayland GLX fix that this block exists to deliver.
+    //
+    // QT_QPA_PLATFORM=xcb remains the escape hatch if a compositor renders
+    // badly under native Wayland (documented in README next to AETHER_NO_GPU).
+    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")) {
         const QByteArray session = qgetenv("XDG_SESSION_TYPE");
         if (session == "wayland" && qEnvironmentVariableIsSet("WAYLAND_DISPLAY")) {
-            qputenv("QT_QPA_PLATFORM", "wayland");
+            // Only override to xcb when we AFFIRMATIVELY detect a headless
+            // session — DRM connectors present, at least one "disconnected",
+            // none connected (e.g. a Pi 5 reached over wayvnc). Native-Wayland
+            // hardware GL cannot allocate a window surface with no DRM scanout,
+            // so the panadapter renders black under an EGL_BAD_MATCH storm
+            // (QT_OPENGL=software does NOT help — the failure is the wayland-egl
+            // surface, not the renderer). XWayland renders fine; "xcb;wayland"
+            // still falls back to wayland if the xcb plugin is absent. If we
+            // cannot tell (no DRM connectors, or every connector reports
+            // "unknown"), keep the native-Wayland default rather than assume
+            // headless. A physical display restores it too.
+            //
+            // Detect on Linux only; a bool with an #else arm keeps the branch
+            // below preprocessor-safe (an added branch can't silently rebind
+            // the non-Linux case).
+#ifdef __linux__
+            const AetherSDR::DisplayPresence presence =
+                AetherSDR::detectDisplayPresence();
+            const bool headless =
+                presence == AetherSDR::DisplayPresence::Headless;
+            AetherSDR::setDetectedDisplayPresence(presence);
+#else
+            constexpr bool headless = false;
+#endif
+            const char* platform = headless ? "xcb;wayland" : "wayland;xcb";
+            qputenv("QT_QPA_PLATFORM", platform);
+            g_qpaPlatformChoice = platform;  // re-emitted once logging is up
         }
     }
+
+    // Render-adapter selection on multi-GPU systems.  Must run before the GL/D3D
+    // context is created (i.e. before QApplication): sets PRIME offload (Linux)
+    // or QT_D3D_ADAPTER_INDEX (Windows) from the persisted Display-menu choice.
+    // Runs AFTER the QT_QPA_PLATFORM block above so GpuSelector::willUseWayland()
+    // reads the platform we actually chose (see the ORDER note above).
+    // Android: compiled in but inert — no persisted Graphics choice exists and
+    // /sys/class/drm has no PCI GPUs, so it returns at the "Auto" arm.
+    AetherSDR::GpuSelector::applyAtStartup();
 
 #if defined(__linux__) && !defined(Q_OS_ANDROID)
     // Install a tolerant X11 error handler before QApplication and before any
@@ -148,38 +372,17 @@ int main(int argc, char* argv[])
 
     // Apply saved UI scale factor BEFORE QApplication is created.
     // QT_SCALE_FACTOR must be set before Qt initializes the display.
-    // We read the settings file directly (can't use AppSettings or
-    // QStandardPaths before QApplication exists).
+    // SettingsBootstrap reads the SQLite store read-only (or the frozen
+    // pre-upgrade XML on the very first launch after the upgrade) without
+    // constructing the AppSettings singleton (RFC #4603).
     {
-#ifdef Q_OS_MAC
-        QString settingsPath = QDir::homePath() + "/Library/Preferences/AetherSDR/AetherSDR.settings";
-#elif defined(Q_OS_WIN)
-        // AppSettings uses GenericConfigLocation (%LOCALAPPDATA%) + "/AetherSDR".
-        // QStandardPaths isn't available before QApplication, so we reproduce
-        // the path manually using the LOCALAPPDATA env var.
-        QString settingsPath = QDir::fromNativeSeparators(qEnvironmentVariable("LOCALAPPDATA"))
-                               + "/AetherSDR/AetherSDR.settings";
-#else
-        QString settingsPath = QDir::homePath() + "/.config/AetherSDR/AetherSDR.settings";
-#endif
-        QFile f(settingsPath);
-        if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QByteArray data = f.readAll();
-            // AppSettings XML format: <UiScalePercent>125</UiScalePercent>
-            QByteArray tag = "<UiScalePercent>";
-            int idx = data.indexOf(tag);
-            if (idx >= 0) {
-                idx += tag.size();
-                int end = data.indexOf('<', idx);
-                if (end > idx) {
-                    int pct = data.mid(idx, end - idx).trimmed().toInt();
-                    // Always set — even at 100% — so a restarted child process
-                    // overrides any QT_SCALE_FACTOR it inherited from its parent.
-                    if (pct > 0)
-                        qputenv("QT_SCALE_FACTOR", QByteArray::number(pct / 100.0, 'f', 2));
-                }
-            }
-        }
+        const int pct =
+            AetherSDR::SettingsBootstrap::readValue(QStringLiteral("UiScalePercent"))
+                .trimmed().toInt();
+        // Always set — even at 100% — so a restarted child process overrides
+        // any QT_SCALE_FACTOR it inherited from its parent.
+        if (pct > 0)
+            qputenv("QT_SCALE_FACTOR", QByteArray::number(pct / 100.0, 'f', 2));
     }
 
 #ifdef Q_OS_MAC
@@ -211,6 +414,20 @@ int main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 #endif
+
+    // Release the Hermes-Lite 2 if this process is killed or crashes.
+    //
+    // A signal tears down nothing — Hl2Backend's destructor never runs — and an
+    // HL2 that is never told to stop keeps streaming at a host that is gone,
+    // then stops answering discovery until it is physically power-cycled.
+    // Reproduced three times with a plain `kill` on a connected session.
+    //
+    // Installed HERE, after the macOS startup guard has restored SIGABRT: doing
+    // it earlier would have the guard overwrite the handler for that signal.
+    // No-op until a radio is actually connected, so it costs a disconnected run
+    // nothing. See Hl2EmergencyStop.h for why it acts inside the handler rather
+    // than deferring to the event loop.
+    AetherSDR::hl2::installEmergencyStopSignalHandlers();
 
     app.setApplicationName("AetherSDR");
     app.setApplicationVersion(AETHERSDR_VERSION);
@@ -451,6 +668,14 @@ int main(int argc, char* argv[])
         qInfo().noquote() << "GpuSelector: render GPU ->"
                           << AetherSDR::GpuSelector::appliedSummary();
 
+        // Likewise the Wayland platform choice (decided before logging existed).
+        if (g_qpaPlatformChoice) {
+            qInfo().noquote()
+                << "Platform: Wayland session, display presence"
+                << displayPresenceName(AetherSDR::detectedDisplayPresence())
+                << "-> QT_QPA_PLATFORM" << g_qpaPlatformChoice;
+        }
+
         // Symlink aethersdr.log → latest timestamped file (for Support dialog)
         const QString symlink = logDir + "/aethersdr.log";
 #ifdef Q_OS_UNIX
@@ -501,6 +726,21 @@ int main(int argc, char* argv[])
 #else
         window.show();
 #endif
+
+        // Settings-store notices a user must see (RFC #4603): a backup was
+        // restored after corruption, a newer-schema store opened read-only, or
+        // older-version changes were not carried forward. One-shot, after the
+        // window is up so the box has a parent and never blocks startup.
+        {
+            const QString settingsNotice =
+                AetherSDR::AppSettings::instance().loadNotice();
+            if (!settingsNotice.isEmpty()) {
+                QTimer::singleShot(0, &window, [&window, settingsNotice] {
+                    AetherSDR::FramelessMessageBox::warning(
+                        &window, QStringLiteral("Settings"), settingsNotice);
+                });
+            }
+        }
 
         // Agent-drivable automation bridge (#3646, Phase 0). Off in production;
         // starts only when AETHER_AUTOMATION is set. AETHER_AUTOMATION_SOCKET

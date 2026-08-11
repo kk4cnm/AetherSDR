@@ -85,13 +85,23 @@ changes.
 - **GUI → Model**: GUI widgets call model setters. Use `QSignalBlocker` or
   `m_updatingFromModel` guards to prevent echo loops.
 - **Settings**: Use `AppSettings`, **never** `QSettings`. Keys are PascalCase.
-  Booleans are `"True"` / `"False"` strings.
-- **Radio-authoritative**: Never persist or override settings the radio manages
-  (frequency, mode, filter, step size, AGC, squelch, DSP flags, antennas, TX
-  power, panadapter *count* and per-pan state — including FFT
-  average/FPS/weighted-average and waterfall line duration). Never write a
-  radio-echoed status value into a setter that also persists to `AppSettings`
-  (the recurring #4261 anti-pattern). See `AGENTS.md` for the full list.
+  Booleans are `"True"` / `"False"` strings. The store is SQLite
+  (`AetherSDR.db`, RFC #4603) — never include `sqlite3.h` outside
+  `SettingsDatabase.cpp`, and **never put a credential in the settings
+  store**: QtKeychain only (see AGENTS.md "Settings Persistence").
+- **Settings authority is capability-shaped** (RFC #4603): on a radio that
+  persists its own state (Flex), never persist or override radio-managed
+  settings client-side (frequency, mode, filter, AGC, TX power, per-pan
+  state, …) and never write a radio-echoed status value into a setter that
+  also persists (the recurring #4261 anti-pattern). On a radio that persists
+  NOTHING (HL2), the client is its memory — but only for the domains the
+  backend declares in `RadioCapabilities::clientSettingsDomains`, and only
+  through `RadioStateMemory`'s document, never flat `AppSettings` keys or
+  ad-hoc paths. See AGENTS.md "Settings Authority Policy" for the full rules.
+- **Radio-scoped config** goes in `radio_settings` feature documents via
+  `RadioModel::settingsScope()` — one versioned JSON document per feature
+  (Principle V), atomic whole-document writes, write failures surfaced. See
+  AGENTS.md "Radio-Scoped Feature Documents".
 
 ### Working in MainWindow
 
@@ -258,7 +268,7 @@ GitHub on every tier — your own PR always needs review from someone else.
 |---|---|---|
 | **Source (Tier 3)** | Everything not listed below — all of `src/`, **including the whole of `MainWindow`** | `@aethersdr/reviewers` (@ten9876, @jensenpat, @NF0T, @rfoust, @chibondking) |
 | **Infrastructure (Tier 2)** | `tests/`, `docs/`, `*.md`, `CMakeLists.txt`, the routine `.github/workflows/`, `.github/dependabot.yml`, `.github/docker/`, `.github/ISSUE_TEMPLATE/` | `@aethersdr/infrastructure` (@ten9876, @jensenpat) |
-| **Maintainer-only (Tier 1)** | governance/security docs (`CONSTITUTION.md`, `GOVERNANCE.md`, `CONTRIBUTING.md`, `SECURITY*`, `LICENSE`, `ROADMAP.md`, `CODE_OF_CONDUCT.md`), `.github/CODEOWNERS`, `.github/codeql/`, the release signing/publish + CodeQL-scan workflows (`sign-release.yml`, `codeql.yml`, `macos-dmg.yml`, `build-macos-qt.yml`, `windows-installer.yml`, `appimage.yml`, `docker-ci-image.yml`, `streamdeck-plugins.yml`), and the AI-instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.claude/commands/`) | `@aethersdr/maintainers` (@ten9876) |
+| **Maintainer-only (Tier 1)** | governance/security docs (`CONSTITUTION.md`, `GOVERNANCE.md`, `CONTRIBUTING.md`, `SECURITY*`, `LICENSE`, `ROADMAP.md`, `CODE_OF_CONDUCT.md`), `.github/CODEOWNERS`, `.github/codeql/`, the release signing/publish + CodeQL-scan workflows (`sign-release.yml`, `codeql.yml`, `macos-dmg.yml`, `windows-installer.yml`, `appimage.yml`, `docker-ci-image.yml`, `streamdeck-plugins.yml`), and the AI-instruction files (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.claude/commands/`) | `@aethersdr/maintainers` (@ten9876) |
 
 The maintainer-only tier covers *governance and security-critical* paths:
 project policy and governance docs, the CODEOWNERS file and CodeQL config, the

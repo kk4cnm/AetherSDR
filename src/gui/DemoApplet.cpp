@@ -1,5 +1,6 @@
 #include "DemoApplet.h"
 
+#include "FlowLayout.h"
 #include "core/backends/sim/NoiseMixer.h"
 
 #include <QGridLayout>
@@ -25,18 +26,31 @@ struct RowSpec {
     int knobMin, knobMax, knobDefault;
     bool   defaultOn;
     int    defaultLevel;  // dB
+    const char* tip;      // hover one-liner: what causes this on a real HF rig
 };
+// The tips teach a newcomer what each sound IS on a real band — cause first,
+// then what to do about it — so playing with the demo doubles as an HF primer.
 const RowSpec kRows[] = {
-    {"cw",         "CW tone",        "hz",   "Hz",  300, 1200, 700,  false, -16},
-    {"voice",      "Voice (speech)", "",     "",    0, 0, 0,          false, -10},
-    {"white",      "White / AWGN",   "",     "",    0, 0, 0,         false, -26},
-    {"pink",       "Pink / hiss",    "",     "",    0, 0, 0,         true,  -22},
-    {"qrn",        "QRN crackle",    "rate", "i/s", 1, 60, 12,       false, -18},
-    {"powerline",  "Power-line",     "freq", "Hz",  50, 60, 60,      false, -22},
-    {"crashes",    "Static crash",   "rate", "c/s", 1, 30, 4,       false, -16},  // rate stored val/10
-    {"birdie",     "Birdie carrier", "hz",   "Hz",  300, 3000, 1200, true, -18},
-    {"hash",       "SMPS hash",      "prf",  "Hz",  30, 400, 120,    false, -24},
-    {"woodpecker", "Woodpecker",     "prf",  "pps", 2, 50, 10,       false, -22},
+    {"cw",         "CW tone",        "hz",   "Hz",  300, 1200, 700,  false, -16,
+     "A Morse code signal — a wanted signal. Your filters and notch should spare this one."},
+    {"voice",      "Voice (speech)", "",     "",    0, 0, 0,          false, -10,
+     "An SSB voice signal — the wanted audio that noise reduction must preserve, not scrub."},
+    {"white",      "White / AWGN",   "",     "",    0, 0, 0,         false, -26,
+     "Flat thermal noise from the receiver itself — the baseline hiss that sets how weak a signal you can hear."},
+    {"pink",       "Pink / hiss",    "",     "",    0, 0, 0,         true,  -22,
+     "Atmospheric band noise, strongest on the low bands — the ever-present hiss behind every HF signal."},
+    {"qrn",        "QRN crackle",    "rate", "i/s", 1, 60, 12,       false, -18,
+     "Lightning static from distant thunderstorms — worse in summer and on 160/80/40 m. A noise blanker helps."},
+    {"powerline",  "Power-line",     "freq", "Hz",  50, 60, 60,      false, -22,
+     "Mains buzz (50/60 Hz plus harmonics) — typically caused by proximity to power lines or arcing insulators."},
+    {"crashes",    "Static crash",   "rate", "c/s", 1, 30, 4,       false, -16,  // rate stored val/10
+     "Loud crashes from a nearby storm front — the bursts that ride over everything when weather is close."},
+    {"birdie",     "Birdie carrier", "hz",   "Hz",  300, 3000, 1200, true, -18,
+     "A steady unwanted carrier (heterodyne), often a spur from nearby electronics — the classic notch-filter target."},
+    {"hash",       "SMPS hash",      "prf",  "Hz",  30, 400, 120,    false, -24,
+     "Broadband hash from switch-mode power supplies — phone chargers, LED lamps, solar inverters near the antenna."},
+    {"woodpecker", "Woodpecker",     "prf",  "pps", 2, 50, 10,       false, -22,
+     "A pulsed rasp from over-the-horizon radar — named for the Cold-War Russian 'Woodpecker' heard worldwide."},
 };
 }  // namespace
 
@@ -56,8 +70,12 @@ void DemoApplet::buildUI()
     root->addWidget(title);
 
     // ── scene presets ──────────────────────────────────────────────────────
-    auto* presetRow = new QHBoxLayout();
-    presetRow->setSpacing(4);
+    // FlowLayout, not QHBoxLayout: six labeled buttons need ~450 px but the
+    // docked applet rail hands us ~246 with no horizontal overflow allowed,
+    // so a box layout compresses the buttons past their hint and clips the
+    // centred labels at both ends (#4518). Wrapping keeps every label whole
+    // at any width.
+    auto* presetRow = new FlowLayout(0, 4, 4);
     for (const QString& p : NoiseMixer::allPresetNames()) {
         auto* b = new QPushButton(p, this);
         b->setStyleSheet(QStringLiteral(
@@ -70,7 +88,6 @@ void DemoApplet::buildUI()
         });
         presetRow->addWidget(b);
     }
-    presetRow->addStretch();
     root->addLayout(presetRow);
 
     // ── per-channel rows: toggle | level slider | optional knob ────────────
@@ -86,6 +103,7 @@ void DemoApplet::buildUI()
         row.toggle = new QPushButton(QString::fromLatin1(spec.label), this);
         row.toggle->setCheckable(true);
         row.toggle->setChecked(spec.defaultOn);
+        row.toggle->setToolTip(QString::fromUtf8(spec.tip));
         row.toggle->setStyleSheet(QStringLiteral(
             "QPushButton{text-align:left;padding:2px 6px;border:1px solid #345;"
             "border-radius:3px;background:#1a2332;color:#bcd;font-size:12px;}"
@@ -97,6 +115,7 @@ void DemoApplet::buildUI()
         row.level = new QSlider(Qt::Horizontal, this);
         row.level->setRange(-60, 0);
         row.level->setValue(spec.defaultLevel);
+        row.level->setToolTip(QString::fromUtf8(spec.tip));
         row.levelLabel = new QLabel(QString::number(spec.defaultLevel), this);
         row.levelLabel->setStyleSheet(QStringLiteral("color:#5cf;font-family:monospace;"));
         row.levelLabel->setMinimumWidth(28);
@@ -153,8 +172,8 @@ void DemoApplet::buildUI()
         {"Malformed",   "malformed",  ""},
         {"Clear",       "clear",      ""},
     };
-    auto* faultRow = new QHBoxLayout();
-    faultRow->setSpacing(4);
+    // Same wrap-instead-of-compress treatment as the preset strip (#4518).
+    auto* faultRow = new FlowLayout(0, 4, 4);
     for (const FaultBtn& fb : kFaultBtns) {
         auto* b = new QPushButton(QString::fromLatin1(fb.label), this);
         const bool isClear = QLatin1String(fb.fault) == QLatin1String("clear");
@@ -175,7 +194,6 @@ void DemoApplet::buildUI()
         });
         faultRow->addWidget(b);
     }
-    faultRow->addStretch();
     root->addLayout(faultRow);
 
     root->addStretch();

@@ -41,12 +41,14 @@ Q_DECLARE_LOGGING_CATEGORY(lcPerf)
 Q_DECLARE_LOGGING_CATEGORY(lcCw)
 Q_DECLARE_LOGGING_CATEGORY(lcSHistory)
 Q_DECLARE_LOGGING_CATEGORY(lcAx25)
+Q_DECLARE_LOGGING_CATEGORY(lcAx25Link)
 Q_DECLARE_LOGGING_CATEGORY(lcWaveform)
 Q_DECLARE_LOGGING_CATEGORY(lcKiwiSdr)
 Q_DECLARE_LOGGING_CATEGORY(lcKiwiSdrAudio)
 Q_DECLARE_LOGGING_CATEGORY(lcAutomation)
 Q_DECLARE_LOGGING_CATEGORY(lcQrz)
 Q_DECLARE_LOGGING_CATEGORY(lcClock)
+Q_DECLARE_LOGGING_CATEGORY(lcHl2)
 
 // Central registry for toggling per-module diagnostic logging at runtime.
 // The Support dialog (Help → Support) uses this to let users enable/disable
@@ -60,6 +62,10 @@ class LogManager : public QObject {
     Q_OBJECT
 
 public:
+    // Upper bound on the curated list plus anything registered on demand.
+    // The on-demand path persists what it registers, so this is what keeps a
+    // scripted caller from growing the stored list without limit.
+    static constexpr int kMaxCategories = 256;
     struct Category {
         QString id;           // e.g. "aether.connection"
         QString label;        // e.g. "Connection"

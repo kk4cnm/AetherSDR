@@ -12,6 +12,30 @@ namespace AetherSDR {
 
 namespace {
 
+// Forward power at or below which the radio is treated as not transmitting, so
+// the display snaps to zero instead of decaying towards it (#4540).
+//
+// A radio with no carrier reports 0 dBm on FWDPWR, and 10^(0/10)/1000 is
+// 0.001 W — small, but NOT zero, which is the whole problem: an
+// exponential-decay filter converges on it rather than reaching it. The
+// threshold is a hair above that floor so the "no carrier" case is caught
+// exactly, while any genuine reading (0 dBm is already 30 dB below a 1 W
+// carrier) stays on the smoothed path.
+constexpr float kNoCarrierWatts = 0.0011f;
+// Minimum instantaneous forward power for an SWR ratio to mean anything.
+//
+// A radio with no carrier reports 0 dBm on FWDPWR, which is 10^(0/10)/1000 =
+// 0.001 W — small but not zero. SWR is computed from forward and reflected
+// power, so below this there is no power behind the ratio and it saturates:
+// an HL2 published 255.99 and held it. The threshold sits a hair above that
+// floor, and 0 dBm is already 30 dB below a 1 W carrier, so nothing real
+// lives underneath it. (#4533)
+constexpr float kMinForwardWattsForSwr = 0.0011f;
+// NOTE: kNoCarrierWatts (#4540) and kMinForwardWattsForSwr (#4533) share the
+// same numeric floor but answer different questions -- "is a carrier present"
+// versus "is there power behind this ratio" -- and are kept separate so a
+// future change to one cannot silently move the other.
+
 constexpr qint64 kCompressionSummaryLogIntervalMs = 500;
 constexpr qint64 kDirectionalMeterFreshnessMs = 500;
 constexpr int kMinTxWaveformSourceIndex = 8;
@@ -96,10 +120,14 @@ void MeterModel::defineMeter(const MeterDef& def)
         m_sLevelIdxBySlice[def.sourceIndex] = def.index;
     else if (def.source == "SLC" && def.name == "ESC")
         m_escLevelIdxBySlice[def.sourceIndex] = def.index;
-    else if (def.source.startsWith("TX") && def.name == "FWDPWR")
+    else if (def.source.startsWith("TX") && def.name == "FWDPWR") {
         m_fwdPwrIdx = def.index;
-    else if (def.source.startsWith("TX") && def.name == "REFPWR")
+        m_fwdPwrUnit = def.unit;
+    }
+    else if (def.source.startsWith("TX") && def.name == "REFPWR") {
         m_refPwrIdx = def.index;
+        m_refPwrUnit = def.unit;
+    }
     else if (def.source.startsWith("TX") && def.name == "SWR")
         m_swrIdx = def.index;
     else if (def.name == "MICPEAK")
@@ -116,8 +144,26 @@ void MeterModel::defineMeter(const MeterDef& def)
         m_compLevelIdx = def.index;
     else if (def.name == "HWALC")
         m_hwAlcIdx = def.index;
-    else if (def.name == "ALC")
+    else if (def.name == "ALC") {
         m_swAlcIdx = def.index;
+        m_swAlcUnit = def.unit;
+    }
+    else if (isTxWaveformMeter(def)
+             && (def.name == "SC_MIC" || def.name == "SC_FILT_1"
+                 || def.name == "SC_FILT_2")) {
+        // Same resolution COMPPEAK uses: key by explicit TX-waveform
+        // sourceIndex where the radio supplies one, otherwise by the slice
+        // context the manifest was in when this block arrived.
+        const bool explicitSource = hasExplicitTxWaveformSourceIndex(def);
+        const int key = explicitSource ? def.sourceIndex
+                                       : implicitTxWaveformSliceIndex();
+        if (def.name == "SC_MIC")
+            (explicitSource ? m_scMicIdxByTxSource : m_scMicIdxBySlice)[key] = def.index;
+        else if (def.name == "SC_FILT_1")
+            (explicitSource ? m_scFilt1IdxByTxSource : m_scFilt1IdxBySlice)[key] = def.index;
+        else
+            (explicitSource ? m_scFilt2IdxByTxSource : m_scFilt2IdxBySlice)[key] = def.index;
+    }
     else if (def.source != "AMP" && def.name == "PATEMP")
         m_paTempIdx = def.index;
     else if (def.name == "+13.8A")
@@ -184,9 +230,10 @@ void MeterModel::removeMeter(int index)
             ++it;
         }
     }
-    if (index == m_fwdPwrIdx)   m_fwdPwrIdx = -1;
+    if (index == m_fwdPwrIdx) { m_fwdPwrIdx = -1; m_fwdPwrUnit.clear(); }
     if (index == m_refPwrIdx) {
         m_refPwrIdx = -1;
+    m_refPwrUnit.clear();
         m_reflectedPower = 0.0f;
         m_lastReflectedPowerUpdateMs = 0;
     }
@@ -195,9 +242,29 @@ void MeterModel::removeMeter(int index)
     if (index == m_micLevelIdx)  m_micLevelIdx = -1;
     if (index == m_compLevelIdx) m_compLevelIdx = -1;
     if (index == m_hwAlcIdx)     m_hwAlcIdx = -1;
-    if (index == m_swAlcIdx)     m_swAlcIdx = -1;
+    if (index == m_swAlcIdx)   { m_swAlcIdx = -1; m_swAlcUnit.clear(); }
+    // A level must never outlive the meter it describes.
+    // Resolve the ACTIVE indices BEFORE erasing: once the entry is gone the
+    // resolver returns -1 and the has-a-sample flag would never be cleared.
+    const int activeScMic   = scMicIndexForActiveTxSlice();
+    const int activeScFilt1 = scFilt1IndexForActiveTxSlice();
+    const int activeScFilt2 = scFilt2IndexForActiveTxSlice();
+    for (QMap<int, int>* m : {&m_scMicIdxByTxSource, &m_scMicIdxBySlice,
+                              &m_scFilt1IdxByTxSource, &m_scFilt1IdxBySlice,
+                              &m_scFilt2IdxByTxSource, &m_scFilt2IdxBySlice}) {
+        for (auto it = m->begin(); it != m->end(); ) {
+            if (it.value() == index) it = m->erase(it);
+            else ++it;
+        }
+    }
+    if (index == activeScMic)   m_hasScMicValue = false;
+    if (index == activeScFilt1) m_hasScFilt1Value = false;
+    if (index == activeScFilt2) m_hasScFilt2Value = false;
     if (index == m_paTempIdx)    m_paTempIdx = -1;
-    if (index == m_supplyIdx)    m_supplyIdx = -1;
+    if (index == m_supplyIdx) {
+        m_supplyIdx = -1;
+        m_hasSupplyVoltsValue = false;   // the sample cannot outlive its meter
+    }
     if (index == m_ampFwdPwrIdx) m_ampFwdPwrIdx = -1;
     if (index == m_ampSwrIdx)    m_ampSwrIdx = -1;
     if (index == m_ampTempIdx)   m_ampTempIdx = -1;
@@ -277,15 +344,28 @@ void MeterModel::clear()
     m_manifestSliceContext = -1;
     m_activeTxSlice = -1;
     m_fwdPwrIdx = -1;
+    m_fwdPwrUnit.clear();
     m_refPwrIdx = -1;
+    m_refPwrUnit.clear();
     m_swrIdx = -1;
     m_micPeakIdx = -1;
     m_micLevelIdx = -1;
     m_compLevelIdx = -1;
     m_hwAlcIdx = -1;
     m_swAlcIdx = -1;
+    m_swAlcUnit.clear();
     m_paTempIdx = -1;
+    m_scMicIdxByTxSource.clear();
+    m_scMicIdxBySlice.clear();
+    m_scFilt1IdxByTxSource.clear();
+    m_scFilt1IdxBySlice.clear();
+    m_scFilt2IdxByTxSource.clear();
+    m_scFilt2IdxBySlice.clear();
+    m_hasScMicValue = false;
+    m_hasScFilt1Value = false;
+    m_hasScFilt2Value = false;
     m_supplyIdx = -1;
+    m_hasSupplyVoltsValue = false;
     m_ampFwdPwrIdx = -1;
     m_ampSwrIdx = -1;
     m_ampTempIdx = -1;
@@ -324,6 +404,11 @@ void MeterModel::setActiveTxSlice(int sliceIndex)
         return;
 
     m_activeTxSlice = sliceIndex;
+    // The stored filter levels describe the PREVIOUS slice's chain; drop
+    // them so a comparison cannot straddle a slice change (#4649).
+    m_hasScMicValue = false;
+    m_hasScFilt1Value = false;
+    m_hasScFilt2Value = false;
     clearCompressionState();
     logCompressionSummary("active-slice-change", true);
     emit micMetersChanged(m_micLevel, m_compLevel, m_micPeak, m_compPeak);
@@ -338,6 +423,35 @@ void MeterModel::clearCompressionState()
     m_compPeakUpdatedMs = 0;
     m_lastCompressionSummaryLogMs = 0;
     m_lastCompressionSummaryReason.clear();
+}
+
+// Mirrors PhoneCwApplet's kAlcGaugeFloorDbfs. Duplicated rather than shared
+// because models must not include gui headers; meter_model_test pins the pair.
+static constexpr float kAlcGaugeFloorDbfs = -20.0f;
+
+float MeterModel::convertAlcToGaugeDbfs(float raw) const
+{
+    if (m_swAlcUnit.compare(QLatin1String("dBFS"), Qt::CaseInsensitive) == 0
+        || m_swAlcUnit.isEmpty()) {
+        return raw;   // already the gauge's own unit, or a backend from before this field
+    }
+    if (m_swAlcUnit.compare(QLatin1String("Percent"), Qt::CaseInsensitive) == 0) {
+        const float frac = qBound(0.0f, raw / 100.0f, 1.0f);
+        return kAlcGaugeFloorDbfs * (1.0f - frac);
+    }
+    return raw;
+}
+
+qint64 MeterModel::newestValueAgeMs() const
+{
+    qint64 newest = -1;
+    for (auto it = m_valueUpdatedMs.constBegin(); it != m_valueUpdatedMs.constEnd(); ++it) {
+        if (it.value() > newest)
+            newest = it.value();
+    }
+    if (newest < 0)
+        return -1;
+    return QDateTime::currentMSecsSinceEpoch() - newest;
 }
 
 bool MeterModel::isTxWaveformMeter(const MeterDef& def) const
@@ -400,7 +514,30 @@ int MeterModel::compPeakIndexForActiveTxSlice() const
     const int txSource = activeTxWaveformSourceIndex();
     if (txSource >= 0 && m_compPeakIdxByTxSource.contains(txSource))
         return m_compPeakIdxByTxSource.value(txSource);
-    return m_compPeakIdxBySlice.value(m_activeTxSlice, -1);
+    const int bySlice = m_compPeakIdxBySlice.value(m_activeTxSlice, -1);
+    if (bySlice >= 0)
+        return bySlice;
+
+    // ONE transmitter, and transmit is not on the slice the manifest filed the
+    // meter under.
+    //
+    // A Flex declares COMPPEAK per TX-waveform slice, so the explicit map above
+    // answers and this never runs. A backend with a single modulator however
+    // many receivers it runs (HL2) declares ONE implicit-source COMPPEAK, and
+    // defineMeter() files it under implicitTxWaveformSliceIndex() — the
+    // manifest's SLC sourceIndex, which is 0 — while m_activeTxSlice follows
+    // whichever receiver currently owns transmit. Move transmit to the second
+    // receiver and the lookup above misses, so the compression gauge went dead
+    // for a compressor that was still working (#4609 review).
+    //
+    // Deliberately narrow. With an explicit per-waveform map present, or more
+    // than one implicit entry, "which slice" is a real question and answering it
+    // by picking the only entry would point the gauge at the wrong transmitter.
+    if (m_activeTxSlice >= 0 && m_compPeakIdxByTxSource.isEmpty()
+        && m_compPeakIdxBySlice.size() == 1) {
+        return m_compPeakIdxBySlice.constBegin().value();
+    }
+    return -1;
 }
 
 void MeterModel::logCompressionMeterMap(const MeterDef& def) const
@@ -451,6 +588,31 @@ void MeterModel::logCompressionSummary(const char* reason, bool force)
                       << "available" << m_hasCompPeakValue;
 }
 
+bool MeterModel::swrSampleLive(qint64 nowMs, qint64 swrMaxAgeMs) const
+{
+    // See the declaration for the contract. Order matters: the SWR sample's
+    // own age is always required — a stale ratio is not a measurement no
+    // matter what power is doing (#4533, the 16-minute-old reading).
+    const bool swrFresh = m_lastSwrUpdateMs > 0
+        && (nowMs - m_lastSwrUpdateMs) <= swrMaxAgeMs;
+    if (!swrFresh)
+        return false;
+    // Backend never published forward power (HL2): SWR self-gates upstream.
+    if (m_lastFwdPowerUpdateMs == 0)
+        return true;
+    // Backend does publish power: a fresh ratio with no qualifying power
+    // behind it is two noise samples divided (#4533's saturated 255.99).
+    return (nowMs - m_lastFwdPowerUpdateMs) <= kDirectionalMeterFreshnessMs
+        && m_fwdPowerInstant > kMinForwardWattsForSwr;
+}
+
+std::optional<float> MeterModel::swrIfLive() const
+{
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    return swrSampleLive(now, kTxMeterStaleMs) ? std::optional<float>(m_swr)
+                                               : std::nullopt;
+}
+
 bool MeterModel::hasRecentTxMeters(qint64 maxAgeMs) const
 {
     if (m_lastTxMeterUpdateMs <= 0 || maxAgeMs < 0)
@@ -475,6 +637,11 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
     const int n = qMin(ids.size(), vals.size());
     const qint64 packetUpdatedMs = QDateTime::currentMSecsSinceEpoch();
     const int activeCompPeakIdx = compPeakIndexForActiveTxSlice();
+    // Resolved once per packet, same shape as activeCompPeakIdx: these must
+    // track the ACTIVE TX slice, not whichever block was defined last.
+    const int activeScMicIdx   = scMicIndexForActiveTxSlice();
+    const int activeScFilt1Idx = scFilt1IndexForActiveTxSlice();
+    const int activeScFilt2Idx = scFilt2IndexForActiveTxSlice();
     // sLevelChanged is emitted per-slice inline in the loop below
     bool txChanged = false;
     bool directionalChanged = false;
@@ -482,6 +649,7 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
     bool micChanged = false;
     bool hwAlcChangedFlag = false;
     bool swAlcChangedFlag = false;
+    bool txFilterLevelsChangedFlag = false;
     bool hwChanged = false;
     bool ampChanged = false;
     bool tgxlChanged = false;
@@ -519,16 +687,39 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         } else if (idx == m_fwdPwrIdx) {
             m_lastTxMeterUpdateMs = packetUpdatedMs;
             m_lastFwdPowerUpdateMs = m_lastTxMeterUpdateMs;
-            // FWDPWR meter reports in dBm — convert to watts for display.
-            // watts = 10^(dBm/10) / 1000
-            // e.g. 50 dBm = 100 W, 47 dBm ≈ 50 W, 40 dBm = 10 W
-            float watts = std::pow(10.0f, v / 10.0f) / 1000.0f;
+            // HONOUR THE DECLARED UNIT. This used to convert unconditionally
+            // from dBm, which is right for a Flex or an HL2 and wrong for any
+            // backend that publishes watts directly — an IC-705 reporting 5 W
+            // arrived as 10^(5/10)/1000 = 0.003 W and the gauge never moved.
+            //
+            // dBm remains the default for a backend that declares nothing,
+            // because that is what every backend predating this field meant.
+            const bool alreadyWatts =
+                m_fwdPwrUnit.compare(QLatin1String("Watts"), Qt::CaseInsensitive) == 0
+                || m_fwdPwrUnit.compare(QLatin1String("W"), Qt::CaseInsensitive) == 0;
+            float watts = alreadyWatts ? v : std::pow(10.0f, v / 10.0f) / 1000.0f;
             m_fwdPowerInstant = watts;
             fwdInstantChanged = true;
             directionalChanged = true;
             // Smooth: fast attack (α=0.5) to track peaks, slow decay (α=0.15)
             // for stable display without jitter (#980)
-            if (m_fwdPower < 0.01f) {
+            //
+            // The slow decay is right DURING a transmission and wrong at the end
+            // of one. On unkey the radio reports 0 dBm, which is 0.001 W rather
+            // than 0, so the filter creeps towards it at 15 % per sample instead
+            // of arriving: measured on a FLEX-6700, the dBm meter read 0 within
+            // 200 ms while the watts reading was still 3.45 W, and it took
+            // ~2.9 s to fall away. For that whole window the display claims
+            // forward power out of a radio that has stopped transmitting.
+            //
+            // So: keep the smoothing for real readings, but snap to zero once
+            // the meter says there is no carrier. REFPWR immediately below is
+            // not smoothed at all and drops instantly — this brings the two
+            // directional readings back into agreement instead of having one
+            // linger while the other is already at rest.
+            if (watts <= kNoCarrierWatts) {
+                m_fwdPower = 0.0f;
+            } else if (m_fwdPower < 0.01f) {
                 m_fwdPower = watts;  // first sample — no smoothing
             } else {
                 float alpha = (watts > m_fwdPower) ? 0.5f : 0.15f;
@@ -538,9 +729,22 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         } else if (idx == m_refPwrIdx) {
             m_lastTxMeterUpdateMs = packetUpdatedMs;
             m_lastReflectedPowerUpdateMs = m_lastTxMeterUpdateMs;
-            // REFPWR is an independent directional-coupler reading in dBm.
-            // Preserve it as watts rather than reconstructing it from SWR.
-            m_reflectedPower = std::pow(10.0f, v / 10.0f) / 1000.0f;
+            // REFPWR is an independent directional-coupler reading. Preserve it
+            // as watts rather than reconstructing it from SWR — and HONOUR THE
+            // DECLARED UNIT, exactly as forward power does.
+            //
+            // This one was missed when FWDPWR and ALC were fixed, and the gap
+            // was worse than the original bug: MeterSurfaces.h advertises this
+            // consumer as accepting Watts, so `liveness` reported a
+            // watts-declaring backend as unit-AGREEING while the value was
+            // still being converted from dBm — 0.5 W arriving as 0.0011 W with
+            // the diagnostic vouching for it. Nothing publishes REFPWR in watts
+            // today, which is precisely why it would have been found the hard
+            // way.
+            const bool refAlreadyWatts =
+                m_refPwrUnit.compare(QLatin1String("Watts"), Qt::CaseInsensitive) == 0
+                || m_refPwrUnit.compare(QLatin1String("W"), Qt::CaseInsensitive) == 0;
+            m_reflectedPower = refAlreadyWatts ? v : std::pow(10.0f, v / 10.0f) / 1000.0f;
             directionalChanged = true;
         } else if (idx == m_swrIdx) {
             m_lastTxMeterUpdateMs = packetUpdatedMs;
@@ -569,13 +773,40 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
             m_hwAlc = v;
             hwAlcChangedFlag = true;
         } else if (idx == m_swAlcIdx) {
-            m_swAlc = v;
+            // The ALC consumers are a dBFS gauge (-20..0). A radio that runs its
+            // OWN ALC has no dBFS to give — the IC-705 reports 0..100 % of full
+            // scale — so a percentage handed straight over pins the gauge at the
+            // top and stays there, which is what "ALC is completely pegged"
+            // looked like.
+            //
+            // Map it onto the gauge instead. This is a PRESENTATION mapping and
+            // not a measurement: it says "this fraction of the radio's own ALC
+            // range", and the only honest claim it makes is proportionality.
+            m_swAlc = convertAlcToGaugeDbfs(v);
             swAlcChangedFlag = true;
+        } else if (activeScMicIdx >= 0 && idx == activeScMicIdx) {
+            m_scMic = v;
+            m_hasScMicValue = true;
+        } else if (activeScFilt1Idx >= 0 && idx == activeScFilt1Idx) {
+            m_scFilt1 = v;
+            m_hasScFilt1Value = true;
+        } else if (activeScFilt2Idx >= 0 && idx == activeScFilt2Idx) {
+            m_scFilt2 = v;
+            m_hasScFilt2Value = true;
+            // Publish on the SLOWER tap only. SC_FILT_1 runs at 20 fps and
+            // SC_FILT_2 at 10, so emitting on either would hand the consumer
+            // one fresh value and a partner up to 100 ms old -- and at
+            // key-down SC_FILT_1 rises first while SC_FILT_2 is still at the
+            // floor, which is exactly the shape a loss detector misreads.
+            // Emitting here bounds the partner's age at ~one SC_FILT_1
+            // period (~50 ms) instead.
+            txFilterLevelsChangedFlag = true;
         } else if (idx == m_paTempIdx) {
             m_paTemp = v;
             hwChanged = true;
         } else if (idx == m_supplyIdx) {
             m_supplyVolts = v;  // "+13.8A" = supply voltage at point A (before fuse)
+            m_hasSupplyVoltsValue = true;   // a SAMPLE, not just a definition
             hwChanged = true;
         } else if (idx == m_tgxlFwdIdx) {
             m_tgxlFwdPwr = std::pow(10.0f, v / 10.0f) / 1000.0f;
@@ -601,9 +832,43 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         emit meterUpdated(idx, v);
     }
 
+    // SWR as published to consumers. It is derived from forward and reflected
+    // power, so once the TX meters go stale it is not a measurement any more —
+    // it is whatever was last read during a previous transmit, and on a radio
+    // that publishes SWR but no FWDPWR it saturates at 255.99 and stays there
+    // (#4533).
+    //
+    // Gated HERE, at the single point both signals read it, rather than in each
+    // consumer: HealthApplet already qualifies SWR on instantaneous forward
+    // power (#4243), but that gate cannot fire on a backend which never sends
+    // FWDPWR at all, so every such consumer is defeated by the absence of the
+    // very quantity it gates on.
+    //
+    // ⚠ Gate on SWR'S OWN AGE (swrUpdatedAtMs), NOT on forward power and NOT
+    // on hasRecentTxMeters(). The earlier forward-power gate silently zeroed
+    // SWR forever on any backend that publishes SWR without FWDPWR — the HL2
+    // does exactly that, by design (its forward counts are uncalibrated ADC
+    // values; the RATIO survives the unknown scale, which is why its SWR is
+    // the most trustworthy meter it has). "This SWR reading is old" is the
+    // claim this gate makes; power flowing is evidence for a different
+    // proposition, and #4243's HealthApplet already qualifies on power where
+    // power data exists.
+    //
+    // ⚠ The two emits stay CO-EMITTED and in this order — #4243 depends on
+    // directionalPowerMetersChanged landing in the same cycle as
+    // txMetersChanged. Only the values carried change here, never the timing.
+    const bool swrValid =
+        m_swrIdx >= 0
+        && swrSampleLive(packetUpdatedMs, kDirectionalMeterFreshnessMs);
+    // 0.0f is a PLACEHOLDER carried alongside swrValid=false, never a value:
+    // RadioSwrValidityFilter reads <1.0 as the radio's over-range sentinel and
+    // other consumers clamp it to 1.0, so an unaccompanied 0.0f means opposite
+    // things on different surfaces (#4536 review, blocker 2).
+    const float publishedSwr = swrValid ? m_swr : 0.0f;
+
     // sLevelChanged is now emitted per-slice inline above
     if (txChanged)
-        emit txMetersChanged(m_fwdPower, m_swr);
+        emit txMetersChanged(m_fwdPower, publishedSwr, swrValid);
     if (directionalChanged) {
         const bool reflectedPowerMeasured = m_refPwrIdx >= 0
             && m_lastReflectedPowerUpdateMs > 0
@@ -611,7 +876,8 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
                 <= kDirectionalMeterFreshnessMs;
         emit directionalPowerMetersChanged(m_fwdPowerInstant,
                                            m_reflectedPower,
-                                           m_swr,
+                                           publishedSwr,
+                                           swrValid,
                                            reflectedPowerMeasured);
     }
     // Separate signal carries the raw pre-smoothed sample so consumers
@@ -625,12 +891,56 @@ void MeterModel::updateValues(const QVector<quint16>& ids, const QVector<qint16>
         emit this->hwAlcChanged(m_hwAlc);
     if (swAlcChangedFlag)
         emit this->swAlcChanged(m_swAlc);
+    if (txFilterLevelsChangedFlag)
+        emit txFilterLevelsChanged(m_scFilt1, m_scFilt2);
     if (hwChanged)
         emit hwTelemetryChanged(m_paTemp, m_supplyVolts);
     if (ampChanged)
         emit ampMetersChanged(m_ampFwdPwr, m_ampSwr, m_ampTemp);
     if (tgxlChanged)
         emit tgxlMetersChanged(m_tgxlFwdPwr, m_tgxlSwr);
+}
+
+static int resolveTxWaveformIndex(const QMap<int, int>& byTxSource,
+                                  const QMap<int, int>& bySlice,
+                                  int txSource, int activeSlice)
+{
+    if (txSource >= 0 && byTxSource.contains(txSource))
+        return byTxSource.value(txSource);
+    return bySlice.value(activeSlice, -1);
+}
+
+int MeterModel::scMicIndexForActiveTxSlice() const
+{
+    return resolveTxWaveformIndex(m_scMicIdxByTxSource, m_scMicIdxBySlice,
+                                  activeTxWaveformSourceIndex(), m_activeTxSlice);
+}
+
+int MeterModel::scFilt1IndexForActiveTxSlice() const
+{
+    return resolveTxWaveformIndex(m_scFilt1IdxByTxSource, m_scFilt1IdxBySlice,
+                                  activeTxWaveformSourceIndex(), m_activeTxSlice);
+}
+
+int MeterModel::scFilt2IndexForActiveTxSlice() const
+{
+    return resolveTxWaveformIndex(m_scFilt2IdxByTxSource, m_scFilt2IdxBySlice,
+                                  activeTxWaveformSourceIndex(), m_activeTxSlice);
+}
+
+qint64 MeterModel::txFilterLevelSkewMs() const
+{
+    if (!m_hasScFilt1Value || !m_hasScFilt2Value)
+        return -1;
+    const int i1 = scFilt1IndexForActiveTxSlice();
+    const int i2 = scFilt2IndexForActiveTxSlice();
+    if (i1 < 0 || i2 < 0)
+        return -1;
+    const qint64 a = m_valueUpdatedMs.value(i1, 0);
+    const qint64 b = m_valueUpdatedMs.value(i2, 0);
+    if (a <= 0 || b <= 0)
+        return -1;
+    return qAbs(a - b);
 }
 
 const MeterDef* MeterModel::meterDef(int index) const
@@ -650,6 +960,14 @@ int MeterModel::findMeter(const QString& source, const QString& name, int source
     return -1;
 }
 
+qint64 MeterModel::valueAgeMs(int index) const
+{
+    const qint64 upd = m_valueUpdatedMs.value(index, 0);
+    if (upd <= 0 || !m_values.contains(index))
+        return -1;
+    return QDateTime::currentMSecsSinceEpoch() - upd;
+}
+
 float MeterModel::value(int index) const
 {
     return m_values.value(index, 0.0f);
@@ -659,9 +977,22 @@ QJsonArray MeterModel::allMeters() const
 {
     QJsonArray meters;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    // One predicate for every surface — see swrSampleLive() (#4536).
+    const bool swrFresh = swrSampleLive(now, kTxMeterStaleMs);
     for (auto it = m_defs.constBegin(); it != m_defs.constEnd(); ++it) {
         const auto valueIt = m_values.constFind(it.key());
-        const bool hasValue = valueIt != m_values.constEnd();
+        bool hasValue = valueIt != m_values.constEnd();
+        // SWR is derived from forward and reflected power, so once the TX
+        // meters go stale it is not a measurement any more — it is the last
+        // reading from a previous transmit. Reporting it as a live value sends
+        // the operator hunting for an antenna fault that isn't there (#4533).
+        // Present it the same way FWDPWR/REFPWR already present themselves when
+        // the radio isn't sending them: has_value=false, value=null, age=-1.
+        // Matches the existing gates in RigctlProtocol (which additionally
+        // requires an active transmit) and the Amp/Acom applets, both of which
+        // blank SWR without drive.
+        if (hasValue && it.key() == m_swrIdx && !swrFresh)
+            hasValue = false;
         const qint64 upd = m_valueUpdatedMs.value(it.key(), 0);
         const qint64 ageMs = (hasValue && upd > 0) ? (now - upd) : -1;
         meters.append(meterToJson(*it, hasValue, hasValue ? valueIt.value() : 0.0f, ageMs));
@@ -673,6 +1004,8 @@ QJsonArray MeterModel::metersForSource(const QString& source, int sourceIndex) c
 {
     QJsonArray meters;
     const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    // One predicate for every surface — see swrSampleLive() (#4536).
+    const bool swrFresh = swrSampleLive(now, kTxMeterStaleMs);
     for (auto it = m_defs.constBegin(); it != m_defs.constEnd(); ++it) {
         const MeterDef& def = *it;
         if (def.source != source)
@@ -681,7 +1014,13 @@ QJsonArray MeterModel::metersForSource(const QString& source, int sourceIndex) c
             continue;
 
         const auto valueIt = m_values.constFind(it.key());
-        const bool hasValue = valueIt != m_values.constEnd();
+        bool hasValue = valueIt != m_values.constEnd();
+        // Same SWR gate as allMeters(). Without it a `tx`-source query answered
+        // has_value=true for the identical meter that `all` reports as absent —
+        // two views of one model disagreeing about the same reading, which is
+        // the disagreement #4533 was filed about rather than a second bug.
+        if (hasValue && it.key() == m_swrIdx && !swrFresh)
+            hasValue = false;
         const qint64 upd = m_valueUpdatedMs.value(it.key(), 0);
         const qint64 ageMs = (hasValue && upd > 0) ? (now - upd) : -1;
         meters.append(meterToJson(def, hasValue, hasValue ? valueIt.value() : 0.0f, ageMs));

@@ -1,5 +1,6 @@
 #include "core/backends/flex/FlexBackend.h"
 
+#include <algorithm>
 #include <limits>
 
 #include <QThread>
@@ -7,6 +8,7 @@
 #include "core/LogManager.h"
 #include "core/RadioConnection.h"
 #include "core/PanadapterStream.h"
+#include "core/backends/MemoryWireCodec.h"
 #include "core/backends/flex/FlexKvCarry.h"
 #include "models/ModelCapabilities.h"
 
@@ -130,6 +132,7 @@ RadioCapabilities FlexBackend::capabilities() const
 {
     RadioCapabilities caps;
     caps.family = QStringLiteral("flex");
+    caps.manufacturer = QStringLiteral("FlexRadio");
     caps.model = m_modelProvider ? m_modelProvider() : QString();
 
     // Seed from the FlexLib-sourced platform table (Principle I). This is the
@@ -141,6 +144,12 @@ RadioCapabilities FlexBackend::capabilities() const
     // refined from live radio status in a later touchpoint conversion.
     caps.maxPanadapters = mc.maxSlices;
     caps.hasExtendedDsp = mc.hasExtendedDsp();
+    // The LMS/FFT family is base Flex firmware, not an 8000-series extra —
+    // every radio with hasRadioSideDsp below also has NRL/ANFL/ANFT.
+    caps.hasLmsNoiseFilters = true;
+    // A Flex notches with TNFs, which are pinned to absolute frequencies and
+    // are a different instrument. No single in-passband manual notch.
+    caps.hasManualNotch = false;
 
     // Every current FlexRadio transmits; RX-only WAN/observer nuance is layered
     // in later. Sample rates and TX power range are refined as their touchpoints
@@ -148,6 +157,92 @@ RadioCapabilities FlexBackend::capabilities() const
     caps.canTransmit = true;
     caps.hasTuner = true;
     caps.canReboot = true;   // SmartSDR "radio reboot" (#4448 F3)
+    // The radio owns its reference and its own calibration ("radio set cal_freq",
+    // "radio pll_start", freq_error_ppb) — that surface is the Frequency Offset
+    // group on the Receive page, and it is NOT this flag. False here means "the
+    // client does not apply a frequency scalar", which is correct for a Flex.
+    caps.hostFrequencyCalibration = false;
+    // Global / TX / mic profiles are a SmartSDR feature on every current model.
+    caps.hasProfiles = true;
+    caps.hasSelectableMicInputs = true;
+
+    // FALSE, and stated rather than left to the default. A Flex modulates on
+    // the radio AND takes its transmit audio over DAX/VITA-49, so it is the one
+    // family for which "the host ships the audio" is wrong — the seam verb is
+    // never called and MainWindow's transmit-audio gate must stay closed. An
+    // omitted field is indistinguishable here from a considered false, which is
+    // what this file's ADDING-A-FIELD note exists to prevent.
+    caps.takesTxAudioOverSeam = false;
+
+    // EMPTY = continuous or unknown, so the RX applet keeps the operator's own
+    // configurable width list. A Flex's filters are continuous.
+    caps.rxFilterWidthsHz = {};
+    // DAX audio + DAX IQ ride PanadapterStream's VITA-49 plane, which only this
+    // backend owns.
+    caps.hasDaxStreams = true;
+    // NR/NB/ANF/NRL/ANFL/ANFT, the APD predistorter and the wideband noise
+    // blanker all run in the radio's firmware, driven by command-plane verbs.
+    caps.hasRadioSideDsp = true;
+    // The radio embeds a per-tile black level in the waterfall stream when
+    // asked (`display panafall set <id> auto_black=1`), so HW is a real
+    // choice on the Display panel's Black Level button.
+    caps.hasRadioSideWaterfallAutoBlack = true;
+    // The CWX text keyer, the digital voice keyer and full duplex are SmartSDR
+    // command-plane features carried by this backend: `cwx …`, `dvk …`,
+    // `radio set full_duplex_enabled=`. hasVoiceKeyer says the radio HAS a
+    // voice keyer; whether this operator is licensed for it is the separate
+    // SmartSDR+ entitlement gate.
+    caps.hasRadioSideCwKeyer = true;
+    caps.hasVoiceKeyer = true;
+    caps.hasFullDuplex = true;
+    caps.hasWaveforms = true;            // installable SmartSDR waveforms
+    caps.hasMultiClientSessions = true;  // multiFLEX
+    // TNFs. Neither FlexLib nor the `tnf` status declares a ceiling — Radio.cs
+    // keeps an unbounded list — so this is a UI-side sanity limit rather than a
+    // radio-reported one, and it is set high enough never to be the thing that
+    // stops an operator. Do NOT read it as a measured hardware figure.
+    caps.maxNotchFilters = 1000;
+    // A Flex TNF has three depths (normal / deep / very deep), unlike a
+    // host-DSP null.
+    caps.notchHasDepth = true;
+    // TnfModel's own floor. The radio reports width in Hz and accepts small
+    // values; 10 Hz is where the model clamps.
+    caps.notchMinWidthHz = 10.0;
+    caps.notchMaxWidthHz = 6000.0;
+    // GPSDO / on-board GNSS, reported through the `gps` status.
+    //
+    // TRUE for every Flex, and deliberately COARSER than
+    // RadioModel::hasGpsHardware(). The two answer different questions and both
+    // are needed:
+    //
+    //   - this flag: "can a radio of this family have GPS at all" — a family
+    //     fact, which is what the capability seam is for and all a backend can
+    //     honestly assert before any status has arrived;
+    //   - hasGpsHardware(): "does THIS unit have it" — model name (8400/8600/
+    //     AU-), a live oscillator presence flag, OR a `gps` status that is not
+    //     "Not Present".
+    //
+    // Do not narrow this to the model-name test to match. That clause is one
+    // half of an OR: a FLEX-6700 with an optional GPSDO installed answers true
+    // through the STATUS clause, and a model-name test here would hide GPS on
+    // exactly those radios — a regression in the opposite direction from the one
+    // it would appear to fix.
+    //
+    // MainWindow therefore combines this family declaration with
+    // RadioModel::hasGpsHardware() while connected.
+    caps.hasGpsLocation = true;
+    // The radio owns the memory slots and re-dumps them on every connect, so
+    // the client must NOT keep a local bank for a Flex — two stores that both
+    // believe they are authoritative would fight over slot indices.
+    caps.persistsMemories = true;
+    // The radio persists its own operating state (frequency, mode, filters,
+    // power) and restores it via GUIClientID session restore — the client must
+    // never re-assert any of it (Constitution II/III; the #2465/#4126/#4261
+    // bug class). Declared empty EXPLICITLY per the ADDING-A-FIELD contract.
+    caps.clientSettingsDomains = {};
+    // The "+13.8A" meter carries the PA supply rail (measurement point A,
+    // before the fuse), which the status bar renders under the PA temperature.
+    caps.hasSupplyVoltageTelemetry = true;
 
     // Advertise the "flex" extension namespace: the amp/tuner operate/bypass/
     // autotune verbs are now routed through invokeExtension() (#4092/#4094), and
@@ -205,7 +300,61 @@ void FlexBackend::setSliceAgc(int sliceId, const QString& mode, int thresholdDb)
     sendSlice(QStringLiteral("slice set %1 agc_threshold=%2").arg(sliceId).arg(thresholdDb));
 }
 
-void FlexBackend::setPanCenter(const QString& panId, double hz)
+// ── Manual notch filters (TNF) ──────────────────────────────────────────────
+//
+// These emit exactly the strings TnfModel used to build itself, quirks
+// included, because the radio is the one thing this refactor must not notice.
+// The odd one is width: the radio REPORTS it in Hz but is WRITTEN in MHz, and
+// TnfModel has always sent it that way. Normalizing it here would be a wire
+// change wearing a cleanup's clothing.
+//
+// No id is minted locally. `tnf create` makes the radio assign one and report
+// it back as `tnf <id> …` status, which RadioModel already decodes — so unlike
+// a host-DSP backend, this one never emits notchChanged().
+void FlexBackend::createNotch(double centerHz, double widthHz)
+{
+    // Width is not settable at create time on the Flex wire; the radio picks a
+    // default and a follow-up `tnf set` resizes it. Accepted here so the seam
+    // reads the same for every backend.
+    Q_UNUSED(widthHz);
+    send(QStringLiteral("tnf create freq=%1").arg(centerHz / 1.0e6, 0, 'f', 6));
+}
+
+void FlexBackend::setNotch(int notchId, const AetherSDR::NotchDelta& delta)
+{
+    // One command per changed field, which is what the Flex wire takes. A drag
+    // therefore still sends two — that is the radio's protocol, not a lost
+    // optimization; the delta exists so a HOST-DSP backend can coalesce.
+    if (delta.centerHz)
+        send(QStringLiteral("tnf set %1 freq=%2")
+                 .arg(notchId).arg(*delta.centerHz / 1.0e6, 0, 'f', 6));
+    if (delta.widthHz)
+        send(QStringLiteral("tnf set %1 width=%2")
+                 .arg(notchId).arg(std::max(10.0, *delta.widthHz) / 1.0e6, 0, 'f', 6));
+    if (delta.depthDb)
+        send(QStringLiteral("tnf set %1 depth=%2")
+                 .arg(notchId).arg(std::clamp(*delta.depthDb, 1, 3)));
+    if (delta.permanent)
+        send(QStringLiteral("tnf set %1 permanent=%2")
+                 .arg(notchId).arg(*delta.permanent ? 1 : 0));
+    // `active` has no Flex wire equivalent — a TNF is present or removed, and
+    // the only bypass is the global tnf_enabled. Ignored rather than emulated
+    // by removing and recreating, which would change the notch's id.
+}
+
+void FlexBackend::removeNotch(int notchId)
+{
+    send(QStringLiteral("tnf remove %1").arg(notchId));
+}
+
+void FlexBackend::setNotchesEnabled(bool on)
+{
+    send(QStringLiteral("radio set tnf_enabled=%1").arg(on ? 1 : 0));
+}
+
+// Intent ignored: a Flex panadapter's window is genuinely independent of the
+// slice, so a drag and a zoom mean the same thing here.
+void FlexBackend::setPanCenter(const QString& panId, double hz, PanCenterIntent)
 {
     // Flex owns the pan; this is the same write RadioModel already makes on the
     // Flex path, expressed through the seam so a non-Flex backend can implement
@@ -939,42 +1088,10 @@ void FlexBackend::decodeGpsStatus(const QString& rawBody)
 void FlexBackend::decodeMemoryStatus(int index, const QMap<QString, QString>& kvs)
 {
     // Memory-slot status → typed MemoryDelta (aetherd RFC 2.3 — RadioModel
-    // residual). Removal: the radio sends "in_use=0" or a bare "removed".
-    MemoryDelta d;
-    d.index = index;
-    if (kvs.value(QStringLiteral("in_use")) == QLatin1String("0")
-        || kvs.contains(QStringLiteral("removed"))) {
-        d.removed = true;
-        emit memoryChanged(d);
-        return;
-    }
-
-    // Text fields ride raw — the protocol space-encoding (0x7f→' ') and the
-    // NUL/control-byte sanitisation (MemoryFields) are a model concern applied in
-    // RadioModel::applyMemoryChanges, so the backend keeps no models/ dependency.
-    carry(kvs, "group", d.group);
-    carry(kvs, "owner", d.owner);
-    carry(kvs, "name", d.name);
-    carry(kvs, "mode", d.mode);
-    carry(kvs, "repeater", d.offsetDir);
-    carry(kvs, "tone_mode", d.toneMode);
-    // Numeric fields — ok-guarded (a malformed *present* value is dropped, so the
-    // model keeps the slot's prior value rather than clobbering it with 0). The
-    // old handler applied an unguarded toInt/toDouble (→0); the carry() guard is
-    // the same fail-closed improvement made at the slice/transmit sites.
-    carry(kvs, "freq", d.freq);
-    carry(kvs, "repeater_offset", d.repeaterOffset);
-    carry(kvs, "tone_value", d.toneValue);
-    carry(kvs, "step", d.step);
-    carry(kvs, "squelch", d.squelch);
-    carry(kvs, "squelch_level", d.squelchLevel);
-    carry(kvs, "rx_filter_low", d.rxFilterLow);
-    carry(kvs, "rx_filter_high", d.rxFilterHigh);
-    carry(kvs, "rtty_mark", d.rttyMark);
-    carry(kvs, "rtty_shift", d.rttyShift);
-    carry(kvs, "digl_offset", d.diglOffset);
-    carry(kvs, "digu_offset", d.diguOffset);
-    emit memoryChanged(d);
+    // residual). The decode itself moved to MemoryWire::decodeStatus so the
+    // local memory bank — which decodes the very same kv-set for a radio that
+    // has no memory storage of its own — cannot drift from what a Flex reports.
+    emit memoryChanged(MemoryWire::decodeStatus(index, kvs));
 }
 
 void FlexBackend::decodeProfileStatus(const QString& profileType, const QString& rawBody)

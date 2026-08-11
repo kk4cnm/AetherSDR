@@ -30,7 +30,12 @@
 class DssRenderer
 {
 public:
-    static constexpr int kRows = 96;   // history depth (front → back)
+    static constexpr int kVisibleRows = 96;    // front → back display depth
+    // Outgoing rows kept during scroll. Must cover the largest row distance
+    // passed to SpectrumWidget::startWaterfallScrollAnimation(); the current
+    // Flex, Kiwi, and fallback producers append at most one row per update.
+    static constexpr int kTransitionRows = 8;
+    static constexpr int kRows = kVisibleRows + kTransitionRows;
     static constexpr int kCols = 768;  // resampled columns per row
 
     // Perspective geometry of the surface, shared by this CPU renderer and the
@@ -45,14 +50,119 @@ public:
     // span. Otherwise a high Ref level compresses every real signal into blue.
     static constexpr float kColorSpanDb        = 45.0f;
 
+    // ── Wedge-closing row span ──────────────────────────────────────────────
+    // Because every row covers the SAME frequency span while the far rows
+    // narrow to kBackWidthFrac, the surface leaves two empty triangles beside
+    // it. Widen the span each row covers instead: the near rows then run off
+    // both edges of the plot and the existing perspective narrowing walks them
+    // back in, closing the wedge from the front. The projection below is
+    // untouched, so the converging slant, the frequency ruler and every marker
+    // stay put. dss_mesh.vert applies the SAME formulas.
+
+    // Span at which the DEEPEST row lands exactly on the plot edge. Beyond this
+    // the surface only overhangs further without revealing more of the plot.
+    static constexpr float kMaxRowSpanFactor = 1.0f / kBackWidthFrac;
+
+    // Mesh columns per row for the GPU path. The mesh spans rowSpanFactor x the
+    // viewport, while the height texture holds kCols texels ACROSS THE VIEWPORT
+    // — so a kCols-wide mesh would leave (span-1)/span of those texels unread.
+    // That is not shimmer: the mesh-column-to-frequency mapping is static, so
+    // the same texels are missed every frame and a narrow carrier landing on one
+    // is permanently invisible at a fixed screen position. Size the mesh for the
+    // widest span instead, so the on-screen region is never sparser than the
+    // texture it samples. Below the widest span it merely oversamples, which
+    // Nearest filtering absorbs by repeating texels.
+    static constexpr int kMeshCols =
+        static_cast<int>(kCols * kMaxRowSpanFactor) + 1;
+    // The invariant dss_mesh.vert's Nearest height sampler depends on: at the
+    // widest span the on-screen columns (kMeshCols / kMaxRowSpanFactor) must
+    // still be at least kCols, or bins fall between samples and vanish.
+    static_assert(static_cast<float>(kMeshCols) >= kCols * kMaxRowSpanFactor,
+                  "kMeshCols must keep the on-screen grid at texel density "
+                  "at kMaxRowSpanFactor");
+
+    // Perspective narrowing with depth — the only thing that places a frequency.
+    static float depthScale(float depth)
+    {
+        return 1.0f - std::clamp(depth, 0.0f, 1.0f) * (1.0f - kBackWidthFrac);
+    }
+
+    // Mesh column (0..1 across the drawn row) -> frequency in viewport units,
+    // where 0..1 spans the on-screen bandwidth. Depth-independent by design.
+    static float rowFrequencyUnit(float meshUnit, float rowSpanFactor)
+    {
+        return 0.5f + (meshUnit - 0.5f) * rowSpanFactor;
+    }
+
+    // Fraction of the plot width a row at `depth` covers. >= 1 means that row
+    // reaches both edges and leaves no wedge; the front row is the widest.
+    static float rowScreenCoverage(float depth, float rowSpanFactor)
+    {
+        return depthScale(depth) * rowSpanFactor;
+    }
+
+    // Shallowest depth still leaving a wedge, or 1 when the surface is closed
+    // all the way to the back. Lets the host report how much a given overhang
+    // actually bought.
+    static float wedgeFreeDepth(float rowSpanFactor)
+    {
+        if (rowSpanFactor <= 1.0f) {
+            return 0.0f;
+        }
+        if (rowSpanFactor >= kMaxRowSpanFactor) {
+            return 1.0f;
+        }
+        return (1.0f - 1.0f / rowSpanFactor) / (1.0f - kBackWidthFrac);
+    }
+
+    // Usable span for an overhang of `spanFactor` x the viewport bandwidth.
+    // Clamped at kMaxRowSpanFactor: past it the extra data is off-plot anyway.
+    static float rowSpanFactorForOverhang(float spanFactor)
+    {
+        if (!(spanFactor > 1.0f) || !std::isfinite(spanFactor)) {
+            return 1.0f;
+        }
+        return std::min(spanFactor, kMaxRowSpanFactor);
+    }
+
+    // Row span for a source whose calibrated overhang spans
+    // supplementalBandwidthMhz against a targetBandwidthMhz viewport, scaled by
+    // a 0-100 operator setting. Anything that cannot be trusted -- a
+    // non-positive or non-finite bandwidth, or an overhang no wider than the
+    // viewport -- yields 1.0, the clipped trapezoid, rather than widening into
+    // spectrum that was never captured.
+    //
+    // The percentage scales the AVAILABLE span, not the absolute maximum:
+    // against a ~1.15x tile an absolute reading would clamp everything above
+    // ~22% to the same picture, leaving most of the control's travel dead.
+    static float rowSpanFactorFor(double supplementalBandwidthMhz,
+                                  double targetBandwidthMhz,
+                                  int spanPercent)
+    {
+        if (!std::isfinite(targetBandwidthMhz) || targetBandwidthMhz <= 0.0
+            || !std::isfinite(supplementalBandwidthMhz)
+            || supplementalBandwidthMhz <= targetBandwidthMhz) {
+            return 1.0f;
+        }
+        const float available = rowSpanFactorForOverhang(
+            static_cast<float>(
+                supplementalBandwidthMhz / targetBandwidthMhz));
+        const float fraction =
+            static_cast<float>(std::clamp(spanPercent, 0, 100)) / 100.0f;
+        return 1.0f + fraction * (available - 1.0f);
+    }
+
     // Project a normalized frequency coordinate onto the same perspective
     // plane used by both DSS renderers. depth=0 is the full-width front edge;
     // depth=1 is the narrowed back edge. Slice overlays use this helper so
     // their apparent angle cannot drift from the FFT surface.
+    //
+    // Frequency-in / screen-out, and independent of rowSpanFactor: widening a
+    // row extends the frequency range it covers, never where a frequency lands.
     static QPointF projectPerspective(float frequencyUnit, float depth)
     {
         const float d = std::clamp(depth, 0.0f, 1.0f);
-        const float width = 1.0f - d * (1.0f - kBackWidthFrac);
+        const float width = depthScale(d);
         return QPointF(0.5f + (frequencyUnit - 0.5f) * width,
                        1.0f - d * kDepthSpanFrac);
     }
@@ -64,7 +174,7 @@ public:
                                   float floorDbm, float rangeDb, float zCurve)
     {
         const float d = std::clamp(depth, 0.0f, 1.0f);
-        const float width = 1.0f - d * (1.0f - kBackWidthFrac);
+        const float width = depthScale(d);
         const float finiteDbm = std::isfinite(dbm) ? dbm : floorDbm;
         const float strengthLinear = std::clamp(
             (finiteDbm - floorDbm) / std::max(rangeDb, 1.0f),
@@ -89,7 +199,16 @@ public:
 
     // Push one freshly-decoded FFT row (any bin count, dBm). Peak-preserving
     // downsample to kCols and store it as the newest (front) trace.
-    void pushRow(const QVector<float>& binsDbm);
+    void pushRow(const QVector<float>& binsDbm,
+                 double centerMhz = 0.0,
+                 double bandwidthMhz = 0.0);
+    void pushRowWithSupplemental(
+        const QVector<float>& binsDbm,
+        double centerMhz,
+        double bandwidthMhz,
+        const QVector<float>& supplementalBinsDbm,
+        double supplementalCenterMhz,
+        double supplementalBandwidthMhz);
     void setHistoryCapacityRows(int rows);
     int historyCapacityRows() const { return m_historyCapacityRows; }
     int historyRowCount() const { return m_historyRowCount; }
@@ -103,9 +222,14 @@ public:
     void rebuildVisibleFromHistory(int offsetRows,
                                    double centerMhz, double bandwidthMhz,
                                    float fallbackDbm);
+    // Remap the visible live viewport to a new frequency frame. Prefer an
+    // in-place refresh from retained, frame-stamped rows so ring topology and
+    // scroll phase remain intact; fall back to direct visible-ring reprojection
+    // when no matching retained history is available.
     void reprojectFrequencyFrame(double oldCenterMhz, double oldBandwidthMhz,
                                  double newCenterMhz, double newBandwidthMhz,
-                                 float fallbackDbm);
+                                 float fallbackDbm,
+                                 bool refreshFromRetainedHistory = false);
 
     // Return the cached surface sized to px. The plot region (everything above
     // the bottom scaleStripPx) is painted opaque over bgFill; the scale strip
@@ -139,8 +263,38 @@ public:
     int cols() const { return kCols; }
     int rows() const { return kRows; }
     int rowCount() const { return m_count; }     // valid rows (0..kRows)
+    int visibleRowCount() const
+    {
+        return std::min(m_count, kVisibleRows);
+    }
     int headRing() const { return m_head; }       // ring index of the newest row
     const float* rowDataRing(int ringIndex) const { return m_rows[ringIndex].data(); }
+    const quint8* rowCoverageRing(int ringIndex) const
+    {
+        return m_rowCoverage[ringIndex].data();
+    }
+    const float* rowSupplementalDataRing(int ringIndex) const
+    {
+        return m_rowSupplemental[ringIndex].data();
+    }
+    const quint8* rowSupplementalCoverageRing(int ringIndex) const
+    {
+        return m_rowSupplementalCoverage[ringIndex].data();
+    }
+    double rowCenterMhzAtAge(int age) const;
+    double rowBandwidthMhzAtAge(int age) const;
+    double rowSupplementalCenterMhzAtAge(int age) const;
+    double rowSupplementalBandwidthMhzAtAge(int age) const;
+    // Bandwidth of the newest VISIBLE row carrying a calibrated overhang wider
+    // than targetBandwidthMhz, or 0 when no such row is on screen.
+    //
+    // The front row is deliberately not authoritative: the FFT-derived producer
+    // that paces rows during TX and during the RX stale-native fallback appends
+    // with no supplemental at all, so keying up would otherwise drop the
+    // overhang to nothing while 90-odd rows of it are still on screen. Once the
+    // last covered row scrolls out, returning 0 is the correct answer.
+    double newestSupplementalBandwidthMhz(double targetBandwidthMhz) const;
+
     RowStats rowStats(int age, float epsilonDb = 0.01f) const;
     quint64 rowGeneration() const { return m_rowGeneration; }
 
@@ -160,6 +314,25 @@ private:
 
     // Circular store: m_head indexes the newest row.
     std::array<std::array<float, kCols>, kRows> m_rows{};
+    // One byte per bin records whether that frequency existed in the captured
+    // row. Reprojection-created gaps remain drawable floor lines, but the
+    // marker lets both renderers keep their height/colour independent of later
+    // zoom and dBm-range changes.
+    std::array<std::array<quint8, kCols>, kRows> m_rowCoverage{};
+    // Native FLEX waterfall tiles cover more spectrum than the FFT viewport.
+    // Keep that calibrated overhang in separate channels so it can fill only
+    // frequencies the exact FFT row never captured; it must never resample or
+    // replace the working FFT trace.
+    std::array<std::array<float, kCols>, kRows> m_rowSupplemental{};
+    std::array<std::array<quint8, kCols>, kRows>
+        m_rowSupplementalCoverage{};
+    // Each live row keeps the frequency frame in which its bins were captured.
+    // The GPU maps rows independently during pan previews, allowing retained
+    // off-screen data and newly received radio coverage to coexist.
+    std::array<double, kRows> m_rowCenterMhz{};
+    std::array<double, kRows> m_rowBandwidthMhz{};
+    std::array<double, kRows> m_rowSupplementalCenterMhz{};
+    std::array<double, kRows> m_rowSupplementalBandwidthMhz{};
     int     m_head  = 0;         // index of the newest row
     int     m_count = 0;         // number of valid rows (0..kRows)
     bool    m_dirty = true;
@@ -171,6 +344,13 @@ private:
     std::array<float, kCols> m_rawPrev1{};
     std::array<float, kCols> m_rawPrev2{};
     int m_rawHistCount = 0;
+    // The calibrated native-tile overhang needs an independent copy of the
+    // same smoothing chain. Sharing FFT history would blend different
+    // frequency frames; storing it raw exaggerates isolated tile maxima until
+    // exact FFT coverage replaces them.
+    std::array<float, kCols> m_supplementalRawPrev1{};
+    std::array<float, kCols> m_supplementalRawPrev2{};
+    int m_supplementalRawHistCount = 0;
 
     // One-shot flags: after resetInputSmoothing() the next pushed row must not
     // blend against the retained row that preceded the reset (it was decoded
@@ -179,6 +359,7 @@ private:
     // own; the temporal IIR term against the previous smoothed row also carries
     // pre-reset data.
     bool m_skipLiveTemporalBlendOnce = false;
+    bool m_skipSupplementalTemporalBlendOnce = false;
     bool m_skipHistoryTemporalBlendOnce = false;
 
     // Retained scrollback store. This is intentionally separate from the
